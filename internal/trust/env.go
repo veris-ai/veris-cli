@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"runtime"
 	"sort"
 	"strings"
@@ -114,7 +115,7 @@ func Build(o Options) []Var {
 			"-Dhttp.proxyPort=" + port,
 			"-Dhttps.proxyHost=" + host,
 			"-Dhttps.proxyPort=" + port,
-			`-Dhttp.nonProxyHosts=localhost|127.*|[::1]`,
+			"-Dhttp.nonProxyHosts=" + javaNonProxyHosts(o.NoProxy),
 			"-Djavax.net.ssl.trustStore=" + o.JavaTrustStore,
 			"-Djavax.net.ssl.trustStorePassword=" + o.JavaTrustStorePass,
 		}
@@ -144,7 +145,7 @@ func Warnings(o Options) []string {
 	}
 	if o.JavaTrustStore == "" {
 		w = append(w, "No Java truststore built, so JVM processes are not covered. "+
-			"Run `veris proxy trust --java` to create one from your JDK's cacerts.")
+			"Run `veris-proxy trust --java` to create one from your JDK's cacerts.")
 	}
 	w = append(w,
 		"Apache HttpClient built with HttpClients.createDefault() ignores the JVM proxy properties; "+
@@ -154,6 +155,67 @@ func Warnings(o Options) []string {
 			"set stripe.ca_bundle_path, or use the container runner.",
 	)
 	return w
+}
+
+// javaNonProxyHosts renders the NO_PROXY list in http.nonProxyHosts syntax,
+// which understands only "|"-separated hostname globs — no CIDR notation. The
+// two lists must be derived from the same source, or Java processes would
+// proxy hosts that everything else bypasses.
+func javaNonProxyHosts(extra []string) string {
+	var out []string
+	for _, entry := range append(append([]string{}, defaultNoProxy...), extra...) {
+		out = append(out, javaHostPatterns(entry)...)
+	}
+	return strings.Join(out, "|")
+}
+
+func javaHostPatterns(entry string) []string {
+	entry = strings.TrimSpace(entry)
+	switch {
+	case entry == "":
+		return nil
+	case entry == "::1":
+		return []string{"[::1]"}
+	case entry == "127.0.0.1":
+		// Broaden to the whole loopback block, matching Java's own default.
+		return []string{"127.*"}
+	case strings.Contains(entry, "/"):
+		return cidrToJavaPatterns(entry)
+	default:
+		// Hostnames and *.wildcards are already valid nonProxyHosts syntax.
+		return []string{entry}
+	}
+}
+
+// cidrToJavaPatterns approximates an IPv4 CIDR with dotted wildcards. Octet-
+// aligned prefixes map to a single pattern (10.0.0.0/8 -> 10.*); prefixes
+// between /8 and /16 enumerate their /16s (172.16.0.0/12 -> 172.16.* through
+// 172.31.*). Anything finer is dropped: Java's matcher cannot express it, and
+// silently over-matching would be worse than not matching.
+func cidrToJavaPatterns(entry string) []string {
+	ip, ipnet, err := net.ParseCIDR(entry)
+	if err != nil || ip.To4() == nil {
+		return nil
+	}
+	ones, bits := ipnet.Mask.Size()
+	if bits != 32 {
+		return nil
+	}
+	v4 := ip.To4()
+	switch {
+	case ones%8 == 0 && ones > 0 && ones <= 24:
+		parts := strings.Split(v4.String(), ".")
+		return []string{strings.Join(parts[:ones/8], ".") + ".*"}
+	case ones > 8 && ones < 16:
+		count := 1 << (16 - ones)
+		out := make([]string, 0, count)
+		for i := 0; i < count; i++ {
+			out = append(out, fmt.Sprintf("%d.%d.*", v4[0], int(v4[1])+i))
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func splitProxy(proxyURL string) (host, port string) {

@@ -30,6 +30,7 @@ pytest -q
 | `serve` | Run the proxy. Add `--transparent` for kernel-redirected traffic. |
 | `env` | Print the environment the process under test needs. |
 | `check` | Probe a running proxy. Exit 2 if interception is not live. |
+| `trust` | Build a Java truststore (`--java`), or add the CA to an app-managed keystore (`--inject`). |
 | `ca` | Create or inspect the local interception CA. |
 
 ## Config
@@ -55,6 +56,15 @@ Host matching is exact or a single leading `*.` wildcard. Exact always beats
 wildcard, so `api.stripe.com` can route differently from `*.stripe.com`. Two
 services claiming the same host is rejected at load rather than resolved by
 declaration order.
+
+`allow_passthrough` accepts the preset `"@build"`, which expands to the
+package registries a build tool needs (Maven Central, Gradle, npm, PyPI, Go,
+crates.io, RubyGems, NuGet, Packagist). Without it, running tests behind the
+strict proxy means resolving dependencies with interception off and then
+forcing the build tool offline; with it, dependency traffic flows around the
+proxy while the strict-mode guarantee stays auditable — these exact hosts and
+nothing else. The list is first-party registry hosts only; a project on a
+private registry adds its own host next to the preset.
 
 An unresolved service upstream is derived as
 `{base_url}/s/{sandbox_id}/{service}`.
@@ -95,7 +105,18 @@ standard for any of them, so each runtime needs its own:
 | Go | env | `SSL_CERT_FILE` (Linux only) |
 | Node | needs `--use-env-proxy` | `NODE_EXTRA_CA_CERTS` |
 | .NET | env | `SSL_CERT_FILE` (Linux only) |
-| Java | none; needs `-D` flags | JKS truststore, not a PEM |
+| Java | `JAVA_TOOL_OPTIONS`, after `trust --java` | JKS truststore, not a PEM |
+
+Java deserves its own paragraph because it reads none of the usual variables.
+`veris-proxy trust --java` copies the JDK's cacerts and imports the Veris CA;
+`env` finds the result and emits `JAVA_TOOL_OPTIONS` with the `-D` proxy,
+`nonProxyHosts` and truststore flags, which every JVM — including Gradle and
+Maven test forks — picks up from the environment. An app that loads its own
+keystore from disk (the k8s-mounted `keystore.p12` pattern) never consults the
+JVM default truststore, and custom trust managers wrapping such a keystore
+have been observed to break outright when it is empty rather than fall back;
+`trust --inject path/to/keystore.p12` puts the CA where the app actually
+looks.
 
 `env` prints what it cannot cover to stderr rather than letting you discover it
 as a mystery TLS failure. Four cases are genuinely out of reach here: Go on

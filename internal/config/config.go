@@ -126,6 +126,55 @@ func (c *Config) applyDefaults() {
 	if c.Mode == "" {
 		c.Mode = ModeStrict
 	}
+	c.AllowPassthrough = expandPresets(c.AllowPassthrough)
+}
+
+// BuildHostsPreset is what "@build" in allow_passthrough expands to: the
+// package registries a build tool needs during dependency resolution.
+//
+// Without this, running tests behind the strict proxy needs a two-phase
+// dance — resolve dependencies with interception off, then run with the
+// build tool forced offline — because the registries are unmapped hosts and
+// strict mode rightly blocks them. Listing them here keeps the strict-mode
+// guarantee auditable: these exact hosts and nothing else bypass the sandbox.
+//
+// The list is deliberately conservative: first-party registry hosts only, no
+// CDN wildcards and no cloud-storage buckets that also serve arbitrary
+// content. A project on a private registry adds its own host next to the
+// preset.
+var BuildHostsPreset = []string{
+	// Maven / Gradle. plugins.gradle.org answers metadata but redirects
+	// artifact downloads to plugins-artifacts.gradle.org; missing either one
+	// fails resolution with a 502 that names the host.
+	"repo.maven.apache.org", "repo1.maven.org",
+	"services.gradle.org", "downloads.gradle.org",
+	"plugins.gradle.org", "plugins-artifacts.gradle.org",
+	// npm / yarn
+	"registry.npmjs.org", "registry.yarnpkg.com",
+	// Python
+	"pypi.org", "files.pythonhosted.org",
+	// Go
+	"proxy.golang.org", "sum.golang.org",
+	// Rust
+	"crates.io", "index.crates.io", "static.crates.io",
+	// Ruby
+	"rubygems.org", "index.rubygems.org",
+	// .NET
+	"api.nuget.org",
+	// PHP
+	"repo.packagist.org",
+}
+
+func expandPresets(entries []string) []string {
+	var out []string
+	for _, e := range entries {
+		if strings.TrimSpace(e) == "@build" {
+			out = append(out, BuildHostsPreset...)
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // Validate rejects configurations that would silently misbehave at runtime.
@@ -152,6 +201,14 @@ func (c *Config) Validate() error {
 		u, err := url.Parse(c.Upstream.BaseURL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return fmt.Errorf("upstream.base_url %q is not an absolute URL", c.Upstream.BaseURL)
+		}
+	}
+
+	// applyDefaults has already expanded known presets, so any "@" entry left
+	// is a typo, and a typo here would silently fail open or closed at runtime.
+	for _, p := range c.AllowPassthrough {
+		if strings.HasPrefix(strings.TrimSpace(p), "@") {
+			return fmt.Errorf("allow_passthrough entry %q: unknown preset (only \"@build\" is defined)", p)
 		}
 	}
 

@@ -33,6 +33,7 @@ Usage:
   veris-proxy serve   --config <file> [--listen <addr>] [--transparent] [--log-level <level>]
   veris-proxy env     --config <file> [--format posix|fish|powershell|dotenv|json|github] [--explain]
   veris-proxy check   [--proxy <url>] [--expect-canary <token>] [--timeout <dur>]
+  veris-proxy trust   --java [--jdk <dir>] [--out <path>] | --inject <keystore> [--storepass <pw>]
   veris-proxy ca      --ca-dir <dir> [--print]
   veris-proxy version
 
@@ -40,6 +41,7 @@ Commands:
   serve   Run the interception proxy.
   env     Print the environment the process under test needs.
   check   Probe a running proxy and fail if interception is not live.
+  trust   Build a Java truststore, or add the CA to an app's own keystore.
   ca      Create or show the local interception CA.
 
 Exit codes:
@@ -73,6 +75,8 @@ func run(args []string) error {
 		return cmdEnv(args[1:])
 	case "check":
 		return cmdCheck(args[1:])
+	case "trust":
+		return cmdTrust(args[1:])
 	case "ca":
 		return cmdCA(args[1:])
 	case "version", "--version", "-v":
@@ -189,6 +193,14 @@ func cmdEnv(args []string) error {
 		url = "http://" + cfg.Listen
 	}
 
+	// A truststore built by `trust --java` lands in the CA directory; pick it
+	// up automatically so Java coverage does not depend on remembering a flag.
+	if *javaStore == "" {
+		if candidate := filepath.Join(authority.Dir(), trust.DefaultJavaTrustStoreName); fileExists(candidate) {
+			*javaStore = candidate
+		}
+	}
+
 	opts := trust.Options{
 		ProxyURL:           url,
 		CACertPath:         authority.CertPath(),
@@ -287,6 +299,54 @@ func cmdCheck(args []string) error {
 	return nil
 }
 
+func cmdTrust(args []string) error {
+	fs := flag.NewFlagSet("trust", flag.ContinueOnError)
+	java := fs.Bool("java", false, "build a Java truststore: the JDK's cacerts plus the Veris CA")
+	inject := fs.String("inject", "", "path to an application-managed keystore to add the Veris CA to")
+	jdk := fs.String("jdk", "", "JDK home to take keytool and cacerts from (defaults to $JAVA_HOME, then $PATH)")
+	caDir := fs.String("ca-dir", defaultCADir(), "directory holding the CA")
+	out := fs.String("out", "", "output path for --java (defaults to <ca-dir>/"+trust.DefaultJavaTrustStoreName+")")
+	storePass := fs.String("storepass", "changeit", "keystore password (the JDK cacerts default is changeit)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*java && *inject == "" {
+		return errors.New("trust requires --java, --inject <keystore>, or both")
+	}
+
+	authority, err := ca.Load(expand(*caDir))
+	if err != nil {
+		return err
+	}
+
+	if *java {
+		outPath := *out
+		if outPath == "" {
+			outPath = filepath.Join(authority.Dir(), trust.DefaultJavaTrustStoreName)
+		}
+		cacerts, err := trust.BuildJavaTrustStore(*jdk, authority.CertPath(), outPath, *storePass)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("java truststore written: %s (from %s)\n", outPath, cacerts)
+		if *out == "" {
+			// The default location is where `env` looks, so no extra flag is
+			// needed; a custom location must be passed back in explicitly.
+			fmt.Println("`veris-proxy env` will now emit JAVA_TOOL_OPTIONS automatically")
+		} else {
+			fmt.Printf("pass it to env: veris-proxy env --config <file> --java-truststore %s\n", outPath)
+		}
+	}
+
+	if *inject != "" {
+		if err := trust.InjectCA(*jdk, authority.CertPath(), *inject, *storePass); err != nil {
+			return err
+		}
+		fmt.Printf("veris-ca imported into %s\n", *inject)
+	}
+	return nil
+}
+
 func cmdCA(args []string) error {
 	fs := flag.NewFlagSet("ca", flag.ContinueOnError)
 	dir := fs.String("ca-dir", defaultCADir(), "directory holding the CA")
@@ -312,6 +372,11 @@ func cmdCA(args []string) error {
 	}, "", "  ")
 	fmt.Println(string(out))
 	return nil
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func defaultCADir() string {
