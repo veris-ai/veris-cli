@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "listen": "127.0.0.1:8080",
+  "sandbox_id": "sbx_replace_me",
+  "env_id": "env_replace_me",
+  "mode": "strict",
+  "ca_dir": "~/.veris/ca",
+  "upstream": {
+    "base_url": "https://sandbox.veris.ai",
+    "auth_value_env": "VERIS_API_KEY"
+  },
+  "services": [
+    { "name": "stripe",   "hosts": ["api.stripe.com", "files.stripe.com"] },
+    { "name": "sendgrid", "hosts": ["api.sendgrid.com"] },
+    { "name": "avalara",  "hosts": ["*.avalara.com"] }
+  ],
+  "allow_passthrough": ["*.internal.example.com"],
+  "canary_token": "generated-per-run-by-the-cli"
+}
