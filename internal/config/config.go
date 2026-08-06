@@ -95,25 +95,82 @@ type Service struct {
 	Upstream string `json:"upstream,omitempty"`
 }
 
-// Load reads and validates a config file.
+// Overrides carries the per-run values that deliberately have no home in a
+// committed config file. A committed sandbox_id would go stale, and a
+// committed canary token would defeat stale-proxy detection outright — the
+// token only proves anything because each run mints its own.
+type Overrides struct {
+	SandboxID   string
+	CanaryToken string
+	// UpstreamBaseURL is where the current sandbox's services live, taken
+	// from the create_sandbox response. Per-run because the ingress host is
+	// the platform's to change, not the repo's to pin.
+	UpstreamBaseURL string
+	Listen          string
+}
+
+// Load reads and validates a config file: the committed .veris.toml or the
+// CLI-generated proxy.json, chosen by extension.
 func Load(path string) (*Config, error) {
+	return LoadWithOverrides(path, Overrides{})
+}
+
+// LoadWithOverrides reads a config file, applies per-run values on top, and
+// validates the result.
+func LoadWithOverrides(path string, o Overrides) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	var c Config
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&c); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	var c *Config
+	if isTOMLPath(path) {
+		c, err = parseTOML(raw, path)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		c = &Config{}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(c); err != nil {
+			return nil, fmt.Errorf("parse config %s: %w", path, err)
+		}
+	}
+
+	if o.SandboxID != "" {
+		c.SandboxID = o.SandboxID
+	}
+	if o.CanaryToken != "" {
+		c.CanaryToken = o.CanaryToken
+	}
+	if o.UpstreamBaseURL != "" {
+		c.Upstream.BaseURL = o.UpstreamBaseURL
+	}
+	if o.Listen != "" {
+		c.Listen = o.Listen
 	}
 
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return &c, nil
+	return c, nil
+}
+
+// DefaultPaths is the search order when no --config is given: the committed
+// team file first, then the CLI-generated wire format.
+var DefaultPaths = []string{".veris.toml", ".veris/proxy.json"}
+
+// FindDefault returns the first default config path that exists.
+func FindDefault() (string, error) {
+	for _, p := range DefaultPaths {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("no config found (looked for %s); pass --config",
+		strings.Join(DefaultPaths, ", "))
 }
 
 func (c *Config) applyDefaults() {

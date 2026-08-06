@@ -30,12 +30,18 @@ var version = "dev"
 const usage = `veris-proxy - route code under test at a Veris dependency sandbox
 
 Usage:
-  veris-proxy serve   --config <file> [--listen <addr>] [--transparent] [--log-level <level>]
-  veris-proxy env     --config <file> [--format posix|fish|powershell|dotenv|json|github] [--explain]
+  veris-proxy serve   [--config <file>] [--sandbox-id <id>] [--canary <tok>] [--upstream <url>]
+                      [--listen <addr>] [--transparent] [--log-level <level>]
+  veris-proxy env     [--config <file>] [--sandbox-id <id>] [--canary <tok>]
+                      [--format posix|fish|powershell|dotenv|json|github] [--explain]
   veris-proxy check   [--proxy <url>] [--expect-canary <token>] [--timeout <dur>]
   veris-proxy trust   --java [--jdk <dir>] [--out <path>] | --inject <keystore> [--storepass <pw>]
   veris-proxy ca      --ca-dir <dir> [--print]
   veris-proxy version
+
+Config resolves to --config, else .veris.toml, else .veris/proxy.json. The
+committed .veris.toml never holds sandbox_id or a canary token; those are
+per-run and arrive via the flags.
 
 Commands:
   serve   Run the interception proxy.
@@ -93,8 +99,11 @@ func run(args []string) error {
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to the proxy config (required)")
+	cfgPath := fs.String("config", "", "path to the proxy config (defaults to .veris.toml, then .veris/proxy.json)")
 	listen := fs.String("listen", "", "override the listen address from the config")
+	sandboxID := fs.String("sandbox-id", "", "per-run sandbox id (required when the config file has none)")
+	canary := fs.String("canary", "", "per-run canary token; mint a fresh one per run")
+	upstream := fs.String("upstream", "", "override upstream.base_url with the current sandbox's ingress")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
 	logFormat := fs.String("log-format", "text", "text or json")
 	transparent := fs.Bool("transparent", false,
@@ -105,18 +114,20 @@ func cmdServe(args []string) error {
 		return err
 	}
 	if *cfgPath == "" {
-		return errors.New("serve requires --config")
-	}
-
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		return err
-	}
-	if *listen != "" {
-		cfg.Listen = *listen
-		if err := cfg.Validate(); err != nil {
+		var err error
+		if *cfgPath, err = config.FindDefault(); err != nil {
 			return err
 		}
+	}
+
+	cfg, err := config.LoadWithOverrides(*cfgPath, config.Overrides{
+		SandboxID:       *sandboxID,
+		CanaryToken:     *canary,
+		UpstreamBaseURL: *upstream,
+		Listen:          *listen,
+	})
+	if err != nil {
+		return err
 	}
 
 	log := newLogger(*logLevel, *logFormat)
@@ -165,10 +176,13 @@ func cmdServe(args []string) error {
 
 func cmdEnv(args []string) error {
 	fs := flag.NewFlagSet("env", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to the proxy config (required)")
+	cfgPath := fs.String("config", "", "path to the proxy config (defaults to .veris.toml, then .veris/proxy.json)")
 	format := fs.String("format", "posix", "posix, fish, powershell, dotenv, json or github")
 	explain := fs.Bool("explain", false, "annotate each variable with why it is set")
 	quiet := fs.Bool("quiet", false, "suppress coverage warnings on stderr")
+	sandboxID := fs.String("sandbox-id", "", "per-run sandbox id, matching what serve was given")
+	canary := fs.String("canary", "", "per-run canary token, matching what serve was given")
+	upstream := fs.String("upstream", "", "override upstream.base_url, matching what serve was given")
 	javaStore := fs.String("java-truststore", "", "path to a JKS truststore containing the Veris CA")
 	javaPass := fs.String("java-truststore-pass", "changeit", "password for the JKS truststore")
 	proxyURL := fs.String("proxy-url", "", "override the proxy URL (defaults to the config listen address)")
@@ -176,10 +190,17 @@ func cmdEnv(args []string) error {
 		return err
 	}
 	if *cfgPath == "" {
-		return errors.New("env requires --config")
+		var err error
+		if *cfgPath, err = config.FindDefault(); err != nil {
+			return err
+		}
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.LoadWithOverrides(*cfgPath, config.Overrides{
+		SandboxID:       *sandboxID,
+		CanaryToken:     *canary,
+		UpstreamBaseURL: *upstream,
+	})
 	if err != nil {
 		return err
 	}

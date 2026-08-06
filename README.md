@@ -33,11 +33,51 @@ pytest -q
 | `trust` | Build a Java truststore (`--java`), or add the CA to an app-managed keystore (`--inject`). |
 | `ca` | Create or inspect the local interception CA. |
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.sh | sh
+```
+
+Static binary into `~/.local/bin` (override with `VERIS_INSTALL_DIR`), no root
+and no package manager, so the same line works on a laptop, in CI, and inside
+a container build.
+
 ## Config
 
-JSON rather than YAML, because the Veris CLI owns the human-facing `veris.yaml`
-and compiles it down to this. That keeps the binary dependency-free and the
-wire format unambiguous. See `examples/proxy.json`.
+Two faces of the same schema, chosen by file extension, resolved as
+`--config`, else `.veris.toml`, else `.veris/proxy.json`:
+
+**`.veris.toml`** is the committed, team-shared face. It holds what is durable
+— the environment id, the service-to-hostname map, passthrough rules — and a
+`[run]` table that the integration-testing skill owns and the proxy ignores.
+No secrets. The two per-run values deliberately have no home in it: a
+committed `sandbox_id` goes stale, and a committed canary token would defeat
+stale-proxy detection outright. Those arrive as flags:
+
+```sh
+veris-proxy serve --sandbox-id sbx_abc123 --canary "$(uuidgen)" \
+  --upstream https://sandbox.veris.ai
+```
+
+```toml
+[veris]
+env_id = "env_abc123"
+
+[proxy]
+listen = "127.0.0.1:8080"
+allow_passthrough = ["@build"]
+
+[services.stripe]
+hosts = ["api.stripe.com", "*.stripe.com"]
+
+[run]                       # owned by the skill; the proxy ignores it
+mode = "host"
+test_cmd = "make integration"
+```
+
+**`proxy.json`** is the wire format the Veris CLI compiles down to, complete
+per-run values included. See `examples/proxy.json`.
 
 ```json
 {
