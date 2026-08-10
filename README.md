@@ -31,20 +31,26 @@ download the `.exe` from the releases page.
 ```sh
 gcloud auth configure-docker us-central1-docker.pkg.dev   # once, to pull the proxy image
 export VERIS_API_KEY=...
-veris-proxy run --sandbox sbx_abc123 --image your-image -- pytest -q
+veris-proxy run --environment env_abc123 --image your-image -- pytest -q
 ```
 
 Or with no command at all, letting the image's own `ENTRYPOINT` and `CMD` run —
 which is what an application image is built to do:
 
 ```sh
-veris-proxy run --sandbox sbx_abc123 --image your-image
+veris-proxy run --environment env_abc123 --image your-image
 ```
 
-One command, no docker of your own. It starts the proxy in its own container,
-runs your image in a second one sharing that network namespace, streams the
-output, reports what the sandbox received, propagates your command's exit code,
-and tears both down.
+One command, no docker of your own, nothing provisioned in advance.
+`--environment` deploys a fresh sandbox of that environment for this run and
+deletes it afterwards; the proxy starts in its own container, your image runs
+in a second one sharing that network namespace, the output streams, the run
+reports what the sandbox received, your command's exit code propagates, and
+everything is torn down.
+
+`--sandbox sbx_abc123` instead attaches to a sandbox that already exists —
+the right shape when something seeded state into it first, or when several
+suites share one world. Everything below works the same in either mode.
 
 **Your image needs nothing** — no capability, no `iptables`, no entrypoint
 change, no particular base. Distroless and scratch work. Every requirement sits
@@ -115,15 +121,15 @@ delivery at all.
 
 ### A sandbox of your own
 
-`--environment` deploys a fresh sandbox for the run and deletes it afterwards,
-instead of attaching to one that already exists:
+`--environment` works for a long-lived `serve` session the same way it does
+for `run`:
 
 ```sh
 veris-proxy serve --environment env_abc123 --expose 3000
 ```
 
-This is the better default when you are receiving callbacks, for a reason worth
-stating plainly: `client.default_base_url` is a sandbox-wide singleton. Two
+When you are receiving callbacks it is not just simpler but safer, for a
+reason worth stating plainly: `client.default_base_url` is a sandbox-wide singleton. Two
 concurrent runs sharing one sandbox overwrite each other's callback URL, and the
 first run's webhooks are then delivered to the second run's app — silently, with
 neither able to notice. A sandbox per run removes that entirely.
