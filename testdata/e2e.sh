@@ -76,7 +76,8 @@ cat > "$WORK/config.json" <<EOF
 }
 EOF
 
-"$BIN" serve --config "$WORK/config.json" --log-level warn >"$WORK/proxy.log" 2>&1 &
+"$BIN" serve --config "$WORK/config.json" --log-level warn \
+  --write-env "$WORK/veris.env" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 50); do
   curl -fsS "${PROXY}/__veris/status" >/dev/null 2>&1 && break
@@ -141,14 +142,15 @@ else
 fi
 
 # --- Python requests ----------------------------------------------------------
-# These probes source `veris-proxy env` rather than hand-setting HTTPS_PROXY.
+# These probes source the environment the proxy writes (serve --write-env)
+# rather than hand-setting HTTPS_PROXY.
 # Hand-setting only the uppercase name is not equivalent: Python lowercases every
 # *_proxy name it finds, so an ambient lowercase https_proxy (near-universal in
 # CI runners and images that sit behind an egress proxy) silently wins and the
-# request leaves through the wrong proxy. Sourcing the real output also means
-# this test exercises what users actually run.
+# request leaves through the wrong proxy. Sourcing the real file also means
+# this test exercises what a supervisor actually reads.
 if python3 -c 'import requests' 2>/dev/null; then
-  if ( eval "$("$BIN" env --config "$WORK/config.json" --quiet)"; python3 -c "
+  if ( . "$WORK/veris.env"; python3 -c "
 import json, requests
 r = requests.get('https://api.stripe.com/v1/charges', timeout=10)
 d = r.json()
@@ -174,37 +176,43 @@ if (d.service !== 'stripe') { console.error('bad service', d); process.exit(1); 
 JS
   # Decide up front whether this Node can do --use-env-proxy, so that a genuine
   # interception failure fails the suite instead of hiding behind a SKIP.
+  # Measured, not parsed from the version: the flag landed in 22.21 and 24.5,
+  # so a numeric >= check wrongly includes every 23.x. This is also exactly how
+  # the binary decides whether to emit the flag, so the two cannot disagree.
   nver=$(node -p 'process.versions.node')
-  nmaj=${nver%%.*}; nrest=${nver#*.}; nmin=${nrest%%.*}
-  if [ "$nmaj" -gt 22 ] || { [ "$nmaj" -eq 22 ] && [ "$nmin" -ge 21 ]; }; then
-    if ( eval "$("$BIN" env --config "$WORK/config.json" --quiet)"; node "$WORK/probe.mjs" ); then
+  if NODE_OPTIONS=--use-env-proxy node -e '' >/dev/null 2>&1; then
+    if ( . "$WORK/veris.env"; node "$WORK/probe.mjs" ); then
       pass "node fetch: intercepted by the emitted environment"
     else
       fail "node fetch: not intercepted on node $nver"
     fi
   else
-    printf '  \033[33mSKIP\033[0m node fetch (node %s < 22.21, no --use-env-proxy)\n' "$nver"
+    printf '  \033[33mSKIP\033[0m node fetch (node %s does not accept --use-env-proxy)\n' "$nver"
   fi
 else
   printf '  \033[33mSKIP\033[0m node not installed\n'
 fi
 
 # --- env emission -------------------------------------------------------------
-envout=$("$BIN" env --config "$WORK/config.json" --quiet)
+envout=$(cat "$WORK/veris.env")
 for v in NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE HTTPS_PROXY NO_PROXY VERIS_CANARY; do
   echo "$envout" | grep -q "^export ${v}=" || fail "env: missing $v"
 done
-echo "$envout" | grep -q 'NODE_OPTIONS=.*use-env-proxy' || fail "env: NODE_OPTIONS missing --use-env-proxy"
+# Only where this machine's node accepts the flag: the binary measures the
+# local node before emitting it, so on an older node its absence is correct.
+if NODE_OPTIONS=--use-env-proxy node -e '' >/dev/null 2>&1; then
+  echo "$envout" | grep -q 'NODE_OPTIONS=.*use-env-proxy' || fail "env: NODE_OPTIONS missing --use-env-proxy"
+fi
 # The variable must not be named so that Codex strips it on inheritance.
 echo "$envout" | grep -qE '^export VERIS_[A-Z_]*(KEY|SECRET|TOKEN)=' \
   && fail "env: a variable name contains KEY/SECRET/TOKEN; Codex CLI would strip it" \
   || pass "env: emits the full matrix, and no name Codex would strip"
 
-# The emitted environment must actually work when eval'd.
-if ( eval "$envout"; curl -sS https://api.stripe.com/v1/charges | grep -q '"origin": "sandbox"' ); then
-  pass "env: eval'ing the output is sufficient to intercept curl"
+# The written environment must actually work when sourced.
+if ( . "$WORK/veris.env"; curl -sS https://api.stripe.com/v1/charges | grep -q '"origin": "sandbox"' ); then
+  pass "env: sourcing the file is sufficient to intercept curl"
 else
-  fail "env: eval'd environment did not intercept"
+  fail "env: sourced environment did not intercept"
 fi
 
 echo

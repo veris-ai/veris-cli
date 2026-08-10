@@ -14,20 +14,28 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/veris-ai/veris-proxy/internal/hostport"
 )
 
 // Mode controls what happens to a host with no matching service.
 type Mode string
 
 const (
-	// ModeStrict blocks unmapped hosts. This is the default, and it is the
-	// only mode that makes a passing test run meaningful: if the code under
-	// test can still reach the real internet, a green run proves nothing.
+	// ModeStrict blocks unmapped hosts. Opt in when a run must prove the code
+	// under test reached nothing but the sandbox.
 	ModeStrict Mode = "strict"
 
-	// ModePassthrough forwards unmapped hosts to their real destination. Useful
-	// while a developer is still discovering which dependencies a service has,
-	// but it must never be the default.
+	// ModePassthrough forwards unmapped hosts to their real destination, and is
+	// the default: only the services a sandbox actually provisions are
+	// rerouted, and everything else -- telemetry, package registries, an
+	// internal API -- behaves as it always did. A proxy that blocks whatever it
+	// was not told about makes adoption a configuration project.
+	//
+	// What strict mode was protecting against is real, but the receipt answers
+	// it directly rather than by blocking: the run reports what the sandbox
+	// received, so a suite that quietly talked to the real vendor is visible
+	// without having to forbid every host nobody listed.
 	ModePassthrough Mode = "passthrough"
 )
 
@@ -91,86 +99,36 @@ type Service struct {
 	// Exact matches and a single leading "*." wildcard are supported.
 	Hosts []string `json:"hosts"`
 
+	// Paths narrows this entry to request paths under one of these prefixes.
+	// A vendor that fronts several services on one hostname needs it: Google
+	// serves Calendar, Drive and its identity endpoints on
+	// www.googleapis.com, told apart only by prefix. Empty means the entry
+	// claims the whole host.
+	Paths []string `json:"paths,omitempty"`
+
 	// Upstream optionally overrides the derived target for this service.
 	Upstream string `json:"upstream,omitempty"`
 }
 
-// Overrides carries the per-run values that deliberately have no home in a
-// committed config file. A committed sandbox_id would go stale, and a
-// committed canary token would defeat stale-proxy detection outright — the
-// token only proves anything because each run mints its own.
-type Overrides struct {
-	SandboxID   string
-	CanaryToken string
-	// UpstreamBaseURL is where the current sandbox's services live, taken
-	// from the create_sandbox response. Per-run because the ingress host is
-	// the platform's to change, not the repo's to pin.
-	UpstreamBaseURL string
-	Listen          string
-}
-
-// Load reads and validates a config file: the committed .veris.toml or the
-// CLI-generated proxy.json, chosen by extension.
+// Load reads and validates a config file.
 func Load(path string) (*Config, error) {
-	return LoadWithOverrides(path, Overrides{})
-}
-
-// LoadWithOverrides reads a config file, applies per-run values on top, and
-// validates the result.
-func LoadWithOverrides(path string, o Overrides) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	var c *Config
-	if isTOMLPath(path) {
-		c, err = parseTOML(raw, path)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		c = &Config{}
-		dec := json.NewDecoder(strings.NewReader(string(raw)))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(c); err != nil {
-			return nil, fmt.Errorf("parse config %s: %w", path, err)
-		}
-	}
-
-	if o.SandboxID != "" {
-		c.SandboxID = o.SandboxID
-	}
-	if o.CanaryToken != "" {
-		c.CanaryToken = o.CanaryToken
-	}
-	if o.UpstreamBaseURL != "" {
-		c.Upstream.BaseURL = o.UpstreamBaseURL
-	}
-	if o.Listen != "" {
-		c.Listen = o.Listen
+	var c Config
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return c, nil
-}
-
-// DefaultPaths is the search order when no --config is given: the committed
-// team file first, then the CLI-generated wire format.
-var DefaultPaths = []string{".veris.toml", ".veris/proxy.json"}
-
-// FindDefault returns the first default config path that exists.
-func FindDefault() (string, error) {
-	for _, p := range DefaultPaths {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("no config found (looked for %s); pass --config",
-		strings.Join(DefaultPaths, ", "))
+	return &c, nil
 }
 
 func (c *Config) applyDefaults() {
@@ -181,7 +139,7 @@ func (c *Config) applyDefaults() {
 		c.Listen = "127.0.0.1:8080"
 	}
 	if c.Mode == "" {
-		c.Mode = ModeStrict
+		c.Mode = ModePassthrough
 	}
 	c.AllowPassthrough = expandPresets(c.AllowPassthrough)
 }
@@ -294,44 +252,99 @@ func (c *Config) Validate() error {
 			if strings.Contains(h, "*") && !strings.HasPrefix(h, "*.") {
 				return fmt.Errorf("service %q: host %q may only use a wildcard as a leading \"*.\"", s.Name, h)
 			}
-			// Two services claiming the same hostname is always a config bug,
-			// and resolving it by declaration order would be arbitrary.
-			if prev, dup := seen[h]; dup {
-				return fmt.Errorf("host %q is claimed by both %q and %q", h, prev, s.Name)
+			// Two services claiming the same host AND prefix is always a
+			// config bug, and resolving it by declaration order would be
+			// arbitrary. Different prefixes on one host are the point.
+			for _, key := range claimKeys(h, s.Paths) {
+				if prev, dup := seen[key]; dup {
+					return fmt.Errorf("%s is claimed by both %q and %q", key, prev, s.Name)
+				}
+				seen[key] = s.Name
 			}
-			seen[h] = s.Name
 		}
 	}
 	return nil
 }
 
-// Target is the resolved routing decision for a single hostname.
+// claimKeys is what a service entry occupies: one key per host, or per
+// host+prefix when the entry narrows to prefixes. Prefixes are normalized
+// first, because "/v2" and "/v2/" route identically and so must collide.
+func claimKeys(host string, paths []string) []string {
+	wholeHost := fmt.Sprintf("host %q", host)
+	if len(paths) == 0 {
+		return []string{wholeHost}
+	}
+	keys := make([]string, 0, len(paths))
+	for _, p := range paths {
+		stem := normalizePrefix(p)
+		if stem == "/" {
+			// A root prefix claims everything on the host, exactly like an
+			// entry with no prefixes at all, so it takes the same key. A
+			// separate one would let two services claim one host and leave
+			// Resolve picking whichever happened to be declared first.
+			keys = append(keys, wholeHost)
+			continue
+		}
+		keys = append(keys, fmt.Sprintf("host %q path %q", host, stem))
+	}
+	return keys
+}
+
+// normalizePrefix reduces a declared prefix to the stem the matcher uses.
+func normalizePrefix(prefix string) string {
+	stem := strings.TrimSuffix(strings.TrimSpace(prefix), "/")
+	if stem == "" {
+		return "/"
+	}
+	return stem
+}
+
+// Target is the resolved routing decision for a single request.
 type Target struct {
 	Service  string
 	Upstream *url.URL
+
+	// Prefix is the path prefix that matched, or "/" when the entry claims the
+	// whole host. The run receipt records it, so a client can require that a
+	// specific service on a shared hostname was actually exercised.
+	Prefix string
 }
 
 // Resolve maps a request host onto a service upstream.
 //
 // Exact matches always beat wildcards, and among wildcards the longest suffix
 // wins, so "api.stripe.com" can be routed differently from "*.stripe.com".
-func (c *Config) Resolve(host string) (*Target, bool) {
-	name := strings.ToLower(stripPort(host))
+func (c *Config) Resolve(host, path string) (*Target, bool) {
+	name := strings.ToLower(hostport.StripPort(host))
+	if path == "" {
+		path = "/"
+	}
 
 	var (
-		best     *Service
-		bestSpec int // -1 exact, otherwise negative wildcard length; higher is better
+		best       *Service
+		bestHost   int
+		bestPath   int
+		bestPrefix string
+		haveMatch  bool
 	)
 	for i := range c.Services {
 		s := &c.Services[i]
 		for _, pattern := range s.Hosts {
 			pattern = strings.ToLower(strings.TrimSpace(pattern))
-			score, ok := matchScore(pattern, name)
+			hostScore, ok := matchScore(pattern, name)
 			if !ok {
 				continue
 			}
-			if best == nil || score > bestSpec {
-				best, bestSpec = s, score
+			prefix, pScore, ok := s.matchPath(path)
+			if !ok {
+				continue
+			}
+			// Host specificity outranks path length, so an exact host with a
+			// narrow prefix still beats a wildcard that claims everything.
+			// Within one host, the longer prefix wins.
+			if !haveMatch || hostScore > bestHost ||
+				(hostScore == bestHost && pScore > bestPath) {
+				best, bestHost, bestPath, bestPrefix, haveMatch = s, hostScore, pScore, prefix, true
 			}
 		}
 	}
@@ -351,7 +364,71 @@ func (c *Config) Resolve(host string) (*Target, bool) {
 		// unreachable in practice.
 		return nil, false
 	}
-	return &Target{Service: best.Name, Upstream: u}, true
+	return &Target{Service: best.Name, Upstream: u, Prefix: bestPrefix}, true
+}
+
+// ServiceEndpoints is each service's base URL, which is also where its
+// /veris/* control plane lives.
+//
+// Derived here rather than by the caller: the sandbox-and-name path shape is
+// this file's knowledge, and a second copy of it would be a second thing to
+// keep right when the platform moves it.
+func (c *Config) ServiceEndpoints() []ServiceEndpoint {
+	out := make([]ServiceEndpoint, 0, len(c.Services))
+	for _, s := range c.Services {
+		raw := s.Upstream
+		if raw == "" {
+			if c.Upstream.BaseURL == "" {
+				continue
+			}
+			raw = strings.TrimSuffix(c.Upstream.BaseURL, "/") +
+				"/s/" + url.PathEscape(c.SandboxID) +
+				"/" + url.PathEscape(s.Name)
+		}
+		out = append(out, ServiceEndpoint{Name: s.Name, BaseURL: raw})
+	}
+	return out
+}
+
+// ServiceEndpoint names one service and where to reach it.
+type ServiceEndpoint struct {
+	Name    string
+	BaseURL string
+}
+
+// matchPath reports which of the service's prefixes claims path, and how
+// specific that match is. A service with no prefixes claims the whole host and
+// scores zero, so any explicit prefix on the same host outranks it.
+func (s *Service) matchPath(path string) (string, int, bool) {
+	if len(s.Paths) == 0 {
+		return "/", 0, true
+	}
+	var (
+		bestPrefix string
+		best       int
+		ok         bool
+	)
+	for _, prefix := range s.Paths {
+		stem := normalizePrefix(prefix)
+		score, hit := prefixScore(stem, path)
+		if hit && (!ok || score > best) {
+			bestPrefix, best, ok = stem, score, true
+		}
+	}
+	return bestPrefix, best, ok
+}
+
+// prefixScore matches on a segment boundary, so "/userinfo" claims
+// "/userinfo/v2/me" but not "/userinfoXYZ", and no entry needs a hand-tuned
+// trailing slash to behave. stem must already be normalized.
+func prefixScore(stem, path string) (int, bool) {
+	if stem == "/" {
+		return 0, true
+	}
+	if path == stem || strings.HasPrefix(path, stem+"/") {
+		return len(stem), true
+	}
+	return 0, false
 }
 
 // matchScore reports whether pattern matches host, and how specific the match
@@ -374,7 +451,7 @@ func matchScore(pattern, host string) (int, bool) {
 // Loopback is always allowed so that a test hitting its own service under test
 // is never routed to Veris.
 func (c *Config) IsPassthrough(host string) bool {
-	name := strings.ToLower(stripPort(host))
+	name := strings.ToLower(hostport.StripPort(host))
 	if name == "localhost" || strings.HasSuffix(name, ".localhost") {
 		return true
 	}
@@ -387,11 +464,4 @@ func (c *Config) IsPassthrough(host string) bool {
 		}
 	}
 	return false
-}
-
-func stripPort(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
-	}
-	return host
 }

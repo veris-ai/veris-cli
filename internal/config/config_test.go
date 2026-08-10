@@ -25,7 +25,7 @@ func TestResolvePrefersExactOverWildcard(t *testing.T) {
 		Upstream: "https://files.example.test/x",
 	})
 
-	got, ok := c.Resolve("files.stripe.com")
+	got, ok := c.Resolve("files.stripe.com", "/")
 	if !ok {
 		t.Fatal("expected a match for files.stripe.com")
 	}
@@ -39,12 +39,12 @@ func TestResolveWildcardMatchesApexAndSubdomain(t *testing.T) {
 	c.Services = []Service{{Name: "stripe", Hosts: []string{"*.stripe.com"}}}
 
 	for _, host := range []string{"stripe.com", "api.stripe.com", "a.b.stripe.com"} {
-		if _, ok := c.Resolve(host); !ok {
+		if _, ok := c.Resolve(host, "/"); !ok {
 			t.Errorf("expected *.stripe.com to match %q", host)
 		}
 	}
 	// A wildcard must not match a host that merely ends in the same letters.
-	if _, ok := c.Resolve("notstripe.com"); ok {
+	if _, ok := c.Resolve("notstripe.com", "/"); ok {
 		t.Error("*.stripe.com must not match notstripe.com")
 	}
 }
@@ -52,7 +52,7 @@ func TestResolveWildcardMatchesApexAndSubdomain(t *testing.T) {
 func TestResolveStripsPortAndIsCaseInsensitive(t *testing.T) {
 	c := base()
 	for _, host := range []string{"api.stripe.com:443", "API.Stripe.COM", "API.STRIPE.COM:8443"} {
-		got, ok := c.Resolve(host)
+		got, ok := c.Resolve(host, "/")
 		if !ok {
 			t.Fatalf("expected match for %q", host)
 		}
@@ -64,7 +64,7 @@ func TestResolveStripsPortAndIsCaseInsensitive(t *testing.T) {
 
 func TestResolveDerivesUpstreamFromBaseURL(t *testing.T) {
 	c := base()
-	got, ok := c.Resolve("api.sendgrid.com")
+	got, ok := c.Resolve("api.sendgrid.com", "/")
 	if !ok {
 		t.Fatal("expected a match")
 	}
@@ -75,7 +75,7 @@ func TestResolveDerivesUpstreamFromBaseURL(t *testing.T) {
 }
 
 func TestResolveUnknownHost(t *testing.T) {
-	if _, ok := base().Resolve("api.openai.com"); ok {
+	if _, ok := base().Resolve("api.openai.com", "/"); ok {
 		t.Fatal("unmapped host must not resolve")
 	}
 }
@@ -143,10 +143,12 @@ func TestValidateRequiresUpstreamSomewhere(t *testing.T) {
 	}
 }
 
-func TestDefaultModeIsStrict(t *testing.T) {
+func TestDefaultModeIsPassthrough(t *testing.T) {
 	c := &Config{}
 	c.applyDefaults()
-	if c.Mode != ModeStrict {
-		t.Fatalf("default mode = %q, want strict: a permissive default would make green runs meaningless", c.Mode)
+	if c.Mode != ModePassthrough {
+		t.Fatalf("default mode = %q, want passthrough: only the services a sandbox "+
+			"provisions are rerouted, and blocking the rest makes adoption a "+
+			"configuration project", c.Mode)
 	}
 }

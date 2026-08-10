@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,13 +16,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/veris-ai/veris-proxy/internal/ca"
 	"github.com/veris-ai/veris-proxy/internal/config"
+	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/proxy"
-	"github.com/veris-ai/veris-proxy/internal/trust"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
@@ -30,34 +33,49 @@ var version = "dev"
 const usage = `veris-proxy - route code under test at a Veris dependency sandbox
 
 Usage:
-  veris-proxy serve   [--config <file>] [--sandbox-id <id>] [--canary <tok>] [--upstream <url>]
-                      [--listen <addr>] [--transparent] [--log-level <level>]
-  veris-proxy env     [--config <file>] [--sandbox-id <id>] [--canary <tok>]
-                      [--format posix|fish|powershell|dotenv|json|github] [--explain]
-  veris-proxy check   [--proxy <url>] [--expect-canary <token>] [--timeout <dur>]
-  veris-proxy trust   --java [--jdk <dir>] [--out <path>] | --inject <keystore> [--storepass <pw>]
-  veris-proxy ca      --ca-dir <dir> [--print]
+  veris-proxy serve   [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]
+  veris-proxy run     [--sandbox <id>] [--image <image>] [--require-service <n>] -- <cmd>
+  veris-proxy check   [--expect-canary <token>] [--any-run] [--proxy <url>]
   veris-proxy version
 
-Config resolves to --config, else .veris.toml, else .veris/proxy.json. The
-committed .veris.toml never holds sandbox_id or a canary token; those are
-per-run and arrive via the flags.
+What to route (run and serve both accept these, most explicit first):
+  --sandbox <id>    derive the routing from this sandbox
+  --config <file>   or an explicit config file, used exactly as written
+  read from $VERIS_SANDBOX_ID and $VERIS_PROXY_CONFIG when neither is given
 
 Commands:
-  serve   Run the interception proxy.
-  env     Print the environment the process under test needs.
-  check   Probe a running proxy and fail if interception is not live.
-  trust   Build a Java truststore, or add the CA to an app's own keystore.
-  ca      Create or show the local interception CA.
+  serve   Run the proxy. This is what the container image runs, and what a
+          long-lived local session runs. Add --transparent for the kernel
+          redirect, which is the only tier that covers every runtime.
+  run     Run a command against a sandbox and report what it sent.
+          --image runs it in a container, with the proxy in its own container
+          beside it -- the image needs no capability, no iptables and no
+          change, and no docker commands are yours to write.
+          Without --image the command runs LOCALLY with proxy and CA
+          environment variables set, which covers only libraries that honour
+          them; it builds the JVM truststore itself when a JDK is present.
+
+  check   Assert that a live proxy belongs to THIS run, and exit 2 if not.
+          A proxy left running from an earlier run against a different
+          sandbox would otherwise let a suite pass against the wrong data.
 
 Exit codes:
   0  success
   1  usage or configuration error
-  2  check failed: the proxy is not intercepting
+  2  check failed: no proxy, not ours, or a different run
+  3  the run did not call a service it was required to call
+  4  the run's outcome is indeterminate
+  n  otherwise, whatever the command under "run" exited with
 `
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		// A command that ran and failed carries its own status out; printing
+		// anything here would talk over its output.
+		var code exitCode
+		if errors.As(err, &code) {
+			os.Exit(int(code))
+		}
 		var ce checkFailure
 		if errors.As(err, &ce) {
 			fmt.Fprintf(os.Stderr, "veris-proxy: %v\n", err)
@@ -75,16 +93,12 @@ func run(args []string) error {
 	}
 
 	switch args[0] {
+	case "run":
+		return cmdRun(args[1:])
 	case "serve":
 		return cmdServe(args[1:])
-	case "env":
-		return cmdEnv(args[1:])
 	case "check":
 		return cmdCheck(args[1:])
-	case "trust":
-		return cmdTrust(args[1:])
-	case "ca":
-		return cmdCA(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 		return nil
@@ -99,151 +113,371 @@ func run(args []string) error {
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to the proxy config (defaults to .veris.toml, then .veris/proxy.json)")
+	var sources configSources
+	bindConfigFlags(fs, &sources)
 	listen := fs.String("listen", "", "override the listen address from the config")
-	sandboxID := fs.String("sandbox-id", "", "per-run sandbox id (required when the config file has none)")
-	canary := fs.String("canary", "", "per-run canary token; mint a fresh one per run")
-	upstream := fs.String("upstream", "", "override upstream.base_url with the current sandbox's ingress")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
 	logFormat := fs.String("log-format", "text", "text or json")
 	transparent := fs.Bool("transparent", false,
 		"also serve kernel-redirected connections (for iptables REDIRECT inside a container)")
 	tHTTP := fs.String("transparent-http", "0.0.0.0:8081", "listen address for redirected plaintext traffic")
 	tHTTPS := fs.String("transparent-https", "0.0.0.0:8443", "listen address for redirected TLS traffic")
+	caDir := fs.String("ca-dir", "", "directory holding the CA (overrides the config's ca_dir)")
+	strict := fs.Bool("strict", false,
+		"block unmapped hosts instead of letting them reach their real destination")
+	printRoutesOnly := fs.Bool("print-routes", false,
+		"print what would be intercepted, then exit without listening")
+	environment := fs.String("environment", os.Getenv("VERIS_ENVIRONMENT_ID"),
+		"deploy a fresh sandbox from this environment `id` and delete it "+
+			"afterwards, instead of attaching to an existing --sandbox")
+	ttlMinutes := fs.Int("ttl-minutes", 60,
+		"how long a sandbox created by --environment may live if teardown never "+
+			"runs, so a crashed run cannot leak one forever")
+	expose := fs.Int("expose", 0,
+		"publish this local `port` at a public https URL so the sandbox can "+
+			"deliver callbacks to it")
+	exposeHost := fs.String("expose-host", proxy.DefaultOriginHost,
+		"`host` the exposed port is on; loopback is right when the workload shares "+
+			"this network namespace, host.docker.internal when your app is on the host")
+	exposeToken := fs.String("expose-token", "",
+		"cloudflared named-tunnel `token` (defaults to $VERIS_TUNNEL_TOKEN); "+
+			"without it a quick tunnel is used, which needs no account")
+	exposeHostname := fs.String("expose-hostname", "",
+		"public `hostname` a named tunnel serves; required with --expose-token, "+
+			"which announces nothing to read")
+	var requireCallback []requirement
+	fs.Func("require-callback",
+		"fail unless your app received a callback on this path[:count] (* for any path)",
+		func(v string) error {
+			r, err := parseRequirement("callback", v)
+			if err != nil {
+				return err
+			}
+			requireCallback = append(requireCallback, r)
+			return nil
+		})
+	redirectExternal := fs.Bool("redirect-external", false,
+		"the kernel redirect is installed by something else; do not install or demand it")
+	proxyUID := fs.Int("proxy-uid", defaultProxyUID,
+		"uid to drop to, and the one the kernel redirect exempts; must differ "+
+			"from whatever the code under test runs as")
+	readyFile := fs.String("ready-file", "",
+		"write this `file` once every listener is bound (an edge-triggered startup signal)")
+	writeEnv := fs.String("write-env", "",
+		"write the command's interception environment to this `file`")
+	caPublicPath := fs.String("ca-public-path", "",
+		"the CA certificate `path` as the command under test will see it, when "+
+			"that differs from ours (the CA directory also holds the private key)")
+	envTrustOnly := fs.Bool("env-trust-only", false,
+		"emit only the CA variables, for a tier where the kernel already does the routing")
+	envFormat := fs.String("env-format", "posix",
+		"posix (sourceable exports) or docker (for `docker run --env-file`)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *cfgPath == "" {
-		var err error
-		if *cfgPath, err = config.FindDefault(); err != nil {
+	log := newLogger(*logLevel, *logFormat)
+
+	// Checked here, before selfSetup installs iptables rules and drops
+	// privileges. Refusing afterwards would leave a namespace redirecting 80
+	// and 443 at listeners that are about to close.
+	if len(requireCallback) > 0 && *expose <= 0 {
+		return errors.New(
+			"--require-callback asserts what your app received, and nothing can " +
+				"arrive without --expose <port>. Add it, or drop the requirement")
+	}
+	if *environment != "" && sources.Sandbox != "" {
+		return errors.New(
+			"--environment deploys a sandbox of its own and --sandbox attaches to " +
+				"one that exists. Pick one")
+	}
+	// --config wins in resolveConfig, so this combination would route egress at
+	// the file's sandbox while callbacks were registered on the one just
+	// created -- two different sandboxes, with nothing said.
+	if *environment != "" && sources.File != "" {
+		return errors.New(
+			"--environment deploys a sandbox and --config routes at whatever the " +
+				"file names, so callbacks and traffic would go to different " +
+				"sandboxes. Pick one")
+	}
+	// Before the tunnel opens, not after the listeners bind. Otherwise a
+	// reserved port is caught only once a public URL is already forwarding at
+	// the proxy itself, whose status endpoint is unauthenticated.
+	if *expose > 0 {
+		if err := refuseConfiguredPort(*expose, *exposeHost,
+			cfg0Listen(*listen), *tHTTP, *tHTTPS, *transparent); err != nil {
 			return err
 		}
 	}
 
-	cfg, err := config.LoadWithOverrides(*cfgPath, config.Overrides{
-		SandboxID:       *sandboxID,
-		CanaryToken:     *canary,
-		UpstreamBaseURL: *upstream,
-		Listen:          *listen,
-	})
-	if err != nil {
-		return err
+	// Installed before anything is provisioned. Create and WaitReady can take
+	// minutes, and a signal arriving in that window would exit before the
+	// deferred teardown ran -- leaving a public tunnel alive in its own process
+	// group and a sandbox billing until its TTL.
+	// Only when there is something to provision. Registering a second SIGTERM
+	// handler unconditionally adds a window, as each registration is torn down
+	// on return, in which a signal meant for the serve handler finds none
+	// installed and takes the default action -- which killed the test binary
+	// on CI while passing locally.
+	provisionCtx := context.Background()
+	if *environment != "" || *expose > 0 {
+		ctx, cancel := signal.NotifyContext(
+			context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		provisionCtx = ctx
 	}
 
-	log := newLogger(*logLevel, *logFormat)
+	// With --environment the order inverts. The tunnel needs only a local port,
+	// so it opens FIRST and its URL is handed to the sandbox at creation --
+	// which is strictly better than PATCHing afterwards: the sandbox is never
+	// alive without knowing where to deliver, and there is no window in which a
+	// callback could be produced with nowhere to go.
+	var (
+		pending    *pendingIngress
+		lifetime   *sandboxLifetime
+		tunnelDied atomic.Bool
+		err        error
+	)
+	if *environment != "" {
+		if *expose > 0 {
+			pending, err = openIngress(provisionCtx, log, ingressOptions{
+				RunAsUID: *proxyUID,
+				Port:     *expose,
+				Host:     *exposeHost,
+				Token:    firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
+				Hostname: *exposeHostname,
+			})
+			if err != nil {
+				return fmt.Errorf("open the callback path: %w", err)
+			}
+			defer pending.CloseOnFailure()
+		}
+		lifetime, err = deploySandbox(
+			provisionCtx, log, sources, *environment, *ttlMinutes,
+			pending.URL())
+		if err != nil {
+			return err
+		}
+		defer lifetime.Delete(log)
+		sources.Sandbox = lifetime.SandboxID
+		sources.Refresh = true
+	}
 
+	cfg, source, cfgErr := resolveConfig(sources)
+	if cfgErr != nil {
+		return cfgErr
+	}
+	if *listen != "" {
+		cfg.Listen = *listen
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+	}
+	if *caDir != "" {
+		cfg.CADir = *caDir
+	}
+	if *strict {
+		cfg.Mode = config.ModeStrict
+	}
+	if *printRoutesOnly {
+		printRoutes(os.Stdout, cfg)
+		return nil
+	}
+
+	log.Info("configuration resolved", "from", source)
+
+	opts := proxy.ListenOptions{}
+	if *transparent {
+		opts.TransparentHTTP, opts.TransparentHTTPS = *tHTTP, *tHTTPS
+	}
+
+	// The CA is minted BEFORE the trust store is installed, because installing
+	// it reads the file. Getting this backwards produced a container that came
+	// up with the redirect live, the CA absent from the trust store, a warning
+	// in the log, and every intercepted handshake failing.
 	authority, err := ca.Load(expand(cfg.CADir))
 	if err != nil {
 		return err
 	}
 
+	// Then the redirect and the privilege drop, both before a listener is
+	// bound. Nothing may become reachable before the traffic is being
+	// redirected to it, or a workload racing startup reaches the real vendor.
+	if *transparent && runtime.GOOS == "linux" {
+		if err := selfSetup(log, setupOptions{
+			UID:              *proxyUID,
+			TransparentHTTP:  *tHTTP,
+			TransparentHTTPS: *tHTTPS,
+			Writable:         writableDirs(cfg, *writeEnv, *readyFile),
+			CAPath:           authority.CertPath(),
+			RedirectExternal: *redirectExternal,
+		}); err != nil {
+			return err
+		}
+	}
+
 	srv := proxy.New(cfg, authority, log, version)
-
-	// Shut down on signal so the CLI can stop us cleanly between runs.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-stop
-		log.Info("shutting down")
-		os.Exit(0)
-	}()
-
-	errCh := make(chan error, 2)
+	if *transparent && runtime.GOOS != "linux" {
+		// The listeners bind on any OS, and on any OS but Linux nothing can
+		// ever route to them: the redirect is iptables, which is netfilter,
+		// which is Linux. Left unsaid, this looks exactly like it is working.
+		log.Warn("--transparent has no effect on this OS: the kernel redirect "+
+			"is iptables, which is Linux-only. The listeners will bind and "+
+			"receive nothing. Use the explicit proxy, or run in a container.",
+			"os", runtime.GOOS)
+	}
 	if *transparent {
 		// Transparent mode is what makes the container tier work: nothing in
 		// the process under test has to honour HTTP_PROXY, which is the only
 		// way to cover Java, static Go binaries and Apache HttpClient.
-		go func() { errCh <- srv.ServeTransparent(*tHTTP, *tHTTPS) }()
+		opts.TransparentHTTP, opts.TransparentHTTPS = *tHTTP, *tHTTPS
 	}
+
+	running, err := srv.Start(opts)
+	if err != nil {
+		return err
+	}
+	announce(log, running, cfg, authority)
+
+	// Order matters and is the contract: the environment is complete before
+	// the readiness marker exists, so a supervisor that sees the marker can
+	// source the environment without a second wait.
+	var ing *ingress
+	if *expose > 0 {
+		ing, err = startIngress(provisionCtx, log, ingressOptions{
+			RunAsUID: *proxyUID,
+			Port:     *expose,
+			Host:     *exposeHost,
+			Token:    firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
+			Hostname: *exposeHostname,
+		}, cfg, running, pending)
+		if err != nil {
+			return fmt.Errorf("open the callback path: %w", err)
+		}
+		running.AttachIngress(ing.Inbound)
+		// The workload starts after we report ready, so the registration probe
+		// ran against a port nothing was on yet. Confirm once it is up.
+		ing.confirmWhenReady(context.Background(), ing.originAddr())
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+			defer cancel()
+			_ = ing.Stop(ctx)
+		}()
+	}
+
+	material, err := publishTrust(*caPublicPath, authority)
+	if err != nil {
+		return fmt.Errorf("publish the trust material: %w", err)
+	}
+	if *writeEnv != "" {
+		if err := writeEnvFile(*writeEnv, *envFormat, material, *envTrustOnly, running, cfg, publicURL(ing)); err != nil {
+			return fmt.Errorf("write env file: %w", err)
+		}
+	}
+	if *readyFile != "" {
+		if err := writeReadyFile(*readyFile, running); err != nil {
+			return fmt.Errorf("write ready file: %w", err)
+		}
+	}
+
+	// Shut down cleanly on signal so the CLI can stop us between runs without
+	// cutting in-flight requests. Exiting from the handler would skip that.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
 	go func() {
-		errCh <- srv.ListenAndServe(func(addr string) {
-			log.Info("veris-proxy listening",
-				"addr", addr,
-				"mode", string(cfg.Mode),
-				"sandbox_id", cfg.SandboxID,
-				"services", len(cfg.Services),
-				"ca", authority.CertPath(),
-				"ca_fingerprint", authority.Fingerprint(),
-			)
-			if cfg.Mode == config.ModePassthrough {
-				log.Warn("mode=passthrough: unmapped hosts reach the real internet. " +
-					"A passing test run does not prove interception.")
-			}
-		})
+		<-stop
+		log.Info("shutting down")
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		_ = running.Shutdown(ctx)
 	}()
-	return <-errCh
+
+	if ing != nil {
+		// A tunnel that dies mid-run leaves the proxy healthy and registered at
+		// a hostname nothing answers, so callbacks vanish with nothing said.
+		watchDone := make(chan struct{})
+		defer close(watchDone)
+		go func() {
+			select {
+			case <-ing.tunnel.Done():
+				log.Error("the callback tunnel exited; callbacks can no longer arrive")
+				// Recorded, not just acted on. Shutting down cleanly would make
+				// Wait return nil and the run exit 0 -- a webhook suite passing
+				// because ingress vanished is exactly the silent success this
+				// direction was built to refuse.
+				tunnelDied.Store(true)
+				ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+				defer cancel()
+				_ = running.Shutdown(ctx)
+			case <-watchDone:
+			}
+		}()
+	}
+
+	err = running.Wait()
+	if err == nil && tunnelDied.Load() {
+		err = errors.New(
+			"the callback tunnel exited during the run, so callbacks stopped " +
+				"arriving; what the app received is incomplete")
+	}
+	if ing != nil {
+		receipt := ing.Receipt()
+		printInbound(os.Stderr, receipt)
+		unmet := unmetCallbacks(requireCallback, receipt)
+		for _, u := range unmet {
+			fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", u)
+		}
+		if err == nil && len(unmet) > 0 {
+			return exitCode(exitRequirementUnmet)
+		}
+	}
+	return err
 }
 
-func cmdEnv(args []string) error {
-	fs := flag.NewFlagSet("env", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to the proxy config (defaults to .veris.toml, then .veris/proxy.json)")
-	format := fs.String("format", "posix", "posix, fish, powershell, dotenv, json or github")
-	explain := fs.Bool("explain", false, "annotate each variable with why it is set")
-	quiet := fs.Bool("quiet", false, "suppress coverage warnings on stderr")
-	sandboxID := fs.String("sandbox-id", "", "per-run sandbox id, matching what serve was given")
-	canary := fs.String("canary", "", "per-run canary token, matching what serve was given")
-	upstream := fs.String("upstream", "", "override upstream.base_url, matching what serve was given")
-	javaStore := fs.String("java-truststore", "", "path to a JKS truststore containing the Veris CA")
-	javaPass := fs.String("java-truststore-pass", "changeit", "password for the JKS truststore")
-	proxyURL := fs.String("proxy-url", "", "override the proxy URL (defaults to the config listen address)")
-	if err := fs.Parse(args); err != nil {
-		return err
+// publicURL is the callback URL, or "" when nothing was exposed.
+func publicURL(in *ingress) string {
+	if in == nil {
+		return ""
 	}
-	if *cfgPath == "" {
-		var err error
-		if *cfgPath, err = config.FindDefault(); err != nil {
-			return err
+	return in.URL
+}
+
+// writableDirs is everywhere the proxy still writes after dropping privileges.
+// Missing one is not a warning: the CA, the sandbox cache and the handoff
+// files are each fatal to lose, and each failed at least once by being
+// forgotten here.
+func writableDirs(cfg *config.Config, files ...string) []string {
+	dirs := []string{expand(cfg.CADir), discovery.Dir()}
+	for _, f := range files {
+		if f != "" {
+			dirs = append(dirs, filepath.Dir(f))
 		}
 	}
+	return dirs
+}
 
-	cfg, err := config.LoadWithOverrides(*cfgPath, config.Overrides{
-		SandboxID:       *sandboxID,
-		CanaryToken:     *canary,
-		UpstreamBaseURL: *upstream,
-	})
-	if err != nil {
-		return err
-	}
-	authority, err := ca.Load(expand(cfg.CADir))
-	if err != nil {
-		return err
-	}
+// shutdownGrace is how long in-flight requests get to finish before the
+// listeners are force-closed.
+const shutdownGrace = 5 * time.Second
 
-	url := *proxyURL
-	if url == "" {
-		url = "http://" + cfg.Listen
-	}
-
-	// A truststore built by `trust --java` lands in the CA directory; pick it
-	// up automatically so Java coverage does not depend on remembering a flag.
-	if *javaStore == "" {
-		if candidate := filepath.Join(authority.Dir(), trust.DefaultJavaTrustStoreName); fileExists(candidate) {
-			*javaStore = candidate
+func announce(log *slog.Logger, running *proxy.Running, cfg *config.Config, authority *ca.CA) {
+	log.Info("veris-proxy listening",
+		"addr", running.Addr("proxy"),
+		"mode", string(cfg.Mode),
+		"sandbox_id", cfg.SandboxID,
+		"services", len(cfg.Services),
+		"ca", authority.CertPath(),
+		"ca_fingerprint", authority.Fingerprint(),
+	)
+	for _, kind := range []string{"transparent-http", "transparent-https"} {
+		if addr := running.Addr(kind); addr != "" {
+			log.Info("listening", "kind", kind, "addr", addr)
 		}
 	}
-
-	opts := trust.Options{
-		ProxyURL:           url,
-		CACertPath:         authority.CertPath(),
-		JavaTrustStore:     *javaStore,
-		JavaTrustStorePass: *javaPass,
-		SandboxID:          cfg.SandboxID,
-		CanaryToken:        cfg.CanaryToken,
-		NoProxy:            cfg.AllowPassthrough,
+	if cfg.Mode == config.ModePassthrough {
+		log.Info("mode=passthrough: only the listed services are rerouted; " +
+			"every other host reaches its real destination. Use --strict to block them.")
 	}
-
-	if err := trust.Format(os.Stdout, trust.Build(opts), *format, *explain); err != nil {
-		return err
-	}
-
-	// Warnings go to stderr so `eval "$(veris-proxy env --config ...)"` stays
-	// clean while the developer still sees them.
-	if !*quiet {
-		for _, warning := range trust.Warnings(opts) {
-			fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
-		}
-	}
-	return nil
 }
 
 // checkFailure marks an interception probe failure, which exits 2 rather than 1
@@ -254,6 +488,8 @@ func cmdCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	proxyURL := fs.String("proxy", "", "proxy URL (defaults to $VERIS_PROXY_URL)")
 	expect := fs.String("expect-canary", "", "canary token that must match (defaults to $VERIS_CANARY)")
+	anyRun := fs.Bool("any-run", false,
+		"accept any live Veris proxy, without checking which run it belongs to")
 	timeout := fs.Duration("timeout", 5*time.Second, "probe timeout")
 	quiet := fs.Bool("quiet", false, "print nothing on success")
 	if err := fs.Parse(args); err != nil {
@@ -272,6 +508,19 @@ func cmdCheck(args []string) error {
 	want := *expect
 	if want == "" {
 		want = os.Getenv("VERIS_CANARY")
+	}
+	// An assertion must not quietly weaken into a liveness probe. Without a
+	// canary this cannot tell the proxy for THIS run from one left running by
+	// an earlier one against a different sandbox -- which is the whole failure
+	// it exists to catch -- so accepting that has to be said out loud.
+	if want == "" && !*anyRun {
+		return checkFailure{errors.New(
+			"no canary to check against: set --expect-canary or $VERIS_CANARY. " +
+				"Pass --any-run to accept any live proxy, which cannot detect one " +
+				"left over from an earlier run")}
+	}
+	if want != "" && *anyRun {
+		return errors.New("--any-run and an expected canary are contradictory")
 	}
 
 	client := &http.Client{Timeout: *timeout}
@@ -309,89 +558,9 @@ func cmdCheck(args []string) error {
 			"canary mismatch: the proxy at %s belongs to a different run (sandbox %s). "+
 				"Stop it and restart with the current config", url, state.SandboxID)}
 	}
-	if state.Mode != string(config.ModeStrict) {
-		fmt.Fprintf(os.Stderr,
-			"warning: proxy is in %s mode, so unmapped hosts still reach the real internet\n", state.Mode)
-	}
-
 	if !*quiet {
 		fmt.Printf("interception live: sandbox %s, mode %s\n", state.SandboxID, state.Mode)
 	}
-	return nil
-}
-
-func cmdTrust(args []string) error {
-	fs := flag.NewFlagSet("trust", flag.ContinueOnError)
-	java := fs.Bool("java", false, "build a Java truststore: the JDK's cacerts plus the Veris CA")
-	inject := fs.String("inject", "", "path to an application-managed keystore to add the Veris CA to")
-	jdk := fs.String("jdk", "", "JDK home to take keytool and cacerts from (defaults to $JAVA_HOME, then $PATH)")
-	caDir := fs.String("ca-dir", defaultCADir(), "directory holding the CA")
-	out := fs.String("out", "", "output path for --java (defaults to <ca-dir>/"+trust.DefaultJavaTrustStoreName+")")
-	storePass := fs.String("storepass", "changeit", "keystore password (the JDK cacerts default is changeit)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if !*java && *inject == "" {
-		return errors.New("trust requires --java, --inject <keystore>, or both")
-	}
-
-	authority, err := ca.Load(expand(*caDir))
-	if err != nil {
-		return err
-	}
-
-	if *java {
-		outPath := *out
-		if outPath == "" {
-			outPath = filepath.Join(authority.Dir(), trust.DefaultJavaTrustStoreName)
-		}
-		cacerts, err := trust.BuildJavaTrustStore(*jdk, authority.CertPath(), outPath, *storePass)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("java truststore written: %s (from %s)\n", outPath, cacerts)
-		if *out == "" {
-			// The default location is where `env` looks, so no extra flag is
-			// needed; a custom location must be passed back in explicitly.
-			fmt.Println("`veris-proxy env` will now emit JAVA_TOOL_OPTIONS automatically")
-		} else {
-			fmt.Printf("pass it to env: veris-proxy env --config <file> --java-truststore %s\n", outPath)
-		}
-	}
-
-	if *inject != "" {
-		if err := trust.InjectCA(*jdk, authority.CertPath(), *inject, *storePass); err != nil {
-			return err
-		}
-		fmt.Printf("veris-ca imported into %s\n", *inject)
-	}
-	return nil
-}
-
-func cmdCA(args []string) error {
-	fs := flag.NewFlagSet("ca", flag.ContinueOnError)
-	dir := fs.String("ca-dir", defaultCADir(), "directory holding the CA")
-	print := fs.Bool("print", false, "write the CA certificate to stdout")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	authority, err := ca.Load(expand(*dir))
-	if err != nil {
-		return err
-	}
-	if *print {
-		_, err := os.Stdout.Write(authority.CertPEM())
-		return err
-	}
-
-	out, _ := json.MarshalIndent(map[string]any{
-		"path":        authority.CertPath(),
-		"dir":         authority.Dir(),
-		"fingerprint": authority.Fingerprint(),
-		"expires":     authority.NotAfter().Format(time.RFC3339),
-	}, "", "  ")
-	fmt.Println(string(out))
 	return nil
 }
 
@@ -400,9 +569,16 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// defaultCADir is under the user's home, except where there is no usable home
+// to put it in -- a service account in a container has none, and silently
+// choosing an unwritable path fails at first TLS handshake rather than at
+// startup.
 func defaultCADir() string {
 	home, err := os.UserHomeDir()
-	if err != nil {
+	if err != nil || home == "" {
+		return ".veris/ca"
+	}
+	if info, statErr := os.Stat(home); statErr != nil || !info.IsDir() {
 		return ".veris/ca"
 	}
 	return filepath.Join(home, ".veris", "ca")

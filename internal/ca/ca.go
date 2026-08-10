@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/veris-ai/veris-proxy/internal/hostport"
 )
 
 const (
@@ -198,7 +200,7 @@ func (c *CA) Fingerprint() string {
 // certificate SAN are based on the bare hostname, so api.stripe.com:443 and
 // api.stripe.com share a single entry.
 func (c *CA) Leaf(host string) (*tls.Certificate, error) {
-	name := stripPort(host)
+	name := hostport.StripPort(host)
 
 	c.mu.RLock()
 	cached, ok := c.cache[name]
@@ -286,13 +288,6 @@ func randomSerial() (*big.Int, error) {
 		return nil, fmt.Errorf("generate serial: %w", err)
 	}
 	return serial, nil
-}
-
-func stripPort(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
-	}
-	return host
 }
 
 // writeFileAtomic writes via a temp file and rename so a concurrent reader

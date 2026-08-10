@@ -11,10 +11,19 @@ import (
 
 // These tests shell out to a real keytool, because the point of the feature
 // is interoperating with the JDK's actual formats. No JDK, no test.
+//
+// Both halves are checked. A partial install -- keytool on PATH but no
+// locatable cacerts, which is what a JRE-less Homebrew openjdk looks like
+// without JAVA_HOME -- would otherwise fail the build rather than skip, on a
+// machine that simply cannot run this test.
 func requireKeytool(t *testing.T) {
 	t.Helper()
-	if _, err := findKeytool(""); err != nil {
+	keytool, err := findKeytool("")
+	if err != nil {
 		t.Skip("no keytool available:", err)
+	}
+	if _, err := findCacerts("", keytool); err != nil {
+		t.Skip("keytool is present but its cacerts is not:", err)
 	}
 }
 

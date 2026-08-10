@@ -7,12 +7,8 @@
 package trust
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
-	"runtime"
-	"sort"
 	"strings"
 )
 
@@ -30,8 +26,15 @@ type Var struct {
 
 // Options describes the running proxy.
 type Options struct {
-	ProxyURL   string
+	ProxyURL string
+	// CACertPath is the bare Veris certificate, for the variables that ADD to a
+	// runtime's own roots.
 	CACertPath string
+	// CABundlePath is the public roots plus the Veris certificate, for the
+	// variables that REPLACE them. Empty falls back to CACertPath, which trusts
+	// intercepted hosts and rejects every passthrough one -- so callers publish
+	// a bundle rather than leaning on that.
+	CABundlePath string
 	// JavaTrustStore is the path to a JKS copy of the JDK's cacerts with the
 	// Veris CA added. Empty if one has not been built, in which case the Java
 	// variables are omitted rather than emitted broken.
@@ -41,6 +44,29 @@ type Options struct {
 	CanaryToken        string
 	// NoProxy is appended to the built-in loopback and private-range list.
 	NoProxy []string
+
+	// NodeAcceptsEnvProxy reports whether the node on PATH tolerates
+	// --use-env-proxy inside NODE_OPTIONS. Node did not gain it until 22.21 and
+	// 24.5, and an older one does NOT ignore the unknown flag: it refuses to
+	// start at all, so setting it unconditionally breaks every Node command the
+	// run was supposed to instrument.
+	NodeAcceptsEnvProxy bool
+
+	// PublicURL is where the sandbox will deliver callbacks. Handed to the
+	// code under test so it can register its own webhook THROUGH THE VENDOR
+	// API -- which is the code path that ships, and the reason nothing here
+	// writes a service's target_url on the client's behalf.
+	PublicURL string
+
+	// TrustOnly emits the CA variables and nothing that routes.
+	//
+	// For the kernel-redirect tiers, where the routing is already done below
+	// every library. Setting HTTP_PROXY there is worse than redundant: a
+	// client that honours it starts cooperating, so it takes the explicit
+	// proxy path instead of the redirect -- a different transport from the one
+	// being claimed -- and a redirect that silently stopped working would be
+	// masked by the variables rather than showing up as a failure.
+	TrustOnly bool
 }
 
 // loopback plus the RFC1918 ranges. Without these, a test that starts its own
@@ -54,6 +80,15 @@ var defaultNoProxy = []string{
 // Build returns every variable to set, in a stable order.
 func Build(o Options) []Var {
 	noProxy := strings.Join(append(append([]string{}, defaultNoProxy...), o.NoProxy...), ",")
+
+	if o.TrustOnly {
+		return buildTrustOnly(o)
+	}
+
+	bundle := o.CABundlePath
+	if bundle == "" {
+		bundle = o.CACertPath
+	}
 
 	vars := []Var{
 		// Proxy routing. Both cases are set because curl accepts only the
@@ -72,28 +107,30 @@ func Build(o Options) []Var {
 
 		// CA trust. Each runtime reads a different variable; none of them reads
 		// another's.
-		{"NODE_EXTRA_CA_CERTS", o.CACertPath, "Node, including global fetch and undici; read once at startup", false},
-		{"REQUESTS_CA_BUNDLE", o.CACertPath, "Python requests; it does NOT read SSL_CERT_FILE", false},
-		{"SSL_CERT_FILE", o.CACertPath, "Python httpx, Go on Linux, OpenSSL CLI", false},
-		{"CURL_CA_BUNDLE", o.CACertPath, "curl, and requests' fallback", false},
-		{"GIT_SSL_CAINFO", o.CACertPath, "git over https", false},
-		{"AWS_CA_BUNDLE", o.CACertPath, "AWS SDKs and CLI", false},
-		{"CARGO_HTTP_CAINFO", o.CACertPath, "cargo", false},
-		{"DENO_CERT", o.CACertPath, "Deno", false},
-		{"PIP_CERT", o.CACertPath, "pip", false},
-		{"npm_config_cafile", o.CACertPath, "npm registry traffic", false},
-
-		// Node needs an explicit opt-in before its global fetch honours the
-		// proxy variables above. Available from Node 22.21 and 24.5; harmless
-		// on older versions, which ignore the unknown flag inside NODE_OPTIONS.
-		{"NODE_OPTIONS", "--use-env-proxy", "Node's global fetch ignores HTTP_PROXY without this", true},
-
-		// Veris identity, for the canary assertion. Note the names avoid the
-		// substrings KEY, SECRET and TOKEN: Codex CLI strips any inherited
-		// variable containing them, which would silently break the probe.
-		{"VERIS_PROXY_URL", o.ProxyURL, "used by the canary probe", false},
-		{"VERIS_SANDBOX_ID", o.SandboxID, "identifies the dependency sandbox in use", false},
+		{"NODE_EXTRA_CA_CERTS", o.CACertPath, "Node, including global fetch and undici; ADDS to its own roots", false},
 	}
+	vars = append(vars, replacingCAVars(bundle)...)
+	// Veris identity, for the canary assertion. Note the names avoid the
+	// substrings KEY, SECRET and TOKEN: Codex CLI strips any inherited variable
+	// containing them, which would silently break the probe.
+	vars = append(vars,
+		Var{"VERIS_PROXY_URL", o.ProxyURL, "used by the canary probe", false},
+		Var{"VERIS_SANDBOX_ID", o.SandboxID, "identifies the dependency sandbox in use", false},
+	)
+
+	if o.NodeAcceptsEnvProxy {
+		// Node's global fetch ignores HTTP_PROXY without this opt-in. Emitted
+		// only when the node in play accepts it, because one that does not
+		// refuses to start rather than ignoring it.
+		vars = append(vars, Var{
+			Name:   "NODE_OPTIONS",
+			Value:  "--use-env-proxy",
+			Reason: "Node's global fetch ignores HTTP_PROXY without this",
+			Append: true,
+		})
+	}
+
+	vars = append(vars, publicURLVar(o)...)
 
 	if o.CanaryToken != "" {
 		vars = append(vars, Var{
@@ -130,31 +167,72 @@ func Build(o Options) []Var {
 	return vars
 }
 
-// Warnings lists cases this environment cannot cover, so the CLI can print
-// them rather than let a developer discover them as a mystery TLS error.
-//
-// Every entry here is a place where the environment-variable approach is known
-// to fail and the container runner is the answer.
-func Warnings(o Options) []string {
-	var w []string
+// buildTrustOnly is the CA half: what a client needs in order to accept the
+// proxy's certificate, and nothing that would tell it where to send anything.
+func buildTrustOnly(o Options) []Var {
+	bundle := o.CABundlePath
+	if bundle == "" {
+		bundle = o.CACertPath
+	}
+	vars := []Var{
+		{"NODE_EXTRA_CA_CERTS", o.CACertPath, "Node, including global fetch and undici; ADDS to its own roots", false},
+	}
+	vars = append(vars, replacingCAVars(bundle)...)
+	vars = append(vars, Var{
+		Name: "VERIS_SANDBOX_ID", Value: o.SandboxID,
+		Reason: "identifies the dependency sandbox in use",
+	})
+	vars = append(vars, publicURLVar(o)...)
+	if o.CanaryToken != "" {
+		vars = append(vars, Var{
+			Name:   "VERIS_CANARY",
+			Value:  o.CanaryToken,
+			Reason: "asserted by the probe to prove interception is live for this run",
+		})
+	}
+	if o.JavaTrustStore != "" {
+		// The truststore flags only. The -Dhttp.proxyHost pair that Build
+		// emits would route, which is the thing this deliberately does not do.
+		vars = append(vars, Var{
+			Name: "JAVA_TOOL_OPTIONS",
+			Value: "-Djavax.net.ssl.trustStore=" + o.JavaTrustStore +
+				" -Djavax.net.ssl.trustStorePassword=" + o.JavaTrustStorePass,
+			Reason: "Java needs a JKS rather than a PEM, and reads no CA env var",
+			Append: true,
+		})
+	}
+	return vars
+}
 
-	if runtime.GOOS == "darwin" {
-		w = append(w, "Go binaries on macOS ignore SSL_CERT_FILE and verify through Security.framework. "+
-			"A Go service under test will not trust the Veris CA here. Run it under `veris test --container`, "+
-			"or install the CA into the login keychain once.")
+// publicURLVar tells the code under test where its callbacks will arrive, so
+// its own registration call can name it.
+func publicURLVar(o Options) []Var {
+	if o.PublicURL == "" {
+		return nil
 	}
-	if o.JavaTrustStore == "" {
-		w = append(w, "No Java truststore built, so JVM processes are not covered. "+
-			"Run `veris-proxy trust --java` to create one from your JDK's cacerts.")
+	return []Var{{
+		Name: "VERIS_PUBLIC_URL", Value: o.PublicURL,
+		Reason: "register this with the vendor as your webhook destination",
+	}}
+}
+
+// replacingCAVars are the variables that REPLACE a runtime's trust roots rather
+// than adding to them, so every one of them gets the bundle. Pointing any of
+// them at the bare Veris certificate makes a client trust the intercepted hosts
+// and reject the entire rest of the internet, which in passthrough mode is
+// every unmapped vendor, package index and telemetry endpoint the run touches.
+func replacingCAVars(bundle string) []Var {
+	return []Var{
+		{"REQUESTS_CA_BUNDLE", bundle, "Python requests; it does NOT read SSL_CERT_FILE", false},
+		{"SSL_CERT_FILE", bundle, "Python httpx, Go on Linux, OpenSSL CLI", false},
+		{"CURL_CA_BUNDLE", bundle, "curl, and requests' fallback", false},
+		{"GIT_SSL_CAINFO", bundle, "git over https", false},
+		{"AWS_CA_BUNDLE", bundle, "AWS SDKs and CLI", false},
+		{"CARGO_HTTP_CAINFO", bundle, "cargo", false},
+		{"DENO_CERT", bundle, "Deno", false},
+		{"PIP_CERT", bundle, "pip", false},
+		{"npm_config_cafile", bundle, "npm registry traffic", false},
 	}
-	w = append(w,
-		"Apache HttpClient built with HttpClients.createDefault() ignores the JVM proxy properties; "+
-			"only createSystem() reads them. Such a service needs the container runner.",
-		"Python aiohttp ignores proxy env vars unless the session is built with trust_env=True.",
-		"The Stripe Python and Ruby SDKs ship their own CA bundle and ignore REQUESTS_CA_BUNDLE; "+
-			"set stripe.ca_bundle_path, or use the container runner.",
-	)
-	return w
 }
 
 // javaNonProxyHosts renders the NO_PROXY list in http.nonProxyHosts syntax,
@@ -226,98 +304,3 @@ func splitProxy(proxyURL string) (host, port string) {
 	}
 	return s, "80"
 }
-
-// Format renders vars in the requested shell format.
-func Format(w io.Writer, vars []Var, format string, explain bool) error {
-	switch format {
-	case "", "posix", "sh", "bash", "zsh":
-		return formatPosix(w, vars, explain)
-	case "fish":
-		return formatFish(w, vars, explain)
-	case "powershell", "pwsh":
-		return formatPowerShell(w, vars, explain)
-	case "dotenv", "env":
-		return formatDotenv(w, vars, explain)
-	case "json":
-		return json.NewEncoder(w).Encode(vars)
-	case "github":
-		// Writes to $GITHUB_ENV format.
-		for _, v := range vars {
-			if _, err := fmt.Fprintf(w, "%s=%s\n", v.Name, v.Value); err != nil {
-				return err
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown format %q (want posix, fish, powershell, dotenv, json or github)", format)
-	}
-}
-
-func formatPosix(w io.Writer, vars []Var, explain bool) error {
-	for _, v := range vars {
-		if explain {
-			if _, err := fmt.Fprintf(w, "# %s\n", v.Reason); err != nil {
-				return err
-			}
-		}
-		var err error
-		if v.Append {
-			// Preserve whatever the developer or their CI already set.
-			_, err = fmt.Fprintf(w, "export %s=\"${%s:+$%s }%s\"\n", v.Name, v.Name, v.Name, shellEscape(v.Value))
-		} else {
-			_, err = fmt.Fprintf(w, "export %s=%s\n", v.Name, shellQuote(v.Value))
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func formatFish(w io.Writer, vars []Var, explain bool) error {
-	for _, v := range vars {
-		if explain {
-			if _, err := fmt.Fprintf(w, "# %s\n", v.Reason); err != nil {
-				return err
-			}
-		}
-		if _, err := fmt.Fprintf(w, "set -gx %s %s\n", v.Name, shellQuote(v.Value)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func formatPowerShell(w io.Writer, vars []Var, explain bool) error {
-	for _, v := range vars {
-		if explain {
-			if _, err := fmt.Fprintf(w, "# %s\n", v.Reason); err != nil {
-				return err
-			}
-		}
-		if _, err := fmt.Fprintf(w, "$env:%s = %s\n", v.Name, psQuote(v.Value)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func formatDotenv(w io.Writer, vars []Var, explain bool) error {
-	sorted := append([]Var{}, vars...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
-	for _, v := range sorted {
-		if explain {
-			if _, err := fmt.Fprintf(w, "# %s\n", v.Reason); err != nil {
-				return err
-			}
-		}
-		if _, err := fmt.Fprintf(w, "%s=%s\n", v.Name, v.Value); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func shellQuote(s string) string  { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
-func shellEscape(s string) string { return strings.ReplaceAll(s, `"`, `\"`) }
-func psQuote(s string) string     { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

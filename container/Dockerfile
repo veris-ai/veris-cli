@@ -16,7 +16,18 @@ COPY --from=build /out/veris-proxy /veris-proxy
 # Reference runner. Extend it with your own toolchain, or copy the binary and
 # entrypoint into an image you already have.
 FROM alpine:3.22 AS runner
+# No privilege dropper: `veris-proxy serve --transparent` drops itself once the
+# rules are in, so an image adopting this needs iptables and nothing else.
 RUN apk add --no-cache ca-certificates iptables
+
+# cloudflared opens the callback path. Baked in rather than fetched at run time:
+# putting a network download on the startup path of the thing whose job is to be
+# reliable before the command starts is the wrong trade. Pinned rather than
+# `latest`, so an image built today and one built next month are the same image.
+ARG TARGETARCH
+ARG CLOUDFLARED_VERSION=2026.7.3
+ADD https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${TARGETARCH} /usr/local/bin/cloudflared
+RUN chmod +x /usr/local/bin/cloudflared && cloudflared --version
 COPY --from=build /out/veris-proxy /usr/local/bin/veris-proxy
 COPY container/entrypoint.sh /usr/local/bin/veris-entrypoint
 RUN chmod +x /usr/local/bin/veris-entrypoint && mkdir -p /veris/ca

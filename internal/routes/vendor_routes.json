@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "generated_by": "parity vendor-routes",
+  "source": "services/*/parity/backend.yaml (measured), plus each vendor's own spec for path prefixes",
+  "services": {
+    "acuity-scheduling": [
+      {
+        "host": "acuityscheduling.com"
+      }
+    ],
+    "adobe-ims": [
+      {
+        "host": "ims-na1.adobelogin.com"
+      }
+    ],
+    "airtable": [
+      {
+        "host": "api.airtable.com"
+      }
+    ],
+    "asana": [
+      {
+        "host": "app.asana.com"
+      }
+    ],
+    "attio": [
+      {
+        "host": "api.attio.com"
+      }
+    ],
+    "autodesk": [
+      {
+        "host": "developer.api.autodesk.com"
+      }
+    ],
+    "calendly": [
+      {
+        "host": "api.calendly.com"
+      },
+      {
+        "host": "auth.calendly.com",
+        "paths": [
+          "/oauth"
+        ]
+      }
+    ],
+    "daraja": [
+      {
+        "host": "sandbox.safaricom.co.ke"
+      }
+    ],
+    "frameio-v4": [
+      {
+        "host": "api.frame.io"
+      }
+    ],
+    "google-calendar": [
+      {
+        "host": "www.googleapis.com",
+        "paths": [
+          "/calendar/v3"
+        ]
+      }
+    ],
+    "google-drive": [
+      {
+        "host": "www.googleapis.com",
+        "paths": [
+          "/drive/v3",
+          "/resumable/upload/drive/v3/files",
+          "/upload/drive/v3/files"
+        ]
+      }
+    ],
+    "google-gmail": [
+      {
+        "host": "gmail.googleapis.com"
+      }
+    ],
+    "google-identity": [
+      {
+        "host": "accounts.google.com",
+        "paths": [
+          "/.well-known/openid-configuration",
+          "/o/oauth2/v2/auth",
+          "/signin/oauth/error"
+        ]
+      },
+      {
+        "host": "oauth2.googleapis.com",
+        "paths": [
+          "/revoke",
+          "/token",
+          "/tokeninfo"
+        ]
+      },
+      {
+        "host": "openidconnect.googleapis.com",
+        "paths": [
+          "/v1/userinfo"
+        ]
+      },
+      {
+        "host": "www.googleapis.com",
+        "paths": [
+          "/oauth2/v1/certs",
+          "/oauth2/v2",
+          "/oauth2/v3",
+          "/userinfo/v2/me"
+        ]
+      }
+    ],
+    "marqeta": [
+      {
+        "host": "sandbox-api.marqeta.com"
+      }
+    ],
+    "quickbooks": [
+      {
+        "host": "appcenter.intuit.com",
+        "paths": [
+          "/connect"
+        ]
+      },
+      {
+        "host": "developer.api.intuit.com",
+        "paths": [
+          "/v2/oauth2/tokens/revoke"
+        ]
+      },
+      {
+        "host": "oauth.platform.intuit.com",
+        "paths": [
+          "/oauth2/v1/tokens/bearer"
+        ]
+      },
+      {
+        "host": "sandbox-quickbooks.api.intuit.com"
+      }
+    ],
+    "stripe": [
+      {
+        "host": "api.stripe.com"
+      }
+    ]
+  }
+}

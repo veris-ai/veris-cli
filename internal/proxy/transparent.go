@@ -1,167 +1,157 @@
 package proxy
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/veris-ai/veris-proxy/internal/config"
+	"github.com/veris-ai/veris-proxy/internal/hostport"
 )
 
-// Transparent mode serves connections that were redirected by the kernel
-// (iptables REDIRECT) rather than sent to us by a client that knows it is
-// using a proxy.
+// This file serves connections the kernel redirected to us (iptables REDIRECT)
+// rather than ones a client chose to send. There is no absolute URL in the
+// request line and no CONNECT to read the authority from, and nothing in the
+// process under test cooperates -- which is what covers Java, static Go
+// binaries, Apache HttpClient and aiohttp.
 //
-// This is the mode that makes the container tier work. Nothing in the process
-// under test has to cooperate: no HTTP_PROXY, no per-library configuration. It
-// covers Java, static Go binaries, Apache HttpClient and aiohttp, all of which
-// are unreachable through environment variables.
-//
-// The destination cannot be read from the request line here, because a
-// redirected connection carries no absolute URL. For TLS we take it from the
-// SNI in the ClientHello; for plaintext we take it from the Host header.
+// For TLS the destination comes from the SNI, which is authoritative: it is
+// what we issued the certificate for. For plaintext it comes from the Host
+// header, which is all there is.
 
-// ServeTransparent runs the plaintext and TLS transparent listeners until one
-// of them fails.
-func (s *Server) ServeTransparent(httpAddr, httpsAddr string) error {
-	errCh := make(chan error, 2)
+// interceptMode labels the path a request took, for logs and the receipt.
+const modeTransparent = "transparent"
 
-	go func() { errCh <- s.serveTransparentHTTP(httpAddr) }()
-	go func() { errCh <- s.serveTransparentTLS(httpsAddr) }()
-
-	return <-errCh
-}
-
-func (s *Server) serveTransparentHTTP(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("transparent http listen on %s: %w", addr, err)
-	}
-	s.log.Info("transparent http listener", "addr", ln.Addr().String())
-
-	srv := &http.Server{
-		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.forward(w, r, "http") }),
-		ReadHeaderTimeout: 30 * time.Second,
-	}
-	return srv.Serve(ln)
-}
-
-func (s *Server) serveTransparentTLS(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("transparent tls listen on %s: %w", addr, err)
-	}
-	s.log.Info("transparent tls listener", "addr", ln.Addr().String())
-	return s.serveTransparentTLSOn(ln)
-}
-
-// serveTransparentTLSOn accepts on an already-bound listener.
-func (s *Server) serveTransparentTLSOn(ln net.Listener) error {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return err
-			}
-			s.log.Warn("transparent accept failed", "err", err)
-			continue
-		}
-		go s.handleTransparentTLS(conn)
-	}
-}
-
-func (s *Server) handleTransparentTLS(raw net.Conn) {
-	defer raw.Close()
-
-	// GetCertificate gives us the SNI, so we do not need to peek the
-	// ClientHello by hand: crypto/tls hands it to us during the handshake.
-	var sni string
-	tlsConn := tls.Server(raw, &tls.Config{
+// serverTLSConfig is shared by every TLS listener, so session tickets and the
+// certificate cache are shared rather than rebuilt per connection.
+func (s *Server) serverTLSConfig() *tls.Config {
+	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			sni = hello.ServerName
-			if sni == "" {
-				// A client that omits SNI gives us nothing to route on. This
-				// is rare outside of very old clients and raw-IP calls.
+			if hello.ServerName == "" {
+				// Without SNI there is nothing to route on and nothing to name
+				// in a certificate. Old clients and raw-IP calls land here.
 				return nil, errors.New("no SNI: cannot determine the intended destination")
 			}
-			return s.ca.Leaf(sni)
+			return s.ca.Leaf(hello.ServerName)
 		},
-	})
-
-	if err := tlsConn.Handshake(); err != nil {
-		s.log.Debug("transparent tls handshake failed", "sni", sni, "err", err)
-		return
+		// Offer h2 first. Google, Stripe and most large vendors serve HTTP/2,
+		// so a client that negotiated h2 against the real API and HTTP/1.1
+		// here is exercising a different transport than it does in production
+		// -- different multiplexing, different header handling, and a
+		// different set of client-library code paths.
+		NextProtos: []string{"h2", "http/1.1"},
 	}
-	defer tlsConn.Close()
+}
 
-	// Now it is ordinary HTTP over a socket we control.
-	br := bufio.NewReader(tlsConn)
-	for {
-		req, err := http.ReadRequest(br)
-		if err != nil {
-			if err != io.EOF {
-				s.log.Debug("transparent read request", "sni", sni, "err", err)
+// interceptHandler serves one of the non-proxy listeners.
+func (s *Server) interceptHandler(isTLS bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme := "http"
+		// Hostnames are case-insensitive, so normalize before comparing or
+		// routing: a client may send SNI and Host in different cases.
+		host := strings.ToLower(hostport.StripPort(r.Host))
+
+		if isTLS {
+			scheme = "https"
+			sni := ""
+			if r.TLS != nil {
+				sni = strings.ToLower(r.TLS.ServerName)
 			}
-			return
+			if sni == "" {
+				s.writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error":   "veris_no_sni",
+					"message": "the TLS handshake carried no SNI, so the intended destination is unknown",
+				})
+				return
+			}
+			// The certificate was issued for the SNI, so routing on anything
+			// else would let a client handshake for one host and be routed as
+			// another.
+			if host != "" && host != sni {
+				s.log.Warn("refused SNI/Host mismatch", "sni", sni, "host", host)
+				s.writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error": "veris_sni_host_mismatch",
+					"message": fmt.Sprintf(
+						"the TLS handshake was for %s but the request claims Host %s", sni, host),
+				})
+				return
+			}
+			host = sni
 		}
-		// A redirected request has no absolute URL; reconstruct the authority
-		// from the SNI, falling back to the Host header.
-		if req.Host == "" {
-			req.Host = sni
-		}
-		req.URL.Scheme = "https"
-		req.URL.Host = req.Host
 
-		rec := &connResponseWriter{conn: tlsConn, header: http.Header{}, req: req}
-		s.forward(rec, req, "https")
-		if err := rec.finish(); err != nil {
+		if host == "" {
+			s.writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error":   "veris_no_host",
+				"message": "the request carried no Host header, so the intended destination is unknown",
+			})
 			return
 		}
-		if req.Close || rec.closed {
-			return
-		}
-	}
+		s.forward(w, r, scheme, host)
+	})
 }
 
 // forward applies the same routing decision as the explicit-proxy path, then
 // performs the request itself.
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) {
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme, host string) {
 	if r.URL.Path == CanaryPath || r.URL.Path == StatusPath {
 		if r.URL.Path == CanaryPath {
 			s.canaryHits.Add(1)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s.state(r.URL.Path))
+		s.writeJSON(w, http.StatusOK, s.state(r.URL.Path))
 		return
 	}
 
-	host := hostOnly(firstNonEmpty(r.Host, r.URL.Host))
-
 	if s.cfg.IsPassthrough(host) {
 		s.passedvia.Add(1)
-		// Passthrough in transparent mode would mean re-dialling the original
-		// destination, which the kernel has already redirected away from us.
-		// Rather than guess, refuse clearly: the container runner is expected
-		// to exclude passthrough hosts from the redirect rules instead.
+		// Reaching the real host would mean re-dialling a destination we can no
+		// longer address: the kernel redirected it away from us, or DNS points
+		// the name at us. Guessing would be worse than saying so.
 		s.writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error": "veris_passthrough_in_transparent_mode",
+			"error": "veris_passthrough_unreachable",
 			"message": fmt.Sprintf(
-				"%s is configured for passthrough, but it was redirected to the proxy anyway.", host),
-			"remedy": "Exclude this host from the iptables redirect rules rather than from proxy config.",
+				"%s is configured for passthrough, but it reached the proxy anyway.", host),
+			"remedy": "Exclude this host from the iptables redirect rules rather " +
+				"than from proxy config: the redirect happens before DNS.",
 		})
 		return
 	}
 
-	target, ok := s.cfg.Resolve(host)
-	if !ok {
+	outbound := r.Clone(r.Context())
+	outbound.RequestURI = ""
+	outbound.URL.Scheme = scheme
+	outbound.URL.Host = host
+	outbound.Host = host
+
+	target, ok := s.cfg.Resolve(host, r.URL.Path)
+	switch {
+	case ok:
+		s.recordIntercept(host, target, modeTransparent, r.Method, r.URL.Path)
+		rewriteTo(outbound, target)
+		s.annotate(outbound)
+
+	case s.cfg.Mode == config.ModePassthrough:
+		// Forward to the REAL host, unrewritten. This works here for the same
+		// reason the redirect does not loop: the proxy's own egress is exempt
+		// by uid, so it can still reach a destination the kernel redirected
+		// away from everything else.
+		//
+		// Without this the container tier behaved as strict no matter what the
+		// mode said, so a package install or a telemetry call was refused by a
+		// proxy configured to let it through.
 		s.blocked.Add(1)
-		s.log.Error("blocked unmapped host", "host", host, "method", r.Method, "path", r.URL.Path, "mode", "transparent")
+		s.log.Warn("unmapped host forwarded to the real internet",
+			"host", host, "path", r.URL.Path,
+			"hint", "mode=passthrough; set mode=strict before trusting a green run")
+
+	default:
+		s.blocked.Add(1)
+		s.log.Error("blocked unmapped host",
+			"host", host, "method", r.Method, "path", r.URL.Path, "mode", modeTransparent)
 		s.writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":          "veris_unmapped_host",
 			"message":        fmt.Sprintf("%s is not mapped to a Veris simulated service.", host),
@@ -172,23 +162,11 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) 
 		return
 	}
 
-	outbound := r.Clone(r.Context())
-	outbound.RequestURI = ""
-	outbound.URL.Scheme = scheme
-	outbound.URL.Host = host
-	rewriteTo(outbound, target)
-	s.annotate(outbound)
-
-	s.intercepted.Add(1)
-	s.log.Info("intercepted",
-		"service", target.Service, "host", host, "method", r.Method,
-		"path", outbound.URL.Path, "upstream", target.Upstream.Host, "mode", "transparent")
-
-	resp, err := s.upstreamClient().Do(outbound)
+	resp, err := s.upstream.Do(outbound)
 	if err != nil {
 		s.writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":   "veris_upstream_unreachable",
-			"message": fmt.Sprintf("could not reach the Veris sandbox for service %q: %v", target.Service, err),
+			"message": fmt.Sprintf("could not reach %s: %v", outbound.URL.Host, err),
 		})
 		return
 	}
@@ -201,20 +179,33 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) 
 	}
 	w.Header().Set("X-Veris-Proxy", "1")
 	w.WriteHeader(resp.StatusCode)
+	// Streamed rather than buffered, so a large download or an SSE stream is
+	// not held whole in memory.
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (s *Server) upstreamClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			// Never chain through an ambient proxy: in the container the
-			// environment deliberately points at us.
-			Proxy: nil,
-			TLSClientConfig: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
-				InsecureSkipVerify: s.cfg.Upstream.InsecureSkipVerify, //nolint:gosec // operator opt-in
-			},
+// newUpstreamClient is built ONCE per server, not per request: a client
+// constructed per request gets a fresh connection pool every time, so nothing
+// is ever reused and HTTP/2 -- whose whole benefit is multiplexing over one
+// connection -- degrades to a new handshake per call.
+func newUpstreamClient(insecure bool) *http.Client {
+	transport := &http.Transport{
+		// Never chain through an ambient proxy: in the container the
+		// environment deliberately points at us.
+		Proxy: nil,
+		TLSClientConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: insecure, //nolint:gosec // operator opt-in
 		},
+		// Setting TLSClientConfig by hand disables net/http's automatic HTTP/2
+		// upgrade, so it has to be asked for explicitly. Without this the
+		// sandbox leg is HTTP/1.1 even when the client's leg negotiated h2.
+		ForceAttemptHTTP2:   true,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
 		// Redirects are the upstream's business, not ours; passing them back
 		// keeps the client's own redirect policy in charge.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -226,55 +217,5 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Veris-Proxy", "1")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-// connResponseWriter adapts a raw TLS connection to http.ResponseWriter, which
-// is what lets the transparent TLS path reuse the same handler as the
-// plaintext one.
-type connResponseWriter struct {
-	conn    net.Conn
-	req     *http.Request
-	header  http.Header
-	status  int
-	body    []byte
-	written bool
-	closed  bool
-}
-
-func (c *connResponseWriter) Header() http.Header { return c.header }
-
-func (c *connResponseWriter) WriteHeader(status int) {
-	if !c.written {
-		c.status = status
-		c.written = true
-	}
-}
-
-func (c *connResponseWriter) Write(p []byte) (int, error) {
-	if !c.written {
-		c.WriteHeader(http.StatusOK)
-	}
-	c.body = append(c.body, p...)
-	return len(p), nil
-}
-
-// finish serialises the buffered response onto the connection. Buffering keeps
-// this simple and is fine for API traffic, which is what a dependency sandbox
-// serves; it would need streaming for large payloads.
-func (c *connResponseWriter) finish() error {
-	if !c.written {
-		c.WriteHeader(http.StatusOK)
-	}
-	resp := &http.Response{
-		StatusCode:    c.status,
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        c.header,
-		Body:          io.NopCloser(bytes.NewReader(c.body)),
-		ContentLength: int64(len(c.body)),
-		Request:       c.req,
-	}
-	return resp.Write(c.conn)
+	_ = writeJSONBody(w, body)
 }

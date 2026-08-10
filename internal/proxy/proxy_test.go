@@ -25,6 +25,7 @@ type harness struct {
 	proxyURL string
 	client   *http.Client
 	requests chan *http.Request
+	roots    *x509.CertPool
 }
 
 func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
@@ -95,7 +96,7 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 		},
 	}
 
-	return &harness{origin: origin, proxyURL: proxyURL, client: client, requests: seen}
+	return &harness{origin: origin, proxyURL: proxyURL, client: client, requests: seen, roots: roots}
 }
 
 func (h *harness) get(t *testing.T, rawurl string) (*http.Response, []byte) {
@@ -348,5 +349,38 @@ func TestDirectRequestToUnknownPathExplainsItself(t *testing.T) {
 	// not work, not handed a bare 400.
 	if len(body) == 0 {
 		t.Fatal("expected an explanatory message")
+	}
+}
+
+// The explicit-proxy tier tunnels through CONNECT, which is a different code
+// path from the transparent listeners: goproxy terminates the tunnel's TLS
+// itself. It leaves h2 off unless asked, so this proves the ask took.
+func TestTheCONNECTTunnelNegotiatesHTTP2(t *testing.T) {
+	h := newHarness(t, nil)
+
+	proxyURL, err := url.Parse(h.proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &http.Transport{
+		Proxy:             http.ProxyURL(proxyURL),
+		ForceAttemptHTTP2: true,
+		TLSClientConfig: &tls.Config{
+			RootCAs:    h.roots,
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"h2", "http/1.1"},
+		},
+	}
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	resp, err := client.Get("https://api.stripe.com/v1/charges")
+	if err != nil {
+		t.Fatalf("GET through the proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("negotiated %s through CONNECT, want HTTP/2", resp.Proto)
 	}
 }

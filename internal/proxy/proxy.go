@@ -7,11 +7,13 @@
 package proxy
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/veris-ai/veris-proxy/internal/ca"
 	"github.com/veris-ai/veris-proxy/internal/config"
+	"github.com/veris-ai/veris-proxy/internal/hostport"
 )
 
 // Control-plane paths served by the proxy itself, on any host. They are
@@ -49,12 +52,18 @@ type Server struct {
 	version string
 	started time.Time
 
-	handler *goproxy.ProxyHttpServer
+	handler  *goproxy.ProxyHttpServer
+	upstream *http.Client
 
 	intercepted atomic.Int64
 	blocked     atomic.Int64
 	passedvia   atomic.Int64
 	canaryHits  atomic.Int64
+	// inbound is set when --expose opened a callback path, so the status
+	// endpoint can report what the app received.
+	inbound atomic.Pointer[*Ingress]
+
+	receipt receipt
 }
 
 // New builds a Server. It does not listen; call Handler and serve it, or use
@@ -68,9 +77,25 @@ func New(cfg *config.Config, authority *ca.CA, log *slog.Logger, version string)
 		started: time.Now(),
 	}
 
+	// A canary always exists. Its job is to answer "is this the proxy for MY
+	// run", and a per-process token answers that whether or not the caller
+	// supplied one -- so `check` is a real assertion by default instead of
+	// degrading to bare liveness whenever the config happened to omit it.
+	if s.cfg.CanaryToken == "" {
+		s.cfg.CanaryToken = mintCanary()
+	}
+
+	s.upstream = newUpstreamClient(cfg.Upstream.InsecureSkipVerify)
+
 	p := goproxy.NewProxyHttpServer()
 	p.Verbose = false
 	p.Logger = slogAdapter{log}
+
+	// Most large vendors serve HTTP/2, so a client that negotiates h2 against
+	// the real API must be able to negotiate it here too. goproxy leaves this
+	// off by default; without it every intercepted CONNECT tunnel downgrades
+	// the client to HTTP/1.1.
+	p.AllowHTTP2 = true
 
 	// goproxy's default transport reads HTTP_PROXY/HTTPS_PROXY from the
 	// environment. Since we are the proxy, and since the CLI sets those
@@ -81,6 +106,9 @@ func New(cfg *config.Config, authority *ca.CA, log *slog.Logger, version string)
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify, //nolint:gosec // operator opt-in for local sandboxes
 	}
+	// Assigning TLSClientConfig turns off the automatic h2 upgrade, so the leg
+	// from here to the sandbox has to ask for it back.
+	p.Tr.ForceAttemptHTTP2 = true
 
 	// Our CA package owns leaf issuance so we control the SANs and, critically,
 	// serve leaf + CA rather than leaf alone. Clients on OpenSSL and Node
@@ -103,25 +131,24 @@ func New(cfg *config.Config, authority *ca.CA, log *slog.Logger, version string)
 // Handler returns the HTTP handler for the proxy.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// ListenAndServe binds cfg.Listen and serves until the context-bound listener
-// is closed. It returns the bound address through addrFn before blocking,
-// which lets a caller that asked for port 0 learn the real port.
-func (s *Server) ListenAndServe(addrFn func(string)) error {
-	ln, err := net.Listen("tcp", s.cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", s.cfg.Listen, err)
-	}
-	if addrFn != nil {
-		addrFn(ln.Addr().String())
-	}
+// Config exposes the configuration the server was built from.
+func (s *Server) Config() *config.Config { return s.cfg }
 
-	srv := &http.Server{
-		Handler: s.handler,
-		// Interception targets are ordinary REST APIs; a request that takes
-		// longer than this is a hung upstream, not a legitimate slow call.
-		ReadHeaderTimeout: 30 * time.Second,
-	}
-	return srv.Serve(ln)
+// recordIntercept is the single accounting point for a routed request, called
+// once a target has been resolved and before the request is rewritten. Both
+// the explicit-proxy and the transparent paths go through it, so the run
+// receipt cannot drift from the counters.
+func (s *Server) recordIntercept(host string, target *config.Target, mode, method, path string) {
+	s.intercepted.Add(1)
+	s.receipt.record(host, target)
+	s.log.Info("intercepted",
+		"service", target.Service,
+		"host", host,
+		"method", method,
+		"path", path,
+		"upstream", target.Upstream.Host,
+		"mode", mode,
+	)
 }
 
 // onConnect decides whether to intercept a CONNECT tunnel.
@@ -147,7 +174,7 @@ func (s *Server) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 	// On an intercepted CONNECT, goproxy leaves the port on req.URL.Host, so
 	// api.stripe.com arrives as api.stripe.com:443. Strip it before anything
 	// user-visible or anything used as a map key.
-	host := hostOnly(firstNonEmpty(req.URL.Host, req.Host))
+	host := hostport.StripPort(firstNonEmpty(req.URL.Host, req.Host))
 
 	if s.cfg.IsPassthrough(host) {
 		s.passedvia.Add(1)
@@ -155,7 +182,7 @@ func (s *Server) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 		return req, nil
 	}
 
-	target, ok := s.cfg.Resolve(host)
+	target, ok := s.cfg.Resolve(host, req.URL.Path)
 	if !ok {
 		s.blocked.Add(1)
 		if s.cfg.Mode == config.ModePassthrough {
@@ -168,25 +195,16 @@ func (s *Server) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 		return req, s.blockResponse(req, host)
 	}
 
-	original := host
+	s.recordIntercept(host, target, "proxy", req.Method, req.URL.Path)
 	rewriteTo(req, target)
 	s.annotate(req)
-
-	s.intercepted.Add(1)
-	s.log.Info("intercepted",
-		"service", target.Service,
-		"host", original,
-		"method", req.Method,
-		"path", req.URL.Path,
-		"upstream", target.Upstream.Host,
-	)
 	return req, nil
 }
 
 // rewriteTo redirects req at the sandbox upstream while preserving everything
 // the origin API needs to interpret it.
 func rewriteTo(req *http.Request, target *config.Target) {
-	original := hostOnly(firstNonEmpty(req.URL.Host, req.Host))
+	original := hostport.StripPort(firstNonEmpty(req.URL.Host, req.Host))
 
 	req.URL.Scheme = target.Upstream.Scheme
 	req.URL.Host = target.Upstream.Host
@@ -214,12 +232,15 @@ func (s *Server) annotate(req *http.Request) {
 	}
 }
 
-// hostOnly strips a trailing :port if present.
-func hostOnly(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
+// mintCanary produces a token unique to this process.
+func mintCanary() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand does not fail in practice, and a proxy that cannot
+		// identify itself is worse than one that will not start.
+		panic("veris-proxy: cannot generate a canary token: " + err.Error())
 	}
-	return host
+	return "cnry_" + hex.EncodeToString(buf)
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -282,7 +303,13 @@ func (s *Server) serveDirect(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.state(req.URL.Path))
+	_ = writeJSONBody(w, s.state(req.URL.Path))
+}
+
+func writeJSONBody(w io.Writer, body any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(body)
 }
 
 // state is the payload for both control endpoints. The canary token is the
@@ -314,6 +341,16 @@ func (s *Server) state(path string) map[string]any {
 			"passthrough":  s.passedvia.Load(),
 			"canary_hits":  s.canaryHits.Load(),
 			"cached_certs": int64(s.ca.CacheLen()),
+		}
+		// The receipt too, so a caller outside this process can enforce a
+		// --require-service. `run` reads it in-process when it owns the proxy;
+		// when the proxy is in another container it has to come over the wire.
+		out["receipt"] = s.receipt.snapshot()
+		// And the inbound one, for exactly the same reason: with the proxy in
+		// another container, `run --image` can only enforce --require-callback
+		// over the wire.
+		if in := s.inbound.Load(); in != nil {
+			out["inbound_receipt"] = (*in).Receipt()
 		}
 	}
 	return out

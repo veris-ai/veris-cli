@@ -1,7 +1,3 @@
-bin/
-dist/
-go.work
-go.work.sum
-*.pem
-*.jks
-.veris/
+/veris-proxy
+/bin/
+/dist/
