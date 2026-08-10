@@ -62,9 +62,12 @@ veris-proxy: the sandbox received 1 request(s):
   stripe                       1
 ```
 
-Add `--require-service stripe` and the run exits 3 if your suite never called
-it. Without it nothing is asserted — the receipt is still printed, so a run that
-sent nothing says so, but the exit code stays your command's. `-v`, `-e` and
+An `--environment` run that sent the sandbox nothing exits 3 on its own —
+deploying a sandbox for a suite that never called it is a failure, not a
+pass. `--require-service stripe[:count]` sharpens that into per-service
+assertions and takes over the verdict entirely. Attaching with `--sandbox`
+asserts nothing by default: the receipt is still printed, so a run that sent
+nothing says so, but the exit code stays your command's. `-v`, `-e` and
 `-w` pass through to your container.
 
 The proxy's own image comes from a repository holding that image and nothing

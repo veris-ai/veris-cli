@@ -440,6 +440,22 @@ func parseRequirement(kind, raw string) (requirement, error) {
 	return requirement{kind: kind, name: name, count: count}, nil
 }
 
+// environmentReceiptUnmet is the assertion nobody should have to spell out: a
+// run that deployed a whole sandbox and then sent it nothing did not test its
+// integration, whatever the suite's own exit code says. The environment already
+// names the services, so an empty receipt fails by default; explicit
+// --require-service flags take over the judgement entirely when given.
+func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Receipt) []string {
+	if environment == "" || len(reqs) > 0 || r.Total > 0 {
+		return nil
+	}
+	return []string{
+		"this run deployed a sandbox and sent it nothing: either the suite " +
+			"never called its dependencies, or interception missed them. " +
+			"--require-service <name> sharpens this to a per-service assertion",
+	}
+}
+
 func unmetRequirements(reqs []requirement, r proxy.Receipt) []string {
 	var out []string
 	for _, req := range reqs {

@@ -184,6 +184,7 @@ func runContainerised(spec dockerRun) error {
 	}
 
 	unmet := unmetRequirements(spec.Requirements, receipt)
+	unmet = append(unmet, environmentReceiptUnmet(spec.Environment, spec.Requirements, receipt)...)
 	if spec.Expose > 0 {
 		// The proxy is in another container, so the only way to know what the
 		// app received is to read it from the status endpoint. Without this

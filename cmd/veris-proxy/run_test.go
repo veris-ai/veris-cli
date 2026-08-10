@@ -287,3 +287,25 @@ func TestAnImageMayRunWithNoCommandOfItsOwn(t *testing.T) {
 		t.Errorf("expected the incompatible-flag refusal, got: %v", err)
 	}
 }
+
+func TestAnEnvironmentRunThatSentNothingFailsByDefault(t *testing.T) {
+	// The environment already names the services, so nobody should have to
+	// spell out --require-service for "the suite reached the sandbox at all".
+	if got := environmentReceiptUnmet("env_1", nil, proxy.Receipt{}); len(got) != 1 {
+		t.Fatalf("empty receipt on an --environment run must be unmet, got %v", got)
+	}
+	// Explicit requirements take over the judgement entirely.
+	reqs := []requirement{{kind: "service", name: "stripe", count: 1}}
+	if got := environmentReceiptUnmet("env_1", reqs, proxy.Receipt{}); got != nil {
+		t.Fatalf("explicit requirements must own the verdict, got %v", got)
+	}
+	// Traffic flowed: nothing to add.
+	if got := environmentReceiptUnmet("env_1", nil, proxy.Receipt{Total: 2}); got != nil {
+		t.Fatalf("a non-empty receipt is not unmet, got %v", got)
+	}
+	// Attaching to an existing sandbox keeps the documented contract: the
+	// receipt is printed, the exit code stays the command's own.
+	if got := environmentReceiptUnmet("", nil, proxy.Receipt{}); got != nil {
+		t.Fatalf("--sandbox runs must not gain an implicit assertion, got %v", got)
+	}
+}
