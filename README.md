@@ -29,7 +29,6 @@ download the `.exe` from the releases page.
 ## Quick start
 
 ```sh
-gcloud auth configure-docker us-central1-docker.pkg.dev   # once, to pull the proxy image
 export VERIS_API_KEY=...
 veris-proxy run --environment env_abc123 --image your-image -- pytest -q
 ```
@@ -70,6 +69,7 @@ sent nothing says so, but the exit code stays your command's. `-v`, `-e` and
 
 The proxy's own image comes from a repository holding that image and nothing
 else, so pulling it grants nothing else; `--proxy-image` overrides it.
+Pulling needs a logged-in gcloud (`gcloud auth login`).
 
 See `container/README.md` for the two docker commands this is doing for you,
 for running the proxy against an image you cannot restart, and for adding it to

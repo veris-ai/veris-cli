@@ -500,8 +500,8 @@ func javaTrustStore(authority *ca.CA) string {
 //
 // Its own repository, holding this image and nothing else, because of who pulls
 // it: the rest of our images are pulled by the cluster, and this one is pulled
-// by whoever is testing. Access is authenticated, so a first run wants
-// `gcloud auth configure-docker us-central1-docker.pkg.dev`.
+// by whoever is testing. Access is authenticated with the puller's own gcloud
+// login.
 const defaultProxyImage = "us-central1-docker.pkg.dev/veris-ai-dev/" +
 	"svc-sandbox-proxy-dev/veris-proxy:runner"
 
