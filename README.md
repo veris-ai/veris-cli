@@ -69,7 +69,10 @@ sent nothing says so, but the exit code stays your command's. `-v`, `-e` and
 
 The proxy's own image comes from a repository holding that image and nothing
 else, so pulling it grants nothing else; `--proxy-image` overrides it.
-Pulling needs a logged-in gcloud (`gcloud auth login`).
+Pulling needs a logged-in gcloud (`gcloud auth login`; if docker then still
+answers 401, `gcloud auth configure-docker us-central1-docker.pkg.dev` wires
+docker to that login). The auth requirement goes away once the image is
+published publicly.
 
 See `container/README.md` for the two docker commands this is doing for you,
 for running the proxy against an image you cannot restart, and for adding it to
