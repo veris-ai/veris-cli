@@ -46,6 +46,7 @@ func writeEnvFile(path, format string, material trust.Material, trustOnly bool, 
 		TrustOnly:           trustOnly,
 		NodeAcceptsEnvProxy: !trustOnly && nodeAcceptsEnvProxy(),
 		PublicURL:           publicURL,
+		PassThrough:         passThrough(cfg),
 	})
 
 	var buf []byte
@@ -89,6 +90,17 @@ func writeEnvFile(path, format string, material trust.Material, trustOnly bool, 
 // trustStorePassword is the JDK's own cacerts password. A truststore holds no
 // secret, and using anything else would mean telling every client a new one.
 const trustStorePassword = "changeit"
+
+// passThrough lifts the config's non-HTTP handoffs into trust's shape.
+func passThrough(cfg *config.Config) []trust.PassThrough {
+	out := make([]trust.PassThrough, 0, len(cfg.PassEnv))
+	for _, p := range cfg.PassEnv {
+		out = append(out, trust.PassThrough{
+			Name: p.Name, Value: p.Value, Service: p.Service,
+		})
+	}
+	return out
+}
 
 // publishTrust writes the certificate, the public-roots bundle and the JVM
 // truststore where the code under test can read them, and returns those paths.

@@ -478,6 +478,12 @@ func announce(log *slog.Logger, running *proxy.Running, cfg *config.Config, auth
 		log.Info("mode=passthrough: only the listed services are rerouted; " +
 			"every other host reaches its real destination. Use --strict to block them.")
 	}
+	for _, p := range cfg.PassEnv {
+		// Said out loud so nobody hunts for why the database "isn't proxied":
+		// it is handed over instead, under the name the code already reads.
+		log.Info("not proxied; handed to the command as an environment variable",
+			"service", p.Service, "var", p.Name)
+	}
 }
 
 // checkFailure marks an interception probe failure, which exits 2 rather than 1

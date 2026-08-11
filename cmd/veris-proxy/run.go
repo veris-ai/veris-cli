@@ -342,6 +342,7 @@ func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
 		CanaryToken:         cfg.CanaryToken,
 		NoProxy:             cfg.AllowPassthrough,
 		NodeAcceptsEnvProxy: nodeAcceptsEnvProxy(),
+		PassThrough:         passThrough(cfg),
 	}))
 
 	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // running the user's own command is the point

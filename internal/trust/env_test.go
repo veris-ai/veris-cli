@@ -67,3 +67,25 @@ func containsPattern(joined, pattern string) bool {
 	}
 	return false
 }
+
+func TestPassThroughIsEmittedInEveryTier(t *testing.T) {
+	opts := Options{
+		ProxyURL: "http://127.0.0.1:1", CACertPath: "/ca.pem",
+		PassThrough: []PassThrough{
+			{Name: "DATABASE_URL", Value: "postgres://u:p@h:5432/app", Service: "postgres"},
+		},
+	}
+	for _, trustOnly := range []bool{false, true} {
+		opts.TrustOnly = trustOnly
+		var got *Var
+		for _, v := range Build(opts) {
+			if v.Name == "DATABASE_URL" {
+				got = &v
+				break
+			}
+		}
+		if got == nil || got.Value != "postgres://u:p@h:5432/app" {
+			t.Fatalf("trustOnly=%v: DATABASE_URL missing or wrong: %+v", trustOnly, got)
+		}
+	}
+}

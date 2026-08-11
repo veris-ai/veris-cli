@@ -295,7 +295,18 @@ func ToConfig(snapshot *Snapshot) (*config.Config, []Unroutable, error) {
 	for _, svc := range snapshot.Services {
 		if !isHTTP(svc.URL) {
 			// A Postgres DSN is a wire protocol this proxy does not speak. It
-			// is reached directly, not through interception.
+			// is reached directly — and the client code that reads it already
+			// reads it from an environment variable in production, so the
+			// faithful move is to hand it over under that exact name.
+			if svc.EnvHint != "" {
+				cfg.PassEnv = append(cfg.PassEnv, config.PassEnvVar{
+					Name: svc.EnvHint, Value: svc.URL, Service: svc.Name,
+				})
+				skipped = append(skipped, Unroutable{svc.Name,
+					"not proxied (" + schemeOf(svc.URL) +
+						" is not http); handed to the command as $" + svc.EnvHint})
+				continue
+			}
 			skipped = append(skipped, Unroutable{svc.Name,
 				"not an http service (" + schemeOf(svc.URL) + ")"})
 			continue
@@ -316,7 +327,10 @@ func ToConfig(snapshot *Snapshot) (*config.Config, []Unroutable, error) {
 		}
 	}
 
-	if len(cfg.Services) == 0 {
+	// A sandbox holding only pass-env services (a lone database) is a real
+	// shape: nothing is intercepted, but the run still hands the DSN over and
+	// the empty receipt says truthfully that no HTTP reached the sandbox.
+	if len(cfg.Services) == 0 && len(cfg.PassEnv) == 0 {
 		return nil, skipped, fmt.Errorf(
 			"sandbox %s has no service this proxy can route; nothing would be intercepted",
 			snapshot.SandboxID)

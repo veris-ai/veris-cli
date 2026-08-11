@@ -150,6 +150,23 @@ when it replaces someone else's URL.
 
 The URL is a capability, in either mode: anyone holding it can POST to your app.
 
+### Non-HTTP services: handed over, not proxied
+
+A sandbox can hold services that are not HTTP — a Postgres service's `url` is
+a connection string, a wire protocol this proxy does not speak. Interception
+would be the wrong tool anyway: client code already reads its database DSN
+from an environment variable in production, so configuration through the
+environment IS the code path that ships.
+
+The proxy hands each such service's connection string to your command under
+the exact variable the platform names for it (its `env_hint` —
+`DATABASE_URL` for Postgres), in every tier: the local child process, the
+workload container's `--env-file`, and `serve --write-env` output, including
+trust-only mode. Startup says so per service — "postgres: not proxied;
+handed to the command as $DATABASE_URL" — so an unproxied database reads as
+the deliberate handoff it is. An explicit `-e DATABASE_URL=...` of your own
+still wins, exactly as `docker run` precedence has it.
+
 ### Without a container
 
 `veris-proxy run` without `--image` is the fallback for work that is not containerised. It runs
