@@ -196,6 +196,9 @@ func installRedirectIptables(uid, httpPort, httpsPort int) error {
 		{"-d", "192.168.0.0/16", "-j", "RETURN"},
 		{"-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprint(httpPort)},
 		{"-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprint(httpsPort)},
+		// Apache Fineract's shipped HTTPS profiles use its conventional 8443
+		// port. It is still TLS traffic and belongs on the HTTPS listener.
+		{"-p", "tcp", "--dport", "8443", "-j", "REDIRECT", "--to-port", fmt.Sprint(httpsPort)},
 	}
 	for _, rule := range rules {
 		args := append([]string{"-t", "nat", "-A", "VERIS"}, rule...)
@@ -256,9 +259,10 @@ table ip veris {
 		ip daddr 192.168.0.0/16 return
 		tcp dport 80 redirect to :%d
 		tcp dport 443 redirect to :%d
+		tcp dport 8443 redirect to :%d
 	}
 }
-`, uid, httpPort, httpsPort)
+`, uid, httpPort, httpsPort, httpsPort)
 }
 
 func installSystemTrust(caPath string) error {

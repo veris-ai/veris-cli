@@ -12,9 +12,33 @@ func TestTheTableLoadsAndKnowsTheVendors(t *testing.T) {
 	if len(known) < 10 {
 		t.Fatalf("only %d services in the route table: %v", len(known), known)
 	}
-	for _, want := range []string{"stripe", "google-calendar", "google-drive", "google-identity"} {
+	for _, want := range []string{"stripe", "fineract", "google-calendar", "google-drive", "google-identity"} {
 		if _, ok := For(want); !ok {
 			t.Errorf("%s has no route", want)
+		}
+	}
+}
+
+func TestFineractClaimsTheConnectorDeploymentHosts(t *testing.T) {
+	entries, ok := For("fineract")
+	if !ok {
+		t.Fatal("fineract has no routes")
+	}
+	want := map[string]bool{
+		"mifos.mifos.gazelle.test": false,
+		"leopard.mifos.io":         false,
+	}
+	for _, entry := range entries {
+		if _, known := want[entry.Host]; known {
+			want[entry.Host] = true
+		}
+		if len(entry.Paths) != 0 {
+			t.Errorf("fineract host %q should claim the whole host, got paths %v", entry.Host, entry.Paths)
+		}
+	}
+	for host, found := range want {
+		if !found {
+			t.Errorf("fineract does not claim %q; entries = %+v", host, entries)
 		}
 	}
 }

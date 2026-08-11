@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "parity vendor-routes",
-  "source": "services/*/parity/backend.yaml (measured), plus each vendor's own spec for path prefixes",
+  "source": "services/*/parity/backend.yaml (measured), plus service specs and shipped client deployment profiles",
   "services": {
     "acuity-scheduling": [
       {
@@ -52,6 +52,14 @@
     "frameio-v4": [
       {
         "host": "api.frame.io"
+      }
+    ],
+    "fineract": [
+      {
+        "host": "mifos.mifos.gazelle.test"
+      },
+      {
+        "host": "leopard.mifos.io"
       }
     ],
     "google-calendar": [
