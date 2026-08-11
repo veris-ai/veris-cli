@@ -73,6 +73,23 @@ type Config struct {
 	// to prove interception is live for *this* configuration, not a stale proxy
 	// left running from an earlier run.
 	CanaryToken string `json:"canary_token,omitempty"`
+
+	// PassEnv is the sandbox surface the proxy cannot intercept: a database
+	// service's URL is a DSN, a wire protocol this proxy does not speak, and
+	// the client code that consumes it already reads it from an environment
+	// variable in production. So the value is HANDED to the command under
+	// that exact variable (the platform's env_hint) instead of routed.
+	PassEnv []PassEnvVar `json:"pass_env,omitempty"`
+}
+
+// PassEnvVar is one environment variable handed to the command under test.
+type PassEnvVar struct {
+	// Name is the variable the client's code already reads (DATABASE_URL).
+	Name string `json:"name"`
+	// Value is the sandbox's own connection string, verbatim.
+	Value string `json:"value"`
+	// Service names where the value came from, for the announcement.
+	Service string `json:"service"`
 }
 
 // Upstream describes how to reach the Veris sandbox.
@@ -208,7 +225,7 @@ func (c *Config) Validate() error {
 	if c.SandboxID == "" {
 		return fmt.Errorf("sandbox_id is required")
 	}
-	if len(c.Services) == 0 {
+	if len(c.Services) == 0 && len(c.PassEnv) == 0 {
 		return fmt.Errorf("no services configured: the proxy would block every request")
 	}
 

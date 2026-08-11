@@ -24,6 +24,15 @@ type Var struct {
 	Append bool `json:"append,omitempty"`
 }
 
+// PassThrough is a variable the sandbox hands to the command verbatim — a
+// database DSN under the name the client's code already reads. Not routing
+// and not trust, so every tier emits it, including trust-only.
+type PassThrough struct {
+	Name    string
+	Value   string
+	Service string
+}
+
 // Options describes the running proxy.
 type Options struct {
 	ProxyURL string
@@ -67,6 +76,11 @@ type Options struct {
 	// being claimed -- and a redirect that silently stopped working would be
 	// masked by the variables rather than showing up as a failure.
 	TrustOnly bool
+
+	// PassThrough is the non-HTTP sandbox surface (database DSNs), emitted in
+	// EVERY mode including TrustOnly: the kernel redirect cannot route a wire
+	// protocol the proxy does not speak, so the handoff is the coverage.
+	PassThrough []PassThrough
 }
 
 // loopback plus the RFC1918 ranges. Without these, a test that starts its own
@@ -82,7 +96,7 @@ func Build(o Options) []Var {
 	noProxy := strings.Join(append(append([]string{}, defaultNoProxy...), o.NoProxy...), ",")
 
 	if o.TrustOnly {
-		return buildTrustOnly(o)
+		return append(buildTrustOnly(o), passThroughVars(o)...)
 	}
 
 	bundle := o.CABundlePath
@@ -164,6 +178,23 @@ func Build(o Options) []Var {
 		})
 	}
 
+	return append(vars, passThroughVars(o)...)
+}
+
+// passThroughVars hands over what interception cannot cover: each non-HTTP
+// service's connection string, under the variable name the client's code
+// already reads. Same value in every tier — this is configuration the twelve-
+// factor way, not routing.
+func passThroughVars(o Options) []Var {
+	vars := make([]Var, 0, len(o.PassThrough))
+	for _, p := range o.PassThrough {
+		vars = append(vars, Var{
+			Name:  p.Name,
+			Value: p.Value,
+			Reason: p.Service + " is not an HTTP service; its connection " +
+				"string is handed over rather than proxied",
+		})
+	}
 	return vars
 }
 

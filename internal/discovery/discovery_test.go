@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -210,5 +211,53 @@ func TestACollidingSandboxIDIsACacheMissNotAWrongAnswer(t *testing.T) {
 	}
 	if _, err := LoadSnapshot("team_a"); err == nil {
 		t.Fatal("team_a shares the filename of team/a and must not load it")
+	}
+}
+
+func TestADatabaseServiceIsHandedOverNotRouted(t *testing.T) {
+	snapshot := &Snapshot{
+		SandboxID: "sbx_db", EnvironmentID: "env_db",
+		Services: []Service{
+			{Name: "stripe", URL: "http://gw/s/sbx_db/stripe", EnvHint: "STRIPE_API_BASE"},
+			{Name: "postgres", URL: "postgres://user:pw@10.0.0.2:5432/app",
+				EnvHint: "DATABASE_URL"},
+		},
+	}
+	cfg, skipped, err := ToConfig(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.PassEnv) != 1 || cfg.PassEnv[0].Name != "DATABASE_URL" ||
+		cfg.PassEnv[0].Value != "postgres://user:pw@10.0.0.2:5432/app" ||
+		cfg.PassEnv[0].Service != "postgres" {
+		t.Fatalf("pass_env = %+v, want the postgres DSN under DATABASE_URL", cfg.PassEnv)
+	}
+	// The note names the variable, so "why isn't my database proxied" answers
+	// itself in the startup output.
+	found := false
+	for _, s := range skipped {
+		if s.Service == "postgres" && strings.Contains(s.Reason, "$DATABASE_URL") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("skipped notes %+v never name $DATABASE_URL", skipped)
+	}
+}
+
+func TestADatabaseOnlySandboxStillYieldsAConfig(t *testing.T) {
+	snapshot := &Snapshot{
+		SandboxID: "sbx_dbonly", EnvironmentID: "env_db",
+		Services: []Service{
+			{Name: "postgres", URL: "postgres://u:p@h:5432/app", EnvHint: "DATABASE_URL"},
+		},
+	}
+	cfg, _, err := ToConfig(snapshot)
+	if err != nil {
+		t.Fatalf("a lone database is a real sandbox shape, got: %v", err)
+	}
+	if len(cfg.Services) != 0 || len(cfg.PassEnv) != 1 {
+		t.Fatalf("want zero routed services and one handoff, got %d/%d",
+			len(cfg.Services), len(cfg.PassEnv))
 	}
 }
