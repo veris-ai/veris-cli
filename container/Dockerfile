@@ -17,8 +17,11 @@ COPY --from=build /out/veris-proxy /veris-proxy
 # entrypoint into an image you already have.
 FROM alpine:3.22 AS runner
 # No privilege dropper: `veris-proxy serve --transparent` drops itself once the
-# rules are in, so an image adopting this needs iptables and nothing else.
-RUN apk add --no-cache ca-certificates iptables
+# rules are in, so an image adopting this needs a rule writer and nothing else.
+# Both writers ship because the choice belongs to the HOST kernel, not this
+# image: iptables' owner match needs xt_owner, which minimal kernels omit, and
+# serve falls back to nftables there.
+RUN apk add --no-cache ca-certificates iptables nftables
 
 # cloudflared opens the callback path. Baked in rather than fetched at run time:
 # putting a network download on the startup path of the thing whose job is to be

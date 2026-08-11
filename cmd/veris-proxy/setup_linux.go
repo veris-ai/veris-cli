@@ -3,12 +3,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -75,10 +77,11 @@ func selfSetup(log *slog.Logger, opts setupOptions) error {
 		return err
 	}
 
-	if err := installRedirect(opts.UID, httpPort, httpsPort); err != nil {
+	backend, err := installRedirect(opts.UID, httpPort, httpsPort)
+	if err != nil {
 		return err
 	}
-	log.Info("kernel redirect installed",
+	log.Info("kernel redirect installed", "via", backend,
 		"http", httpPort, "https", httpsPort, "exempt_uid", opts.UID)
 
 	// Last, and irreversible. Everything above needed root; nothing below
@@ -129,14 +132,48 @@ func validateUID(uid int) error {
 	return nil
 }
 
-// installRedirect writes the same chain the container entrypoint writes.
-func installRedirect(uid, httpPort, httpsPort int) error {
+// installRedirect writes the redirect with iptables, and when that cannot work
+// falls back to an equivalent native nftables ruleset. The fallback is not an
+// exotic case: the iptables chain needs the owner match (xt_owner) to exempt
+// the proxy's own uid, and minimal kernels -- Firecracker guests such as E2B
+// sandboxes, modules-less container kernels -- ship nf_tables without xt_owner
+// and without /lib/modules to load it from. nft needs no xt_owner: `meta
+// skuid` is core nf_tables. The same fallback covers nft-only distros that
+// stopped shipping iptables entirely.
+//
+// Returns which backend took the rules, for the "kernel redirect installed"
+// log line -- two backends that both look like success must say which one is
+// live, or a missing-interception hunt starts from the wrong tool.
+func installRedirect(uid, httpPort, httpsPort int) (string, error) {
+	iptErr := installRedirectIptables(uid, httpPort, httpsPort)
+	if iptErr == nil {
+		return "iptables", nil
+	}
+	// A failed install may have left a half-built VERIS chain (created, some
+	// rules in, jump absent). Remove it before the fallback: two backends'
+	// rules layered over each other is exactly the state nobody can debug.
+	removeIptablesRedirect()
+	nftErr := installRedirectNft(uid, httpPort, httpsPort)
+	if nftErr == nil {
+		return "nftables", nil
+	}
+	return "", fmt.Errorf(
+		"the kernel redirect could not be installed, so nothing would be "+
+			"intercepted.\n\n"+
+			"     iptables: %v\n"+
+			"     nftables: %v\n\n"+
+			"     The iptables path needs the owner match (xt_owner) in the "+
+			"kernel; the nftables path needs only nf_tables and the nft tool "+
+			"(apt-get install nftables / apk add nftables). Add one of them, "+
+			"or drop --transparent and use the explicit proxy",
+		iptErr, nftErr)
+}
+
+// installRedirectIptables writes the same chain the container entrypoint used
+// to write.
+func installRedirectIptables(uid, httpPort, httpsPort int) error {
 	if _, err := exec.LookPath("iptables"); err != nil {
-		return fmt.Errorf(
-			"iptables is not in this image, so the kernel redirect cannot be " +
-				"installed and nothing would be intercepted. Add it " +
-				"(apt-get install iptables / apk add iptables), or drop " +
-				"--transparent and use the explicit proxy")
+		return errors.New("iptables is not in this image")
 	}
 
 	// A fresh chain either way, so a restart does not append duplicates.
@@ -173,6 +210,55 @@ func installRedirect(uid, httpPort, httpsPort int) error {
 	for execTool("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", "VERIS") == nil {
 	}
 	return execTool("iptables", "-t", "nat", "-I", "OUTPUT", "1", "-p", "tcp", "-j", "VERIS")
+}
+
+// removeIptablesRedirect undoes whatever installRedirectIptables managed to
+// write. Best-effort by design: every step is "make it not exist", and on the
+// kernels that sent us here most of it never existed.
+func removeIptablesRedirect() {
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return
+	}
+	for execTool("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", "VERIS") == nil {
+	}
+	_ = execTool("iptables", "-t", "nat", "-F", "VERIS")
+	_ = execTool("iptables", "-t", "nat", "-X", "VERIS")
+}
+
+// installRedirectNft applies the nftables mirror of the iptables chain in one
+// atomic `nft -f` transaction: partial application is the failure mode this
+// file keeps designing against, and nft gives all-or-nothing for free.
+func installRedirectNft(uid, httpPort, httpsPort int) error {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return errors.New("nft is not in this image")
+	}
+	return execToolStdin(nftRuleset(uid, httpPort, httpsPort), "nft", "-f", "-")
+}
+
+// nftRuleset mirrors the iptables chain rule for rule. The leading empty
+// declaration makes the delete valid when no table exists yet, so a restart
+// replaces the table instead of stacking duplicate rules -- the same "fresh
+// chain either way" the iptables path gets from -N-then-F.
+//
+// Priority -100 is where iptables' own nat OUTPUT hook sits (NF_IP_PRI_NAT_DST),
+// so the two backends see traffic at the same point relative to everything
+// else on the box.
+func nftRuleset(uid, httpPort, httpsPort int) string {
+	return fmt.Sprintf(`table ip veris {}
+delete table ip veris
+table ip veris {
+	chain output {
+		type nat hook output priority -100; policy accept;
+		meta skuid %d return
+		ip daddr 127.0.0.0/8 return
+		ip daddr 10.0.0.0/8 return
+		ip daddr 172.16.0.0/12 return
+		ip daddr 192.168.0.0/16 return
+		tcp dport 80 redirect to :%d
+		tcp dport 443 redirect to :%d
+	}
+}
+`, uid, httpPort, httpsPort)
 }
 
 func installSystemTrust(caPath string) error {
@@ -264,6 +350,15 @@ func chownShallow(dir string, uid int) error {
 
 func execTool(name string, args ...string) error {
 	cmd := exec.Command(name, args...) //nolint:gosec // fixed argv built above
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %w: %s", name, err, out)
+	}
+	return nil
+}
+
+func execToolStdin(stdin, name string, args ...string) error {
+	cmd := exec.Command(name, args...) //nolint:gosec // fixed argv built above
+	cmd.Stdin = strings.NewReader(stdin)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s: %w: %s", name, err, out)
 	}
