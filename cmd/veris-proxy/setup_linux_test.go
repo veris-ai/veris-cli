@@ -38,6 +38,41 @@ func TestChownReachesTheDirectoryAndItsOwnEntriesOnly(t *testing.T) {
 	}
 }
 
+// The nft ruleset is the iptables chain translated, and a translation can
+// drift: a dropped RETURN turns in-pod traffic into vendor calls, a reordered
+// exemption turns the proxy's own upstream calls into a loop.
+func TestNftRulesetMirrorsTheIptablesChain(t *testing.T) {
+	rs := nftRuleset(14741, 8081, 8443)
+
+	// Rules apply in order, so the uid exemption must precede the redirects --
+	// after them it exempts nothing and the proxy redirects itself.
+	uid := strings.Index(rs, "meta skuid 14741 return")
+	redir := strings.Index(rs, "redirect")
+	if uid == -1 || redir == -1 || uid > redir {
+		t.Fatalf("uid exemption missing or after the redirects:\n%s", rs)
+	}
+
+	for _, want := range []string{
+		"ip daddr 127.0.0.0/8 return",
+		"ip daddr 10.0.0.0/8 return",
+		"ip daddr 172.16.0.0/12 return",
+		"ip daddr 192.168.0.0/16 return",
+		"tcp dport 80 redirect to :8081",
+		"tcp dport 443 redirect to :8443",
+		"type nat hook output priority -100",
+	} {
+		if !strings.Contains(rs, want) {
+			t.Fatalf("ruleset lacks %q:\n%s", want, rs)
+		}
+	}
+
+	// Restart safety: declare-then-delete makes the script replace any earlier
+	// table in one transaction instead of stacking rules behind it.
+	if !strings.HasPrefix(rs, "table ip veris {}\ndelete table ip veris\n") {
+		t.Fatalf("ruleset does not replace an existing table:\n%s", rs)
+	}
+}
+
 // uid 0 would leave the proxy running as root with the redirect exempting root,
 // which is every workload exempted at once.
 func TestTheProxyUIDCannotBeRoot(t *testing.T) {
