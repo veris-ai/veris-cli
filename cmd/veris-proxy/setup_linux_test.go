@@ -59,6 +59,7 @@ func TestNftRulesetMirrorsTheIptablesChain(t *testing.T) {
 		"ip daddr 192.168.0.0/16 return",
 		"tcp dport 80 redirect to :8081",
 		"tcp dport 443 redirect to :8443",
+		"tcp dport 8443 redirect to :8443",
 		"type nat hook output priority -100",
 	} {
 		if !strings.Contains(rs, want) {
