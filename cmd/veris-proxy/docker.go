@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/proxy"
 )
 
@@ -95,7 +97,10 @@ func runContainerised(spec dockerRun) error {
 	// Teardown runs on every path out, including a signal: a leaked proxy
 	// container holds a network namespace and a name that the next run wants.
 	// Once-guarded because the signal path and the deferred path both call it.
+	// envSandboxID is read by the teardown closure; it is set once the proxy
+	// reports ready and the deployed sandbox is knowable from here.
 	var teardown sync.Once
+	var envSandboxID string
 	stop := func() {
 		teardown.Do(func() {
 			// The workload first -- it lives in the proxy's network namespace,
@@ -121,6 +126,13 @@ func runContainerised(spec dockerRun) error {
 			_ = dockerQuiet("rm", "-f", name)
 			_ = dockerQuiet("network", "rm", network)
 			_ = os.RemoveAll(share)
+			// The container's own deferred delete is the normal path, but the
+			// stop grace above can expire mid-teardown -- cloudflared drains
+			// its tunnel before the delete request goes out -- and the SIGKILL
+			// that follows leaks the sandbox until its TTL. The host holds the
+			// same credentials, so it guarantees the delete rather than hoping;
+			// a 404 here just means the container got there first.
+			deleteDeployedSandbox(spec, envSandboxID)
 		})
 	}
 	defer stop()
@@ -138,14 +150,13 @@ func runContainerised(spec dockerRun) error {
 	if err := refuseExemptWorkloadUID(spec.Image, spec.ProxyUID); err != nil {
 		return err
 	}
+	if err := ensureProxyImage(spec.ProxyImage, spec.Quiet); err != nil {
+		return err
+	}
 	if err := startProxyContainer(spec, name, network, share); err != nil {
 		return err
 	}
 
-	statusURL, err := proxyStatusURL(name)
-	if err != nil {
-		return err
-	}
 	// --environment deploys a sandbox INSIDE the container before the marker is
 	// written, and that is allowed minutes for scheduling and image pulls. A
 	// ninety-second budget would kill healthy deployments as startup failures.
@@ -159,6 +170,16 @@ func runContainerised(spec dockerRun) error {
 	}
 	if err := waitForReady(share, name, readyBudget); err != nil {
 		return err
+	}
+	// Read only after readiness: a container that crashed on startup surfaces
+	// as waitForReady's exited-with-these-logs error, not as an inscrutable
+	// failure to read a published port from a container that no longer exists.
+	statusURL, err := proxyStatusURL(name)
+	if err != nil {
+		return err
+	}
+	if spec.Environment != "" {
+		envSandboxID = fetchSandboxID(statusURL)
 	}
 	if !spec.Quiet {
 		fmt.Fprintf(os.Stderr, "veris-proxy: interception live in %s\n", name)
@@ -215,6 +236,72 @@ func runContainerised(spec dockerRun) error {
 		return exitCode(exitRequirementUnmet)
 	}
 	return nil
+}
+
+// ensureProxyImage pulls the proxy's own image when it is absent, with the
+// pull's progress on stderr. Leaving the pull to `docker run -d` swallows that
+// progress, and a first run then fails minutes later with whatever secondary
+// error the missing image caused -- measured as "read the proxy's published
+// port: exit status 1", which names neither the image nor the pull.
+func ensureProxyImage(image string, quiet bool) error {
+	if exec.Command("docker", "image", "inspect", image).Run() == nil {
+		return nil
+	}
+	if !quiet {
+		fmt.Fprintf(os.Stderr, "veris-proxy: pulling %s (first run)\n", image)
+	}
+	cmd := exec.Command("docker", "pull", image)
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cannot pull the proxy image %s: %w. "+
+			"Pulling needs a logged-in gcloud; if it answered 401, run "+
+			"`gcloud auth configure-docker us-central1-docker.pkg.dev` once",
+			image, err)
+	}
+	return nil
+}
+
+// fetchSandboxID reads which sandbox the proxy container is routing at, so the
+// host can guarantee the delete of one it asked to be deployed. Best-effort:
+// "" only costs the backstop, and the TTL still bounds the sandbox's life.
+func fetchSandboxID(statusURL string) string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(statusURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return ""
+	}
+	var state struct {
+		SandboxID string `json:"sandbox_id"`
+	}
+	if json.Unmarshal(body, &state) != nil {
+		return ""
+	}
+	return state.SandboxID
+}
+
+// deleteDeployedSandbox is the host-side half of --environment teardown.
+func deleteDeployedSandbox(spec dockerRun, sandboxID string) {
+	if spec.Environment == "" || sandboxID == "" {
+		return
+	}
+	client, err := discovery.NewClient(spec.APIBase, spec.APIKey)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = client.Delete(ctx, spec.Environment, sandboxID)
+	if err == nil || strings.Contains(err.Error(), "404") {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"veris-proxy: could not delete sandbox %s; it will expire on its TTL (%v)\n",
+		sandboxID, err)
 }
 
 // refuseExemptWorkloadUID stops an image that runs as the uid the redirect
