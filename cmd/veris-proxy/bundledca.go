@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 
 	"github.com/veris-ai/veris-proxy/internal/bundlescan"
+	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/trust"
 )
 
@@ -67,9 +68,9 @@ func bundledCAOverlays(spec dockerRun, share, scanLabel string) ([]bundlescan.Ov
 // bundleCacheDir is where scan results live, keyed by immutable image ID. ""
 // disables the cache, which only costs the next run a re-scan.
 func bundleCacheDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	root := discovery.Dir()
+	if root == "" {
 		return ""
 	}
-	return filepath.Join(home, ".veris", "cache", "bundlescan")
+	return filepath.Join(root, "cache", "bundlescan")
 }

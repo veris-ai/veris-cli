@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -143,26 +144,34 @@ func cmdRun(args []string) error {
 	// process -- which does not open one. Refusing beats accepting a callback
 	// assertion that would never be evaluated.
 	if *image == "" {
-		for name, set := range map[string]bool{
-			"--expose": *expose > 0, "--environment": *environment != "",
-			"--require-callback": len(callbackReqs) > 0, "--ttl-minutes": *ttlMinutes > 0,
-			"--expose-token": *exposeToken != "", "--expose-hostname": *exposeHostname != "",
-		} {
-			if set {
-				return fmt.Errorf(
-					"%s needs --image: the callback path is opened by the proxy "+
-						"container. Use `veris-proxy serve %s ...` for a local proxy",
-					name, name)
+		// Most rows share the callback-path reason; --patch-bundled-cas rides
+		// the same table with its own, because its reason is the image's
+		// filesystem, not the callback path. A slice, not a map, so the flag
+		// reported first is deterministic.
+		callbackWhy := func(flag string) string {
+			return "the callback path is opened by the proxy container. Use " +
+				"`veris-proxy serve " + flag + " ...` for a local proxy"
+		}
+		imageOnly := []struct {
+			flag string
+			set  bool
+			why  string
+		}{
+			{"--expose", *expose > 0, callbackWhy("--expose")},
+			{"--environment", *environment != "", callbackWhy("--environment")},
+			{"--require-callback", len(callbackReqs) > 0, callbackWhy("--require-callback")},
+			{"--ttl-minutes", *ttlMinutes > 0, callbackWhy("--ttl-minutes")},
+			{"--expose-token", *exposeToken != "", callbackWhy("--expose-token")},
+			{"--expose-hostname", *exposeHostname != "", callbackWhy("--expose-hostname")},
+			{"--patch-bundled-cas", *patchBundledCAs,
+				"the reason is the image's filesystem, not the callback path: it " +
+					"patches CA files inside a container image"},
+		}
+		for _, f := range imageOnly {
+			if f.set {
+				return fmt.Errorf("%s needs --image: %s", f.flag, f.why)
 			}
 		}
-	}
-
-	// Separate from the map above: the reason is the image's filesystem, not
-	// the callback path.
-	if *patchBundledCAs && *image == "" {
-		return errors.New(
-			"--patch-bundled-cas patches CA files inside a container image, so it " +
-				"needs --image")
 	}
 
 	if len(callbackReqs) > 0 && *expose <= 0 {
@@ -301,19 +310,13 @@ func cmdRun(args []string) error {
 	// code. Only one status can be returned, so a shutdown failure that loses
 	// the tie-break would otherwise vanish -- and it is the one that says the
 	// receipt above may be incomplete.
-	unmet := unmetRequirements(reqs, receipt)
-	for _, u := range unmet {
-		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", u)
-	}
 	// Trust failures are recorded only by transparent listeners, which this
 	// local tier never opens (goproxy's CONNECT loop discards its own MITM
 	// handshake error) -- so today this can fire only via the containerised
 	// path, and is wired here so both tiers share one verdict when that gap
 	// closes.
-	trustMsgs, trustFatal := trustFailureDiagnostics(receipt)
-	for _, m := range trustMsgs {
-		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", m)
-	}
+	unmet := unmetRequirements(reqs, receipt)
+	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt)
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris-proxy: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -325,7 +328,7 @@ func cmdRun(args []string) error {
 	if status != 0 {
 		return exitCode(status)
 	}
-	if len(unmet) > 0 || trustFatal {
+	if fatal {
 		return exitCode(exitRequirementUnmet)
 	}
 	if shutErr != nil {
@@ -534,6 +537,20 @@ func dominantReason(reasons map[string]int64) string {
 		}
 	}
 	return best
+}
+
+// reportUnmetAndTrust prints the run's two failure groups -- the unmet
+// requirements, then the TLS trust diagnostics -- and returns whether either
+// is fatal to the verdict. One place so both tiers report in the same order.
+func reportUnmetAndTrust(w io.Writer, unmet []string, receipt proxy.Receipt) (fatal bool) {
+	for _, u := range unmet {
+		fmt.Fprintf(w, "veris-proxy: %s\n", u)
+	}
+	trustMsgs, trustFatal := trustFailureDiagnostics(receipt)
+	for _, m := range trustMsgs {
+		fmt.Fprintf(w, "veris-proxy: %s\n", m)
+	}
+	return len(unmet) > 0 || trustFatal
 }
 
 func unmetRequirements(reqs []requirement, r proxy.Receipt) []string {

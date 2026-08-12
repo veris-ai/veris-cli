@@ -134,21 +134,6 @@ func cleanTarPath(name string) string {
 	return path.Clean(strings.TrimPrefix(name, "/"))
 }
 
-// pemDER returns the DER of the first CERTIFICATE block.
-func pemDER(pemBytes []byte) ([]byte, error) {
-	rest := pemBytes
-	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			return nil, errors.New("no CERTIFICATE block found")
-		}
-		if block.Type == "CERTIFICATE" {
-			return block.Bytes, nil
-		}
-	}
-}
-
 // bundleContains reports whether the bundle already carries the certificate,
 // compared by DER: whitespace and header text vary per writer, the block's
 // bytes do not.

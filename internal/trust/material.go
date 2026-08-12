@@ -76,12 +76,7 @@ func Publish(dir string, certPEM []byte, storePass string) (Material, error) {
 	// The Veris CA goes LAST. Both orders verify, but a reader inspecting the
 	// file finds the one certificate that is not a public root at the end,
 	// rather than buried among a hundred and twenty.
-	bundle := make([]byte, 0, len(roots)+len(certPEM)+1)
-	bundle = append(bundle, roots...)
-	if len(bundle) > 0 && !bytes.HasSuffix(bundle, []byte("\n")) {
-		bundle = append(bundle, '\n')
-	}
-	bundle = append(bundle, certPEM...)
+	bundle := AppendCA(roots, certPEM)
 
 	if err := writeFile(m.CertPath, certPEM, 0o644); err != nil {
 		return Material{}, err
@@ -90,7 +85,7 @@ func Publish(dir string, certPEM []byte, storePass string) (Material, error) {
 		return Material{}, err
 	}
 
-	ders, err := pemToDER(bundle)
+	ders, err := PEMToDER(bundle)
 	if err != nil {
 		return Material{}, fmt.Errorf("build the JVM truststore: %w", err)
 	}
@@ -120,11 +115,25 @@ func systemRoots() ([]byte, string) {
 	return nil, ""
 }
 
-// pemToDER pulls the DER of every CERTIFICATE block out of a PEM bundle,
+// AppendCA returns base with caPEM appended, guarded by a newline when base is
+// non-empty and lacks a trailing one so two adjacent PEM blocks never fuse into
+// an unparseable line. Append, never replace: a bundle holding only the added
+// CA would break every other TLS connection the reader makes.
+func AppendCA(base, caPEM []byte) []byte {
+	out := make([]byte, 0, len(base)+len(caPEM)+1)
+	out = append(out, base...)
+	if len(out) > 0 && !bytes.HasSuffix(out, []byte("\n")) {
+		out = append(out, '\n')
+	}
+	out = append(out, caPEM...)
+	return out
+}
+
+// PEMToDER pulls the DER of every CERTIFICATE block out of a PEM bundle,
 // skipping anything else the file happens to contain. A bundle with one
 // unparseable block is still a bundle worth building from -- dropping the other
 // hundred and nineteen roots over it would be the worse outcome.
-func pemToDER(raw []byte) ([][]byte, error) {
+func PEMToDER(raw []byte) ([][]byte, error) {
 	var out [][]byte
 	rest := raw
 	for {

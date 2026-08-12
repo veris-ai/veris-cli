@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/veris-ai/veris-proxy/internal/trust"
 )
 
 // testCA returns a freshly minted self-signed CA in PEM, the shape every real
@@ -163,10 +165,11 @@ func TestMatchRuleAnchorsAtASeparator(t *testing.T) {
 func TestBundleContainsComparesByDER(t *testing.T) {
 	ca := testCA(t, "Veris Local CA")
 	other := testCA(t, "Unrelated Root")
-	der, err := pemDER(ca)
+	ders, err := trust.PEMToDER(ca)
 	if err != nil {
 		t.Fatal(err)
 	}
+	der := ders[0]
 	bundle := append(append([]byte{}, other...), ca...)
 	if !bundleContains(bundle, der) {
 		t.Error("a bundle holding the exact certificate must report it")

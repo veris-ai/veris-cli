@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/veris-ai/veris-proxy/internal/discovery"
 )
 
 // Docker is the execution seam: everything the scan asks of the docker CLI
@@ -331,9 +333,9 @@ func (s *Scanner) copyOut(ctx context.Context, ctr, containerPath string) ([]byt
 }
 
 func (s *Scanner) cachePath(id string) string {
-	// The ID is "sha256:<hex>"; the colon is not a filename character worth
-	// keeping.
-	return filepath.Join(s.CacheDir, strings.ReplaceAll(id, ":", "-")+".json")
+	// The ID is "sha256:<hex>"; the sanitizer folds the colon so the entry
+	// stays inside the cache directory.
+	return filepath.Join(s.CacheDir, discovery.SafeFileName(id)+".json")
 }
 
 func (s *Scanner) readCache(id string) ([]cachedMatch, bool) {

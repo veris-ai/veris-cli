@@ -45,6 +45,27 @@ const (
 	handshakeTrustRejected
 )
 
+// certAlerts maps a remote certificate alert to the reason name reported for
+// it, matched as a SUBSTRING of the wrapped "remote error: tls: <alert>" text.
+// Ordered LONGEST substring first so a specific alert wins over one it
+// contains: "unknown certificate authority" MUST precede "unknown certificate",
+// or an unknown-CA refusal would report as certificate_unknown. The expired,
+// revoked and unsupported arms are the client refusing the minted leaf for its
+// content rather than its issuer -- expired is the workload's clock disagreeing
+// with the CA's validity window -- and stay trust rejections carrying the cause.
+var certAlerts = []struct {
+	substr string
+	reason string
+}{
+	{"unknown certificate authority", "unknown_ca"},
+	{"unsupported certificate", "unsupported_certificate"},
+	{"expired certificate", "certificate_expired"},
+	{"revoked certificate", "certificate_revoked"},
+	{"unknown certificate", "certificate_unknown"},
+	{"certificate unknown", "certificate_unknown"},
+	{"bad certificate", "bad_certificate"},
+}
+
 // classifyHandshake reads a server-side handshake error. A peer's TLS alert
 // surfaces as a *net.OpError with Op "remote error" wrapping the alert text.
 // TLS 1.3 encrypts alerts sent after the ServerHello, but this side of
@@ -54,26 +75,10 @@ func classifyHandshake(err error) (handshakeClass, string) {
 	var op *net.OpError
 	if errors.As(err, &op) && op.Op == "remote error" && op.Err != nil {
 		msg := op.Err.Error()
-		switch {
-		// Before the other certificate alerts: "unknown certificate
-		// authority" contains "unknown certificate".
-		case strings.Contains(msg, "unknown certificate authority"):
-			return handshakeTrustRejected, "unknown_ca"
-		case strings.Contains(msg, "bad certificate"):
-			return handshakeTrustRejected, "bad_certificate"
-		case strings.Contains(msg, "unknown certificate"),
-			strings.Contains(msg, "certificate unknown"):
-			return handshakeTrustRejected, "certificate_unknown"
-		// The client evaluated the minted leaf and refused it for its
-		// content rather than its issuer -- expired means the workload's
-		// clock disagrees with the CA's validity window. Still a trust
-		// rejection; the reason name carries the actual cause.
-		case strings.Contains(msg, "expired certificate"):
-			return handshakeTrustRejected, "certificate_expired"
-		case strings.Contains(msg, "revoked certificate"):
-			return handshakeTrustRejected, "certificate_revoked"
-		case strings.Contains(msg, "unsupported certificate"):
-			return handshakeTrustRejected, "unsupported_certificate"
+		for _, a := range certAlerts {
+			if strings.Contains(msg, a.substr) {
+				return handshakeTrustRejected, a.reason
+			}
 		}
 		// A remote alert that names no certificate -- handshake_failure,
 		// protocol_version -- is a different disagreement.

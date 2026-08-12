@@ -113,12 +113,11 @@ func runContainerised(spec dockerRun) error {
 			// with no route to anywhere. Named for exactly this: an unnamed
 			// `docker run` cannot be reached once we stop waiting on it.
 			_ = dockerQuiet("rm", "-f", workload)
-			if spec.PatchBundledCAs {
-				// The signal path exits without running the scan's own deferred
-				// remove, so a scan container created moments before Ctrl-C is
-				// only reachable by its label.
-				removeScanContainers(name)
-			}
+			// The signal path exits without running the scan's own deferred
+			// remove, so a scan container created moments before Ctrl-C is only
+			// reachable by its label. Label-filtered and a no-op when the scan
+			// created none, so it runs unconditionally.
+			removeScanContainers(name)
 			if spec.KeepProxy {
 				fmt.Fprintf(os.Stderr,
 					"veris-proxy: leaving %s running, env file at %s (--keep-proxy)\n",
@@ -226,7 +225,6 @@ func runContainerised(spec dockerRun) error {
 
 	unmet := unmetRequirements(spec.Requirements, receipt)
 	unmet = append(unmet, environmentReceiptUnmet(spec.Environment, spec.Requirements, receipt)...)
-	trustMsgs, trustFatal := trustFailureDiagnostics(receipt)
 	if spec.Expose > 0 {
 		// The proxy is in another container, so the only way to know what the
 		// app received is to read it from the status endpoint. Without this
@@ -247,16 +245,11 @@ func runContainerised(spec dockerRun) error {
 		}
 		unmet = append(unmet, unmetCallbacks(spec.CallbackReqs, inbound)...)
 	}
-	for _, u := range unmet {
-		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", u)
-	}
-	for _, m := range trustMsgs {
-		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", m)
-	}
+	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt)
 	if status != 0 {
 		return exitCode(status)
 	}
-	if len(unmet) > 0 || trustFatal {
+	if fatal {
 		return exitCode(exitRequirementUnmet)
 	}
 	return nil
@@ -568,9 +561,12 @@ func removeScanContainers(value string) {
 	if err != nil {
 		return
 	}
-	for _, id := range strings.Fields(string(out)) {
-		_ = dockerQuiet("rm", "-f", id)
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return
 	}
+	// One `docker rm -f <id>...`, not a subprocess per container.
+	_ = dockerQuiet(append([]string{"rm", "-f"}, ids...)...)
 }
 
 func containerRunning(name string) bool {

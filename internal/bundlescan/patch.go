@@ -5,7 +5,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
+
+	"github.com/veris-ai/veris-proxy/internal/discovery"
+	"github.com/veris-ai/veris-proxy/internal/trust"
 )
 
 // Overlay is one patched copy, ready to bind-mount read-only over the
@@ -31,10 +33,11 @@ func WriteOverlays(dir string, caPEM []byte, cands []Candidate) (
 	if len(cands) == 0 {
 		return nil, nil, nil
 	}
-	der, err := pemDER(caPEM)
+	ders, err := trust.PEMToDER(caPEM)
 	if err != nil {
 		return nil, nil, fmt.Errorf("the Veris CA is not a usable PEM certificate: %w", err)
 	}
+	der := ders[0]
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, nil, err
 	}
@@ -44,14 +47,9 @@ func WriteOverlays(dir string, caPEM []byte, cands []Candidate) (
 			skipped = append(skipped, c)
 			continue
 		}
-		patched := make([]byte, 0, len(c.Content)+len(caPEM)+1)
-		patched = append(patched, c.Content...)
-		if len(patched) > 0 && patched[len(patched)-1] != '\n' {
-			patched = append(patched, '\n')
-		}
-		patched = append(patched, caPEM...)
+		patched := trust.AppendCA(c.Content, caPEM)
 
-		name := fmt.Sprintf("%d-%s-%s", i, slug(c.SDK), path.Base(c.ContainerPath))
+		name := fmt.Sprintf("%d-%s-%s", i, discovery.SafeFileName(c.SDK), path.Base(c.ContainerPath))
 		hostPath := filepath.Join(dir, name)
 		// World-readable on purpose: the reader is the workload container's
 		// own user, and a CA bundle holds no secret.
@@ -65,23 +63,4 @@ func WriteOverlays(dir string, caPEM []byte, cands []Candidate) (
 		})
 	}
 	return overlays, skipped, nil
-}
-
-// slug flattens an SDK label into filename-safe characters.
-func slug(s string) string {
-	var b strings.Builder
-	lastDash := true
-	for _, r := range strings.ToLower(s) {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-			lastDash = false
-		default:
-			if !lastDash {
-				b.WriteByte('-')
-				lastDash = true
-			}
-		}
-	}
-	return strings.TrimSuffix(b.String(), "-")
 }
