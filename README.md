@@ -398,8 +398,10 @@ as a mystery TLS failure. Four cases are genuinely out of reach: Go on macOS
 ignores `SSL_CERT_FILE` and verifies through Security.framework; Apache
 HttpClient built with `createDefault()` ignores the JVM proxy properties;
 `aiohttp` ignores proxy variables without `trust_env=True`; and the Stripe
-Python and Ruby SDKs ship their own CA bundle. All four are covered by the
-container tier.
+Python and Ruby SDKs ship their own CA bundle. The container tier covers the
+*routing* half of all four; for the Stripe case the *trust* half stays
+in-process, which is what `--patch-bundled-cas` and the trust-rejection
+diagnostics below exist for.
 
 
 ## Certificates
@@ -411,6 +413,36 @@ Two details that are easy to get wrong and are covered by tests: leaves are
 served as **leaf + CA**, since Node and anything on OpenSSL reject a bare leaf
 with `UNABLE_TO_VERIFY_LEAF_SIGNATURE`; and every leaf carries a SAN, since a
 certificate with only a CN is rejected by every modern client.
+
+### SDKs that bundle their own CA
+
+Kernel-level routing reaches every runtime, but *trust* is still decided
+inside the process, and an SDK that ships its own CA file and hands it
+straight to the TLS layer — stripe-python and stripe-ruby, older botocore,
+httplib2 — reads none of the trust environment and refuses the minted leaf.
+Three mechanisms close that gap, in the order to reach for them:
+
+1. **Documented overrides in the environment.** Tools with a private bundle
+   and an official override read it from `veris.env` already: gRPC
+   (`GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`), Bundler, Composer, Hex, Julia, Nix,
+   Perl LWP, gcloud. Nothing to do.
+2. **`run --image ... --patch-bundled-cas` (experimental).** Scans the image
+   and your `-v` mounts for known bundled CA files (certifi, pip's vendored
+   certifi, botocore, Stripe's Python and Ruby layouts, httplib2), appends
+   the Veris CA to a copy of each, and bind-mounts the copy read-only over
+   its exact path. The SDK keeps loading its own bundle through its own code
+   path; the file just carries one more root. A bundle it cannot read or
+   patch fails the run loudly, and one line per overlay says what happened.
+3. **The diagnostics tell you when you need either.** A client that refuses
+   the minted certificate is recorded per host — a certificate alert at high
+   confidence, an EOF after leaf selection as probable — and a mapped host
+   whose handshakes were all refused with zero completed requests fails the
+   run with exit 3 and a message naming the host and the likely cause.
+
+What none of this covers is real pinning — an SDK comparing SPKI or
+certificate hashes after chain validation (OkHttp `CertificatePinner`, curl
+`--pinnedpubkey`, aiohttp `fingerprint=`). No added root can satisfy that;
+it is a boundary, not a configuration problem.
 
 ## Development
 
