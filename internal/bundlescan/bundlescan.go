@@ -76,13 +76,18 @@ func matchRule(p string) (rule, bool) {
 // grow while refusing to slurp something that merely reuses the filename.
 const maxBundleSize = 2 << 20
 
+// errTooLarge is the one place the size limit's wording lives, so the constant
+// and its message stay together.
+func errTooLarge(n int64) error {
+	return fmt.Errorf("%d bytes is larger than any CA bundle (limit %d)", n, maxBundleSize)
+}
+
 // validate confirms content is a CA bundle rather than something that reuses
 // a bundle's filename: PEM holding at least one CERTIFICATE that is a CA, or
 // at least self-signed-root-shaped. A filename match alone is never enough.
 func validate(content []byte) error {
 	if len(content) > maxBundleSize {
-		return fmt.Errorf("%d bytes is larger than any CA bundle (limit %d)",
-			len(content), maxBundleSize)
+		return errTooLarge(int64(len(content)))
 	}
 	sawBlock := false
 	rest := content
@@ -116,9 +121,6 @@ type Candidate struct {
 	SDK           string
 	ContainerPath string // absolute path inside the workload container
 	Content       []byte
-	// Origin says where the bytes came from, for error messages: the image
-	// reference or a host path under a -v mount.
-	Origin string
 
 	// mountDest is the -v destination the candidate came in through, "" for
 	// an image match. When two mounts supply the same container path, the

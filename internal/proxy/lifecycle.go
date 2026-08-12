@@ -192,4 +192,4 @@ func (r *Running) Shutdown(ctx context.Context) error {
 // Receipt snapshots what this run sent to the sandbox. Reading it in-process
 // rather than over the status endpoint matters: there is no "could not reach
 // the proxy" state to confuse with "the run sent nothing".
-func (r *Running) Receipt() Receipt { return r.srv.receiptSnapshot() }
+func (r *Running) Receipt() Receipt { return r.srv.receiptSnapshotDrained() }

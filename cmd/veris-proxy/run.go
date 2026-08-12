@@ -522,18 +522,15 @@ func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
 }
 
 // dominantReason names the most frequent certificate alert, so the diagnostic
-// leads with what most of the failed handshakes actually said.
+// leads with what most of the failed handshakes actually said. It is only
+// called when at least one rejection was recorded, so the map is never empty;
+// a name tie breaks alphabetically, so the choice reads the same every run.
 func dominantReason(reasons map[string]int64) string {
-	names := make([]string, 0, len(reasons))
-	for name := range reasons {
-		names = append(names, name)
-	}
-	// By name first, so a tie between alerts reads the same on every run.
-	sort.Strings(names)
-	best, bestN := "certificate_rejected", int64(0)
-	for _, name := range names {
-		if reasons[name] > bestN {
-			best, bestN = name, reasons[name]
+	var best string
+	var bestN int64
+	for name, n := range reasons {
+		if n > bestN || (n == bestN && name < best) {
+			best, bestN = name, n
 		}
 	}
 	return best

@@ -210,7 +210,6 @@ func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, err
 			SDK:           m.rule.SDK,
 			ContainerPath: "/" + m.path,
 			Content:       content,
-			Origin:        "image " + image,
 		})
 	}
 	s.writeCache(id, matches)
@@ -243,7 +242,6 @@ func (s *Scanner) extractCached(ctx context.Context, image string, cached []cach
 			SDK:           m.SDK,
 			ContainerPath: m.Path,
 			Content:       content,
-			Origin:        "image " + image,
 		})
 	}
 	return cands, nil
@@ -316,8 +314,7 @@ func (s *Scanner) copyOut(ctx context.Context, ctr, containerPath string) ([]byt
 		}
 		if hdr.Size > maxBundleSize {
 			_ = rc.Close()
-			return nil, fmt.Errorf("%d bytes is larger than any CA bundle (limit %d)",
-				hdr.Size, maxBundleSize)
+			return nil, errTooLarge(hdr.Size)
 		}
 		if content, err = io.ReadAll(tr); err != nil {
 			_ = rc.Close()
@@ -450,9 +447,7 @@ func scanExportTar(r io.Reader) ([]tarMatch, error) {
 				continue
 			}
 			if matched && hdr.Size > maxBundleSize {
-				return nil, fmt.Errorf(
-					"%s bundle at /%s: %d bytes is larger than any CA bundle (limit %d)",
-					rl.SDK, name, hdr.Size, maxBundleSize)
+				return nil, fmt.Errorf("%s bundle at /%s: %w", rl.SDK, name, errTooLarge(hdr.Size))
 			}
 			if stashNames[path.Base(name)] && hdr.Size <= maxBundleSize &&
 				len(stash) < maxStashedFiles {

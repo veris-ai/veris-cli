@@ -540,8 +540,11 @@ func fetchReceipt(statusURL string) (proxy.Receipt, error) {
 	var out struct {
 		Receipt proxy.Receipt `json:"receipt"`
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(statusURL)
+	// This is the run's single verdict read, so ask the proxy to settle any
+	// in-flight handshakes first -- a workload that exited the instant it
+	// refused the certificate could otherwise beat the recorder.
+	client := &http.Client{Timeout: 12 * time.Second}
+	resp, err := client.Get(statusURL + "?drain=1")
 	if err != nil {
 		return out.Receipt, err
 	}

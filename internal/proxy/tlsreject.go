@@ -181,22 +181,27 @@ func (l *trustLog) snapshot() []TrustFailure {
 
 // receiptSnapshot is the receipt plus the trust-failure ledger, merged at
 // snapshot time so the receipt itself keeps counting only what the sandbox
-// actually received.
-//
-// It drains in-flight handshakes first. A connection is counted before its
-// handshake starts and the client's dial error can return a beat before the
-// server-side goroutine records the rejection — and the run's verdict reads
-// the receipt exactly once, so an in-flight recorder missed here would turn
-// a refused mapped host into a false pass. The bound covers a handshake that
-// is genuinely stuck; it never waits on an idle proxy.
+// actually received. A plain read with no timing knowledge: the status
+// endpoint serves it to the workload on every poll and must never block.
 func (s *Server) receiptSnapshot() Receipt {
+	out := s.receipt.snapshot()
+	out.TrustFailures = s.trustFailures.snapshot()
+	return out
+}
+
+// receiptSnapshotDrained is receiptSnapshot for the run's single verdict read.
+// A connection is counted before its handshake starts and the client's dial
+// error can return a beat before the server-side goroutine records the
+// rejection — so a snapshot taken the instant a workload exits could miss an
+// in-flight recorder and turn a refused mapped host into a false pass. It
+// waits for the counter to drain, bounded so a genuinely stuck handshake
+// cannot hang the verdict; an idle proxy never waits at all.
+func (s *Server) receiptSnapshotDrained() Receipt {
 	deadline := time.Now().Add(2 * time.Second)
 	for s.handshakesInFlight.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
 	}
-	out := s.receipt.snapshot()
-	out.TrustFailures = s.trustFailures.snapshot()
-	return out
+	return s.receiptSnapshot()
 }
 
 // recordHandshakeFailure classifies one failed handshake from a transparent

@@ -122,7 +122,6 @@ func scanFileMount(m Mount) ([]Candidate, error) {
 		SDK:           rl.SDK,
 		ContainerPath: m.Dest,
 		Content:       content,
-		Origin:        src,
 		mountDest:     m.Dest,
 	}}, nil
 }
@@ -201,7 +200,6 @@ func (w *volumeWalk) walk(dir, prefix string) error {
 			SDK:           rl.SDK,
 			ContainerPath: cpath,
 			Content:       content,
-			Origin:        p,
 			mountDest:     w.m.Dest,
 		})
 		return nil
@@ -251,8 +249,7 @@ func readBounded(p string) ([]byte, error) {
 		return nil, err
 	}
 	if info.Size() > maxBundleSize {
-		return nil, fmt.Errorf("%d bytes is larger than any CA bundle (limit %d)",
-			info.Size(), maxBundleSize)
+		return nil, errTooLarge(info.Size())
 	}
 	return os.ReadFile(p)
 }
