@@ -63,7 +63,13 @@ type Server struct {
 	// endpoint can report what the app received.
 	inbound atomic.Pointer[*Ingress]
 
-	receipt receipt
+	receipt       receipt
+	trustFailures trustLog
+	// handshakesInFlight counts accepted connections whose TLS handshake has
+	// not resolved. The receipt snapshot drains it: a client's dial error can
+	// return a beat before the server-side goroutine records the rejection,
+	// and the verdict reads the receipt exactly once.
+	handshakesInFlight atomic.Int64
 }
 
 // New builds a Server. It does not listen; call Handler and serve it, or use
@@ -286,7 +292,7 @@ func (s *Server) controlResponse(req *http.Request) *http.Response {
 	if req.URL.Path == CanaryPath {
 		s.canaryHits.Add(1)
 	}
-	body, _ := json.MarshalIndent(s.state(req.URL.Path), "", "  ")
+	body, _ := json.MarshalIndent(s.state(req.URL.Path, wantsDrain(req)), "", "  ")
 	return newJSONResponse(req, http.StatusOK, body)
 }
 
@@ -303,7 +309,14 @@ func (s *Server) serveDirect(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = writeJSONBody(w, s.state(req.URL.Path))
+	_ = writeJSONBody(w, s.state(req.URL.Path, wantsDrain(req)))
+}
+
+// wantsDrain marks the single verdict read of the status endpoint, which must
+// wait for in-flight handshakes to settle. Ordinary workload polls omit it and
+// never block.
+func wantsDrain(req *http.Request) bool {
+	return req.URL.Query().Get("drain") == "1"
 }
 
 func writeJSONBody(w io.Writer, body any) error {
@@ -316,7 +329,7 @@ func writeJSONBody(w io.Writer, body any) error {
 // part that matters: a test asserting on it proves it is talking to the proxy
 // started for *this* run, not a stale one left over from an earlier run with a
 // different sandbox.
-func (s *Server) state(path string) map[string]any {
+func (s *Server) state(path string, drain bool) map[string]any {
 	out := map[string]any{
 		"ok":             true,
 		"veris_proxy":    true,
@@ -345,7 +358,12 @@ func (s *Server) state(path string) map[string]any {
 		// The receipt too, so a caller outside this process can enforce a
 		// --require-service. `run` reads it in-process when it owns the proxy;
 		// when the proxy is in another container it has to come over the wire.
-		out["receipt"] = s.receipt.snapshot()
+		// The verdict read drains in-flight handshakes; a poll does not.
+		if drain {
+			out["receipt"] = s.receiptSnapshotDrained()
+		} else {
+			out["receipt"] = s.receiptSnapshot()
+		}
 		// And the inbound one, for exactly the same reason: with the proxy in
 		// another container, `run --image` can only enforce --require-callback
 		// over the wire.

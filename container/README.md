@@ -108,6 +108,14 @@ Python's `requests` uses certifi rather than `/etc/ssl/certs`, and the JVM reads
 a JKS. Measured working for Python stdlib, Python requests and Node fetch in
 one recipe.
 
+One tier remains beyond any environment variable: an SDK that ships its own
+CA file and passes it straight to the TLS layer (stripe-python and
+stripe-ruby, older botocore, httplib2). For those, `run --image` takes
+`--patch-bundled-cas` — see "SDKs that bundle their own CA" in the main
+README. The proxy also reports the failure it closes: a client refusing the
+minted certificate for a mapped host shows up in the run's diagnostics
+rather than as a silent TLS mystery.
+
 **Over-mounting the system bundle.** Read the image's own bundle, append the
 CA, mount the result back over it. No environment variables at all:
 

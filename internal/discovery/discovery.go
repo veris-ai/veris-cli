@@ -163,14 +163,14 @@ func Dir() string {
 }
 
 func snapshotPath(sandboxID string) string {
-	return filepath.Join(Dir(), "sandboxes", safeFileName(sandboxID)+".json")
+	return filepath.Join(Dir(), "sandboxes", SafeFileName(sandboxID)+".json")
 }
 
-// safeFileName keeps an id from escaping the cache directory. Ids come from a
+// SafeFileName keeps an id from escaping the cache directory. Ids come from a
 // flag, an environment variable and a control-plane response, and the cache is
 // written while `serve --transparent` is still root -- so "../../etc/x" would
 // otherwise name a file outside it.
-func safeFileName(id string) string {
+func SafeFileName(id string) string {
 	clean := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':

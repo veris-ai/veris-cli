@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -90,6 +91,10 @@ func cmdRun(args []string) error {
 			callbackReqs = append(callbackReqs, r)
 			return nil
 		})
+	patchBundledCAs := fs.Bool("patch-bundled-cas", false,
+		"experimental: find known SDK-bundled CA files (certifi, botocore, "+
+			"stripe, ...) in the image and your -v mounts, and over-mount each "+
+			"with a copy that also carries the Veris CA (with --image)")
 	proxyUID := fs.Int("proxy-uid", defaultProxyUID,
 		"uid the proxy drops to, and the one the redirect exempts; your image "+
 			"must not run as it")
@@ -139,16 +144,32 @@ func cmdRun(args []string) error {
 	// process -- which does not open one. Refusing beats accepting a callback
 	// assertion that would never be evaluated.
 	if *image == "" {
-		for name, set := range map[string]bool{
-			"--expose": *expose > 0, "--environment": *environment != "",
-			"--require-callback": len(callbackReqs) > 0, "--ttl-minutes": *ttlMinutes > 0,
-			"--expose-token": *exposeToken != "", "--expose-hostname": *exposeHostname != "",
-		} {
-			if set {
-				return fmt.Errorf(
-					"%s needs --image: the callback path is opened by the proxy "+
-						"container. Use `veris-proxy serve %s ...` for a local proxy",
-					name, name)
+		// Most rows share the callback-path reason; --patch-bundled-cas rides
+		// the same table with its own, because its reason is the image's
+		// filesystem, not the callback path. A slice, not a map, so the flag
+		// reported first is deterministic.
+		callbackWhy := func(flag string) string {
+			return "the callback path is opened by the proxy container. Use " +
+				"`veris-proxy serve " + flag + " ...` for a local proxy"
+		}
+		imageOnly := []struct {
+			flag string
+			set  bool
+			why  string
+		}{
+			{"--expose", *expose > 0, callbackWhy("--expose")},
+			{"--environment", *environment != "", callbackWhy("--environment")},
+			{"--require-callback", len(callbackReqs) > 0, callbackWhy("--require-callback")},
+			{"--ttl-minutes", *ttlMinutes > 0, callbackWhy("--ttl-minutes")},
+			{"--expose-token", *exposeToken != "", callbackWhy("--expose-token")},
+			{"--expose-hostname", *exposeHostname != "", callbackWhy("--expose-hostname")},
+			{"--patch-bundled-cas", *patchBundledCAs,
+				"the reason is the image's filesystem, not the callback path: it " +
+					"patches CA files inside a container image"},
+		}
+		for _, f := range imageOnly {
+			if f.set {
+				return fmt.Errorf("%s needs --image: %s", f.flag, f.why)
 			}
 		}
 	}
@@ -200,27 +221,28 @@ func cmdRun(args []string) error {
 			// Precedence has to hold here too: an explicit --config must not
 			// lose to a VERIS_SANDBOX_ID left in the environment, which would
 			// silently route the run at a different sandbox.
-			Sandbox:        sandboxOrEnvironment(sources, *environment),
-			APIBase:        firstNonEmpty(sources.APIBase, os.Getenv("VERIS_API_BASE")),
-			APIKey:         firstNonEmpty(sources.APIKey, os.Getenv("VERIS_API_KEY")),
-			Config:         sources.File,
-			Volumes:        volumes,
-			EnvVars:        envVars,
-			Workdir:        *workdir,
-			Argv:           argv,
-			Requirements:   reqs,
-			Quiet:          *quiet,
-			KeepProxy:      *keepProxy,
-			Expose:         *expose,
-			ExposeHost:     *exposeHost,
-			TunnelToken:    firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
-			TunnelHostname: *exposeHostname,
-			Environment:    *environment,
-			TTLMinutes:     *ttlMinutes,
-			CallbackReqs:   callbackReqs,
-			ProxyUID:       *proxyUID,
-			Strict:         *strict,
-			LogLevel:       *logLevel,
+			Sandbox:         sandboxOrEnvironment(sources, *environment),
+			APIBase:         firstNonEmpty(sources.APIBase, os.Getenv("VERIS_API_BASE")),
+			APIKey:          firstNonEmpty(sources.APIKey, os.Getenv("VERIS_API_KEY")),
+			Config:          sources.File,
+			Volumes:         volumes,
+			EnvVars:         envVars,
+			Workdir:         *workdir,
+			Argv:            argv,
+			Requirements:    reqs,
+			Quiet:           *quiet,
+			KeepProxy:       *keepProxy,
+			Expose:          *expose,
+			ExposeHost:      *exposeHost,
+			TunnelToken:     firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
+			TunnelHostname:  *exposeHostname,
+			Environment:     *environment,
+			TTLMinutes:      *ttlMinutes,
+			CallbackReqs:    callbackReqs,
+			PatchBundledCAs: *patchBundledCAs,
+			ProxyUID:        *proxyUID,
+			Strict:          *strict,
+			LogLevel:        *logLevel,
 		})
 	}
 
@@ -288,10 +310,13 @@ func cmdRun(args []string) error {
 	// code. Only one status can be returned, so a shutdown failure that loses
 	// the tie-break would otherwise vanish -- and it is the one that says the
 	// receipt above may be incomplete.
+	// Trust failures are recorded only by transparent listeners, which this
+	// local tier never opens (goproxy's CONNECT loop discards its own MITM
+	// handshake error) -- so today this can fire only via the containerised
+	// path, and is wired here so both tiers share one verdict when that gap
+	// closes.
 	unmet := unmetRequirements(reqs, receipt)
-	for _, u := range unmet {
-		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", u)
-	}
+	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt)
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris-proxy: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -303,7 +328,7 @@ func cmdRun(args []string) error {
 	if status != 0 {
 		return exitCode(status)
 	}
-	if len(unmet) > 0 {
+	if fatal {
 		return exitCode(exitRequirementUnmet)
 	}
 	if shutErr != nil {
@@ -455,6 +480,77 @@ func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Rec
 			"never called its dependencies, or interception missed them. " +
 			"--require-service <name> sharpens this to a per-service assertion",
 	}
+}
+
+// trustFailureDiagnostics turns the receipt's per-host TLS trust failures
+// into printed diagnostics. fatal marks the case that must fail the run: a
+// mapped host whose minted certificate a client refused outright, and which
+// completed no request, never exercised its integration -- whatever the
+// command's own exit code said. An aborted-only host is reported in
+// probabilistic wording and changes nothing: an EOF is consistent with a
+// refusal but never proof of one.
+func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
+	// Receipt hosts arrive as the client wrote them; trust failures are keyed
+	// by lowercased SNI. Fold case here, or a completed request with a
+	// mixed-case Host header would fail to suppress the fatal verdict.
+	completed := make(map[string]int64, len(r.ByHost))
+	for host, n := range r.ByHost {
+		completed[strings.ToLower(host)] += n
+	}
+	for _, f := range r.TrustFailures {
+		// A host that also completed requests was exercised: some client in
+		// the run refused the CA, but the command's own verdict stands.
+		if !f.Mapped || completed[f.Host] > 0 {
+			continue
+		}
+		switch {
+		case f.Rejected > 0:
+			fatal = true
+			msgs = append(msgs, fmt.Sprintf(
+				"%s: %d TLS handshake(s) rejected (%s) after the certificate was "+
+					"minted; 0 requests completed -- the client refused the "+
+					"interception CA, likely an SDK-bundled CA bundle or certificate "+
+					"pinning; see the Certificates section of the README",
+				f.Host, f.Rejected, dominantReason(f.Reasons)))
+		case f.Aborted > 0:
+			msgs = append(msgs, fmt.Sprintf(
+				"%s: %d TLS handshake(s) ended after the certificate was minted; "+
+					"0 requests completed -- CA rejection or certificate pinning is "+
+					"likely, but the connection closed without a TLS alert, so this "+
+					"is not certain; see the Certificates section of the README",
+				f.Host, f.Aborted))
+		}
+	}
+	return msgs, fatal
+}
+
+// dominantReason names the most frequent certificate alert, so the diagnostic
+// leads with what most of the failed handshakes actually said. It is only
+// called when at least one rejection was recorded, so the map is never empty;
+// a name tie breaks alphabetically, so the choice reads the same every run.
+func dominantReason(reasons map[string]int64) string {
+	var best string
+	var bestN int64
+	for name, n := range reasons {
+		if n > bestN || (n == bestN && name < best) {
+			best, bestN = name, n
+		}
+	}
+	return best
+}
+
+// reportUnmetAndTrust prints the run's two failure groups -- the unmet
+// requirements, then the TLS trust diagnostics -- and returns whether either
+// is fatal to the verdict. One place so both tiers report in the same order.
+func reportUnmetAndTrust(w io.Writer, unmet []string, receipt proxy.Receipt) (fatal bool) {
+	for _, u := range unmet {
+		fmt.Fprintf(w, "veris-proxy: %s\n", u)
+	}
+	trustMsgs, trustFatal := trustFailureDiagnostics(receipt)
+	for _, m := range trustMsgs {
+		fmt.Fprintf(w, "veris-proxy: %s\n", m)
+	}
+	return len(unmet) > 0 || trustFatal
 }
 
 func unmetRequirements(reqs []requirement, r proxy.Receipt) []string {

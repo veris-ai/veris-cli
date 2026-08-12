@@ -102,7 +102,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme, host st
 		if r.URL.Path == CanaryPath {
 			s.canaryHits.Add(1)
 		}
-		s.writeJSON(w, http.StatusOK, s.state(r.URL.Path))
+		s.writeJSON(w, http.StatusOK, s.state(r.URL.Path, wantsDrain(r)))
 		return
 	}
 

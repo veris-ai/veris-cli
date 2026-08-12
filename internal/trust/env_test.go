@@ -68,6 +68,45 @@ func containsPattern(joined, pattern string) bool {
 	return false
 }
 
+// Every variable that REPLACES a runtime's roots must carry the bundle, not
+// the bare Veris certificate — the bare cert would break passthrough HTTPS.
+// The additive NODE_EXTRA_CA_CERTS is the one exception.
+func TestReplacingVarsGetTheBundleInEveryTier(t *testing.T) {
+	opts := Options{
+		ProxyURL:     "http://127.0.0.1:8080",
+		CACertPath:   "/share/veris-ca.pem",
+		CABundlePath: "/share/veris-ca-bundle.pem",
+	}
+	for _, name := range []string{
+		"REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+		"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "BUNDLE_SSL_CA_CERT",
+		"COMPOSER_CAFILE", "HEX_CACERTS_PATH", "JULIA_SSL_CA_ROOTS_PATH",
+		"NIX_SSL_CERT_FILE", "PERL_LWP_SSL_CA_FILE",
+		"CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+	} {
+		for _, trustOnly := range []bool{false, true} {
+			opts.TrustOnly = trustOnly
+			value := ""
+			for _, v := range Build(opts) {
+				if v.Name == name {
+					value = v.Value
+				}
+			}
+			if value != "/share/veris-ca-bundle.pem" {
+				t.Errorf("trustOnly=%v: %s = %q, want the bundle", trustOnly, name, value)
+			}
+		}
+	}
+	for _, trustOnly := range []bool{false, true} {
+		opts.TrustOnly = trustOnly
+		for _, v := range Build(opts) {
+			if v.Name == "NODE_EXTRA_CA_CERTS" && v.Value != "/share/veris-ca.pem" {
+				t.Errorf("trustOnly=%v: NODE_EXTRA_CA_CERTS = %q, want the bare cert (it ADDS)", trustOnly, v.Value)
+			}
+		}
+	}
+}
+
 func TestPassThroughIsEmittedInEveryTier(t *testing.T) {
 	opts := Options{
 		ProxyURL: "http://127.0.0.1:1", CACertPath: "/ca.pem",

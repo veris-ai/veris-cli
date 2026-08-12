@@ -108,7 +108,7 @@ func TestThePasswordIsHashedAsJavaHashesIt(t *testing.T) {
 // Two entries under one alias collapse into one in the JVM, which would drop a
 // hundred and nineteen public roots and keep the last.
 func TestEveryCertificateGetsItsOwnAlias(t *testing.T) {
-	block, err := pemToDER([]byte(testCert + testCert))
+	block, err := PEMToDER([]byte(testCert + testCert))
 	if err != nil {
 		t.Fatal(err)
 	}

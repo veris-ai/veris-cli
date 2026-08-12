@@ -464,6 +464,21 @@ func matchScore(pattern, host string) (int, bool) {
 	return 0, false
 }
 
+// HostIsMapped reports whether any service claims host, on any path. A TLS
+// handshake carries no path, so this is the question a failed one poses: was
+// this a name the run was supposed to exercise.
+func (c *Config) HostIsMapped(host string) bool {
+	name := strings.ToLower(hostport.StripPort(host))
+	for i := range c.Services {
+		for _, pattern := range c.Services[i].Hosts {
+			if _, ok := matchScore(strings.ToLower(strings.TrimSpace(pattern)), name); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // IsPassthrough reports whether host should bypass interception entirely.
 // Loopback is always allowed so that a test hitting its own service under test
 // is never routed to Veris.
