@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -49,6 +50,13 @@ type Service struct {
 	URL     string `json:"url"`
 	Status  string `json:"status"`
 	EnvHint string `json:"env_hint"`
+	// Routes are the real hostnames this service answers for, when the control
+	// plane serves them. Same provenance as the embedded table -- generated
+	// from the measured parity backends, never authored -- but they arrive
+	// with the sandbox, so a service added to the platform is routable the day
+	// it lands instead of waiting for the next proxy release. Older control
+	// planes omit the field; the embedded table then decides.
+	Routes []routes.Entry `json:"routes,omitempty"`
 }
 
 // Sandbox is the control plane's description of one sandbox.
@@ -280,15 +288,30 @@ type Unroutable struct {
 // ToConfig builds a proxy configuration from a cached sandbox.
 //
 // Each service's upstream is the URL the control plane returned, used verbatim.
-// Which real hostnames map onto it comes from the embedded, generated route
-// table -- the measured record, not a guess.
-func ToConfig(snapshot *Snapshot) (*config.Config, []Unroutable, error) {
+// Which real hostnames map onto it resolves most-explicit first:
+//
+//	--route overrides  >  routes the control plane served  >  the embedded table
+//
+// All three carry the same kind of fact; they differ in freshness and intent.
+// An override is the operator saying "I know better for this run"; the control
+// plane's routes are the platform's current measured record; the embedded
+// table is that same record frozen at this binary's release, kept as the
+// fallback for control planes that do not serve routes yet.
+func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.Config, []Unroutable, error) {
 	cfg := &config.Config{
 		Version:   1,
 		Listen:    "127.0.0.1:0",
 		SandboxID: snapshot.SandboxID,
 		EnvID:     snapshot.EnvironmentID,
 		Mode:      config.ModePassthrough,
+	}
+
+	// Every override must land on a service the sandbox runs. A typo'd
+	// --route silently ignored would leave its author believing a dependency
+	// was covered -- the exact lie this proxy exists to prevent.
+	unclaimed := make(map[string]bool, len(overrides))
+	for name := range overrides {
+		unclaimed[name] = true
 	}
 
 	var skipped []Unroutable
@@ -311,10 +334,15 @@ func ToConfig(snapshot *Snapshot) (*config.Config, []Unroutable, error) {
 				"not an http service (" + schemeOf(svc.URL) + ")"})
 			continue
 		}
-		entries, ok := routes.For(svc.Name)
-		if !ok {
+		entries, source := routesFor(svc, overrides)
+		if source == "--route" {
+			delete(unclaimed, svc.Name)
+		}
+		if len(entries) == 0 {
 			skipped = append(skipped, Unroutable{svc.Name,
-				"no vendor hostname measured for it"})
+				"no route: the control plane served none and this binary's " +
+					"table has no measured hostname for it (--route " +
+					svc.Name + "=<host> supplies one for this run)"})
 			continue
 		}
 		for _, entry := range entries {
@@ -325,6 +353,17 @@ func ToConfig(snapshot *Snapshot) (*config.Config, []Unroutable, error) {
 				Upstream: strings.TrimSuffix(svc.URL, "/"),
 			})
 		}
+	}
+
+	if len(unclaimed) > 0 {
+		names := make([]string, 0, len(unclaimed))
+		for name := range unclaimed {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return nil, skipped, fmt.Errorf(
+			"--route names %s, which sandbox %s does not run (it runs: %s)",
+			strings.Join(names, ", "), snapshot.SandboxID, serviceNames(snapshot))
 	}
 
 	// A sandbox holding only pass-env services (a lone database) is a real
@@ -339,6 +378,45 @@ func ToConfig(snapshot *Snapshot) (*config.Config, []Unroutable, error) {
 		return nil, skipped, fmt.Errorf("the derived config is not valid: %w", err)
 	}
 	return cfg, skipped, nil
+}
+
+// routesFor picks one source of routes for a service and names it. The
+// sources never merge: a config assembled from two records could not be
+// reasoned about from either, which is the same argument resolveConfig makes
+// about its layers.
+func routesFor(svc Service, overrides map[string][]routes.Entry) ([]routes.Entry, string) {
+	if entries := overrides[svc.Name]; len(entries) > 0 {
+		return entries, "--route"
+	}
+	// Entries without a host are dropped rather than fatal: one malformed row
+	// from a newer control plane must not take down every run against it. A
+	// service whose rows ALL drop falls through to the embedded table.
+	if served := compactRoutes(svc.Routes); len(served) > 0 {
+		return served, "control plane"
+	}
+	if entries, ok := routes.For(svc.Name); ok {
+		return entries, "embedded table"
+	}
+	return nil, ""
+}
+
+func compactRoutes(entries []routes.Entry) []routes.Entry {
+	kept := make([]routes.Entry, 0, len(entries))
+	for _, e := range entries {
+		if strings.TrimSpace(e.Host) != "" {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+func serviceNames(snapshot *Snapshot) string {
+	names := make([]string, 0, len(snapshot.Services))
+	for _, svc := range snapshot.Services {
+		names = append(names, svc.Name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func schemeOf(raw string) string {

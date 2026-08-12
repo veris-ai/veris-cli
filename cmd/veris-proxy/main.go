@@ -43,6 +43,11 @@ What to route (run and serve both accept these, most explicit first):
   --config <file>   or an explicit config file, used exactly as written
   read from $VERIS_SANDBOX_ID and $VERIS_PROXY_CONFIG when neither is given
 
+  Which hostname belongs to each service comes from the control plane when
+  it serves routes, else from the table embedded at this binary's release.
+  --route <service>=<host>[/prefix]   replace one service's derived routes
+                                      for this run (repeatable)
+
 Commands:
   serve   Run the proxy. This is what the container image runs, and what a
           long-lived local session runs. Add --transparent for the kernel

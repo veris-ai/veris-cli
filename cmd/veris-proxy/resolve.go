@@ -5,10 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/veris-ai/veris-proxy/internal/config"
 	"github.com/veris-ai/veris-proxy/internal/discovery"
+	"github.com/veris-ai/veris-proxy/internal/routes"
 )
 
 // configSources are the ways a command can be told what to route.
@@ -23,6 +25,12 @@ type configSources struct {
 
 	APIBase string
 	APIKey  string
+
+	// Overrides is --route, accumulated per service. For a service it names,
+	// the entries REPLACE whatever the control plane or the embedded table
+	// would have derived: an override that merged could never say "only this
+	// host", which is the whole point of overriding.
+	Overrides map[string][]routes.Entry
 }
 
 // bindConfigFlags gives a command the standard ways of naming its target.
@@ -39,6 +47,42 @@ func bindConfigFlags(fs *flag.FlagSet, src *configSources) {
 		"control plane base URL (defaults to $"+discovery.EnvAPIBase+")")
 	fs.StringVar(&src.APIKey, "api-key", "",
 		"control plane API key (defaults to $"+discovery.EnvAPIKey+"; never written to disk)")
+	fs.Func("route",
+		"route a service at a hostname for this run: service=host[/prefix], "+
+			"repeatable; replaces that service's derived routes",
+		func(value string) error {
+			service, entry, err := parseRouteFlag(value)
+			if err != nil {
+				return err
+			}
+			if src.Overrides == nil {
+				src.Overrides = make(map[string][]routes.Entry)
+			}
+			src.Overrides[service] = append(src.Overrides[service], entry)
+			return nil
+		})
+}
+
+// parseRouteFlag reads one --route value: service=host[/prefix]. The prefix is
+// optional and is everything from the first slash on; the host may carry a
+// single leading "*." wildcard, exactly like a config file entry.
+func parseRouteFlag(value string) (service string, entry routes.Entry, err error) {
+	service, target, found := strings.Cut(value, "=")
+	service = strings.TrimSpace(service)
+	target = strings.TrimSpace(target)
+	if !found || service == "" || target == "" {
+		return "", routes.Entry{}, fmt.Errorf(
+			"--route %q is not service=host[/prefix] (e.g. --route stripe=api.stripe.com)", value)
+	}
+	host, path, hasPath := strings.Cut(target, "/")
+	if host == "" {
+		return "", routes.Entry{}, fmt.Errorf("--route %q names no host before the path", value)
+	}
+	entry = routes.Entry{Host: host}
+	if hasPath && path != "" {
+		entry.Paths = []string{"/" + path}
+	}
+	return service, entry, nil
 }
 
 // resolveConfig is where every command gets its configuration.
@@ -57,6 +101,9 @@ func bindConfigFlags(fs *flag.FlagSet, src *configSources) {
 func resolveConfig(src configSources) (*config.Config, string, error) {
 	if src.File != "" {
 		cfg, err := config.Load(src.File)
+		if err == nil && len(src.Overrides) > 0 {
+			err = applyOverridesToFileConfig(cfg, src.Overrides)
+		}
 		return cfg, src.File, err
 	}
 	if src.Sandbox != "" {
@@ -91,12 +138,47 @@ func configFromSandbox(src configSources, sandboxID, via string) (*config.Config
 			"warning: sandbox %s was %q when last read. Requests may fail until it is ready.\n",
 			sandboxID, snapshot.Status)
 	}
-	cfg, skipped, err := discovery.ToConfig(snapshot)
+	cfg, skipped, err := discovery.ToConfig(snapshot, src.Overrides)
 	if err != nil {
 		return nil, "", err
 	}
 	reportSkipped(skipped)
 	return cfg, fmt.Sprintf("sandbox %s (via %s)", sandboxID, via), nil
+}
+
+// applyOverridesToFileConfig rewrites a file config's routes for the services
+// --route names. The file's own entries for that service are the only place
+// its upstream lives, so a service the file does not mention cannot be
+// overridden -- and saying so beats silently intercepting nothing.
+func applyOverridesToFileConfig(cfg *config.Config, overrides map[string][]routes.Entry) error {
+	upstreams := make(map[string]string)
+	for _, svc := range cfg.Services {
+		if _, seen := upstreams[svc.Name]; !seen {
+			upstreams[svc.Name] = svc.Upstream
+		}
+	}
+	kept := cfg.Services[:0]
+	for _, svc := range cfg.Services {
+		if _, replaced := overrides[svc.Name]; !replaced {
+			kept = append(kept, svc)
+		}
+	}
+	cfg.Services = kept
+	for name, entries := range overrides {
+		upstream, ok := upstreams[name]
+		if !ok {
+			return fmt.Errorf(
+				"--route names %s, which this config file does not define, so "+
+					"there is no upstream to route it at", name)
+		}
+		for _, entry := range entries {
+			cfg.Services = append(cfg.Services, config.Service{
+				Name: name, Hosts: []string{entry.Host}, Paths: entry.Paths,
+				Upstream: upstream,
+			})
+		}
+	}
+	return cfg.Validate()
 }
 
 // reportSkipped names every service the sandbox runs that will NOT be

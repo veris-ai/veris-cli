@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/veris-ai/veris-proxy/internal/config"
 	"github.com/veris-ai/veris-proxy/internal/discovery"
+	"github.com/veris-ai/veris-proxy/internal/routes"
 )
 
 // Naming a sandbox on one command must not change what any other command uses.
@@ -181,5 +183,93 @@ func TestAnUnknownSandboxExplainsItself(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sbx_never_seen") {
 		t.Errorf("error does not name the sandbox: %v", err)
+	}
+}
+
+// --- --route overrides ---
+
+func TestParseRouteFlagReadsServiceHostAndPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		service string
+		host    string
+		paths   []string
+	}{
+		{"stripe=api.stripe.com", "stripe", "api.stripe.com", nil},
+		{"google-calendar=www.googleapis.com/calendar/", "google-calendar",
+			"www.googleapis.com", []string{"/calendar/"}},
+		{"acme=*.acme.example", "acme", "*.acme.example", nil},
+	} {
+		service, entry, err := parseRouteFlag(tc.in)
+		if err != nil {
+			t.Fatalf("parseRouteFlag(%q): %v", tc.in, err)
+		}
+		if service != tc.service || entry.Host != tc.host {
+			t.Errorf("parseRouteFlag(%q) = %q %q", tc.in, service, entry.Host)
+		}
+		if len(entry.Paths) != len(tc.paths) {
+			t.Errorf("parseRouteFlag(%q) paths = %v, want %v", tc.in, entry.Paths, tc.paths)
+		}
+		for i := range tc.paths {
+			if entry.Paths[i] != tc.paths[i] {
+				t.Errorf("parseRouteFlag(%q) paths = %v, want %v", tc.in, entry.Paths, tc.paths)
+			}
+		}
+	}
+}
+
+func TestParseRouteFlagRefusesShapesThatRouteNothing(t *testing.T) {
+	for _, in := range []string{"", "stripe", "stripe=", "=api.stripe.com", "stripe=/v1"} {
+		if _, _, err := parseRouteFlag(in); err == nil {
+			t.Errorf("parseRouteFlag(%q) accepted", in)
+		}
+	}
+}
+
+// An override on a file config keeps the file's upstream for that service --
+// the file is the only place the upstream lives.
+func TestFileConfigOverrideKeepsTheUpstream(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1, Listen: "127.0.0.1:0", SandboxID: "sbx_f", Mode: config.ModePassthrough,
+		Services: []config.Service{
+			{Name: "stripe", Hosts: []string{"api.stripe.com"}, Upstream: "http://sbx/stripe"},
+			{Name: "other", Hosts: []string{"api.other.example"}, Upstream: "http://sbx/other"},
+		},
+	}
+	err := applyOverridesToFileConfig(cfg,
+		map[string][]routes.Entry{"stripe": {{Host: "api.stripe.dev"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stripeHost, stripeUpstream string
+	var otherKept bool
+	for _, svc := range cfg.Services {
+		switch svc.Name {
+		case "stripe":
+			stripeHost, stripeUpstream = svc.Hosts[0], svc.Upstream
+		case "other":
+			otherKept = true
+		}
+	}
+	if stripeHost != "api.stripe.dev" || stripeUpstream != "http://sbx/stripe" {
+		t.Errorf("stripe = %s -> %s, want the new host on the file's upstream",
+			stripeHost, stripeUpstream)
+	}
+	if !otherKept {
+		t.Error("the untouched service was dropped")
+	}
+}
+
+func TestFileConfigOverrideForAnUnknownServiceIsAnError(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1, Listen: "127.0.0.1:0", Mode: config.ModePassthrough,
+		Services: []config.Service{
+			{Name: "stripe", Hosts: []string{"api.stripe.com"}, Upstream: "http://sbx/stripe"},
+		},
+	}
+	err := applyOverridesToFileConfig(cfg,
+		map[string][]routes.Entry{"ghost": {{Host: "api.ghost.example"}}})
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("err = %v, want a refusal naming the service", err)
 	}
 }
