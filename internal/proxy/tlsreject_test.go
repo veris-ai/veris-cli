@@ -364,3 +364,20 @@ func TestTheSnapshotWaitsForInFlightHandshakes(t *testing.T) {
 		}
 	}
 }
+
+// OpenSSL under TLS 1.3 sends its rejection in a record this side fails to
+// MAC-verify, so it surfaces as a local error rather than a readable alert.
+// Counting it "other" silenced the diagnostic for exactly the SDK stacks the
+// feature exists for (stripe-python et al. ride OpenSSL).
+func TestAnUnverifiableRecordAfterLeafSelectionIsARejection(t *testing.T) {
+	class, reason := classifyHandshake(&net.OpError{
+		Op: "local error", Err: errors.New("tls: bad record MAC")})
+	if class != handshakeTrustRejected || reason != "bad_record_mac" {
+		t.Errorf("got (%v, %q), want (rejected, bad_record_mac)", class, reason)
+	}
+	// Other local errors stay out: only the MAC-failure shape is attributed.
+	if class, _ := classifyHandshake(&net.OpError{
+		Op: "local error", Err: errors.New("tls: unexpected message")}); class != handshakeOther {
+		t.Errorf("an unrelated local error classified as %v, want other", class)
+	}
+}

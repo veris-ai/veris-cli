@@ -79,6 +79,18 @@ func classifyHandshake(err error) (handshakeClass, string) {
 		// protocol_version -- is a different disagreement.
 		return handshakeOther, ""
 	}
+	// OpenSSL rejecting the certificate under TLS 1.3 does not arrive as a
+	// readable alert: the record fails MAC verification here and surfaces as
+	// this local error instead. The same client pinned to TLS 1.2 sends a
+	// clear unknown_ca, which is how the shape was attributed. Callers only
+	// classify failures after leaf selection, where a genuinely corrupted
+	// record is vanishingly rare next to a client refusing the minted leaf --
+	// and stripe-python's stack is exactly this client, so counting it
+	// "other" would silence the diagnostic for the SDKs it exists for.
+	if errors.As(err, &op) && op.Op == "local error" && op.Err != nil &&
+		strings.Contains(op.Err.Error(), "bad record MAC") {
+		return handshakeTrustRejected, "bad_record_mac"
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
 		return handshakeAborted, ""
