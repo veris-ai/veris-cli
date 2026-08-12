@@ -198,18 +198,23 @@ func TestScanVolumeTerminatesADirectorySymlinkLoop(t *testing.T) {
 }
 
 func TestScanVolumeIgnoresAnEscapingDirectorySymlink(t *testing.T) {
-	// The link's target sits OUTSIDE the mount, so the bind exposes nothing
-	// behind it in the container; following it would patch a phantom path.
+	// A relative link whose target sits OUTSIDE the mount: the bind exposes
+	// nothing behind it in the container, so following it would patch a
+	// phantom path.
 	ca := testCA(t, "Outside Root")
-	outside := t.TempDir()
+	parent := t.TempDir()
+	outside := filepath.Join(parent, "outside")
 	if err := os.MkdirAll(filepath.Join(outside, "certifi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(outside, "certifi", "cacert.pem"), ca, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	src := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(src, "pkgs")); err != nil {
+	src := filepath.Join(parent, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../outside", filepath.Join(src, "pkgs")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -219,6 +224,65 @@ func TestScanVolumeIgnoresAnEscapingDirectorySymlink(t *testing.T) {
 	}
 	if len(cands) != 0 {
 		t.Fatalf("a dir symlink escaping the mount must not be followed, got %+v", cands)
+	}
+}
+
+func TestScanVolumeWalksEachAliasOfASharedTarget(t *testing.T) {
+	// Two sibling symlinks to ONE real directory are two distinct
+	// container-visible paths; a cycle guard that remembers the target
+	// globally would scan the first alias and silently skip the second.
+	ca := testCA(t, "Shared Root")
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "real", "cacert.pem"), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Both alias names anchor a table rule, and botocore sorts before
+	// certifi, so the second alias is exactly the one a global guard loses.
+	for _, alias := range []string{"botocore", "certifi"} {
+		if err := os.Symlink("real", filepath.Join(src, alias)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, c := range cands {
+		got[c.ContainerPath] = true
+	}
+	if len(cands) != 2 || !got["/app/botocore/cacert.pem"] || !got["/app/certifi/cacert.pem"] {
+		t.Fatalf("every alias of a shared target must yield its own candidate, got %+v", cands)
+	}
+}
+
+func TestScanVolumeDoesNotFollowAnAbsoluteDirectorySymlink(t *testing.T) {
+	// The host target sits inside the mount, but the CONTAINER resolves an
+	// absolute link against its own root -- what it finds there is not what
+	// the host-side walk would have read.
+	ca := testCA(t, "Absolute Root")
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "real-certifi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "real-certifi", "cacert.pem"), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(src, "real-certifi"), filepath.Join(src, "certifi")); err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("an absolute dir symlink must not be followed even when its host "+
+			"target is in-root, got %+v", cands)
 	}
 }
 

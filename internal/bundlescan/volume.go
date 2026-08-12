@@ -90,7 +90,7 @@ func ScanVolume(m Mount) ([]Candidate, error) {
 	if root == "" {
 		root = m.Source
 	}
-	w := &volumeWalk{m: m, root: root, visited: map[string]bool{root: true}}
+	w := &volumeWalk{m: m, root: root, chain: map[string]bool{root: true}}
 	if err := w.walk(root, ""); err != nil {
 		return nil, err
 	}
@@ -127,14 +127,18 @@ func scanFileMount(m Mount) ([]Candidate, error) {
 	}}, nil
 }
 
-// volumeWalk carries one mount's walk state: the file budget and the visited
-// set span every directory the walk enters, symlinked or not.
+// volumeWalk carries one mount's walk state. The file budget spans every
+// directory the walk enters, symlinked or not, and is the global bound on the
+// walk's work; chain holds only the ACTIVE recursion's resolved directories,
+// because two sibling links to one target are two distinct container-visible
+// paths and each must be walked -- only a link back into its own ancestry is
+// a cycle.
 type volumeWalk struct {
-	m       Mount
-	root    string
-	files   int
-	visited map[string]bool // resolved directories already walked
-	out     []Candidate
+	m     Mount
+	root  string
+	files int
+	chain map[string]bool // resolved directories the current recursion is inside
+	out   []Candidate
 }
 
 // walk scans one real directory. prefix is the mount-relative path this
@@ -204,13 +208,15 @@ func (w *volumeWalk) walk(dir, prefix string) error {
 	})
 }
 
-// follow descends into a directory symlink whose target stays INSIDE the
-// mount: the container resolves the link the same way, so a bundle behind it
-// is really reachable at the link's own path -- which WalkDir alone would
-// never visit. The visited set is keyed by resolved directory, so a link
-// cycle terminates; a link escaping the root is left alone, because the bind
-// exposes nothing outside its source and the host-side target says nothing
-// about what the container would find there.
+// follow descends into a MOUNT-RELATIVE directory symlink whose target stays
+// INSIDE the mount: the container resolves such a link the same way, so a
+// bundle behind it is really reachable at the link's own path -- which
+// WalkDir alone would never visit. An absolute link is never followed, even
+// when its host target sits inside the root: the container resolves it
+// against the CONTAINER's root, not the bind source, so the host-side target
+// says nothing about what the container finds there. A relative link
+// escaping the root is left alone for the same reason, and one back into its
+// own recursion chain is a cycle.
 func (w *volumeWalk) follow(p, rel string) (bool, error) {
 	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
@@ -221,14 +227,20 @@ func (w *volumeWalk) follow(p, rel string) (bool, error) {
 	if err != nil || !info.IsDir() {
 		return false, nil
 	}
+	target, err := os.Readlink(p)
+	if err != nil || filepath.IsAbs(target) {
+		return true, nil
+	}
 	if resolved != w.root && !strings.HasPrefix(resolved, w.root+string(filepath.Separator)) {
 		return true, nil
 	}
-	if w.visited[resolved] {
+	if w.chain[resolved] {
 		return true, nil
 	}
-	w.visited[resolved] = true
-	return true, w.walk(resolved, rel)
+	w.chain[resolved] = true
+	werr := w.walk(resolved, rel)
+	delete(w.chain, resolved)
+	return true, werr
 }
 
 // readBounded reads a candidate file, refusing the oversized before reading:
