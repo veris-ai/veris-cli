@@ -90,6 +90,10 @@ func cmdRun(args []string) error {
 			callbackReqs = append(callbackReqs, r)
 			return nil
 		})
+	patchBundledCAs := fs.Bool("patch-bundled-cas", false,
+		"experimental: find known SDK-bundled CA files (certifi, botocore, "+
+			"stripe, ...) in the image and your -v mounts, and over-mount each "+
+			"with a copy that also carries the Veris CA (with --image)")
 	proxyUID := fs.Int("proxy-uid", defaultProxyUID,
 		"uid the proxy drops to, and the one the redirect exempts; your image "+
 			"must not run as it")
@@ -153,6 +157,14 @@ func cmdRun(args []string) error {
 		}
 	}
 
+	// Separate from the map above: the reason is the image's filesystem, not
+	// the callback path.
+	if *patchBundledCAs && *image == "" {
+		return errors.New(
+			"--patch-bundled-cas patches CA files inside a container image, so it " +
+				"needs --image")
+	}
+
 	if len(callbackReqs) > 0 && *expose <= 0 {
 		return errors.New(
 			"--require-callback asserts what your app received, and nothing can " +
@@ -200,27 +212,28 @@ func cmdRun(args []string) error {
 			// Precedence has to hold here too: an explicit --config must not
 			// lose to a VERIS_SANDBOX_ID left in the environment, which would
 			// silently route the run at a different sandbox.
-			Sandbox:        sandboxOrEnvironment(sources, *environment),
-			APIBase:        firstNonEmpty(sources.APIBase, os.Getenv("VERIS_API_BASE")),
-			APIKey:         firstNonEmpty(sources.APIKey, os.Getenv("VERIS_API_KEY")),
-			Config:         sources.File,
-			Volumes:        volumes,
-			EnvVars:        envVars,
-			Workdir:        *workdir,
-			Argv:           argv,
-			Requirements:   reqs,
-			Quiet:          *quiet,
-			KeepProxy:      *keepProxy,
-			Expose:         *expose,
-			ExposeHost:     *exposeHost,
-			TunnelToken:    firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
-			TunnelHostname: *exposeHostname,
-			Environment:    *environment,
-			TTLMinutes:     *ttlMinutes,
-			CallbackReqs:   callbackReqs,
-			ProxyUID:       *proxyUID,
-			Strict:         *strict,
-			LogLevel:       *logLevel,
+			Sandbox:         sandboxOrEnvironment(sources, *environment),
+			APIBase:         firstNonEmpty(sources.APIBase, os.Getenv("VERIS_API_BASE")),
+			APIKey:          firstNonEmpty(sources.APIKey, os.Getenv("VERIS_API_KEY")),
+			Config:          sources.File,
+			Volumes:         volumes,
+			EnvVars:         envVars,
+			Workdir:         *workdir,
+			Argv:            argv,
+			Requirements:    reqs,
+			Quiet:           *quiet,
+			KeepProxy:       *keepProxy,
+			Expose:          *expose,
+			ExposeHost:      *exposeHost,
+			TunnelToken:     firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
+			TunnelHostname:  *exposeHostname,
+			Environment:     *environment,
+			TTLMinutes:      *ttlMinutes,
+			CallbackReqs:    callbackReqs,
+			PatchBundledCAs: *patchBundledCAs,
+			ProxyUID:        *proxyUID,
+			Strict:          *strict,
+			LogLevel:        *logLevel,
 		})
 	}
 

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/veris-ai/veris-proxy/internal/bundlescan"
 	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/proxy"
 )
@@ -56,6 +57,10 @@ type dockerRun struct {
 	Environment    string
 	TTLMinutes     int
 	CallbackReqs   []requirement
+
+	// PatchBundledCAs (experimental) over-mounts known SDK-bundled CA files
+	// with copies that also carry the Veris CA. See bundledca.go.
+	PatchBundledCAs bool
 
 	ProxyUID  int
 	Quiet     bool
@@ -108,6 +113,12 @@ func runContainerised(spec dockerRun) error {
 			// with no route to anywhere. Named for exactly this: an unnamed
 			// `docker run` cannot be reached once we stop waiting on it.
 			_ = dockerQuiet("rm", "-f", workload)
+			if spec.PatchBundledCAs {
+				// The signal path exits without running the scan's own deferred
+				// remove, so a scan container created moments before Ctrl-C is
+				// only reachable by its label.
+				removeScanContainers(name)
+			}
 			if spec.KeepProxy {
 				fmt.Fprintf(os.Stderr,
 					"veris-proxy: leaving %s running, env file at %s (--keep-proxy)\n",
@@ -185,7 +196,16 @@ func runContainerised(spec dockerRun) error {
 		fmt.Fprintf(os.Stderr, "veris-proxy: interception live in %s\n", name)
 	}
 
-	status, runErr := runWorkload(spec, name, workload, share)
+	// After readiness on purpose: the scan's patched copies append the CA the
+	// proxy container publishes into the share, which exists only now.
+	var overlays []bundlescan.Overlay
+	if spec.PatchBundledCAs {
+		if overlays, err = bundledCAOverlays(spec, share, name); err != nil {
+			return err
+		}
+	}
+
+	status, runErr := runWorkload(spec, name, workload, share, overlays)
 	if runErr != nil {
 		return runErr
 	}
@@ -432,7 +452,9 @@ func waitForReady(share, name string, budget time.Duration) error {
 	return fmt.Errorf("the proxy container never became ready:\n%s", logs)
 }
 
-func runWorkload(spec dockerRun, proxyName, name, share string) (int, error) {
+func runWorkload(spec dockerRun, proxyName, name, share string,
+	overlays []bundlescan.Overlay,
+) (int, error) {
 	args := []string{
 		"run", "--rm", "--name", name,
 		// The load-bearing flag: one network namespace, so the proxy's
@@ -447,6 +469,19 @@ func runWorkload(spec dockerRun, proxyName, name, share string) (int, error) {
 	}
 	for _, v := range spec.Volumes {
 		args = append(args, "-v", v)
+	}
+	// Read-only: the workload has no business editing its own trust roots.
+	// Docker orders binds by destination, so these land over anything a -v
+	// above mounted at an ancestor path.
+	for _, o := range overlays {
+		args = append(args, "-v", o.HostPath+":"+o.ContainerPath+":ro")
+	}
+	if len(overlays) > 0 {
+		// The overlays live under the share, which is mounted read-write
+		// above; this deeper read-only bind masks that subtree, or the
+		// workload could edit its own trust roots through /veris-share.
+		args = append(args, "-v",
+			filepath.Join(share, bundlesSubdir)+":/veris-share/"+bundlesSubdir+":ro")
 	}
 	for _, e := range spec.EnvVars {
 		args = append(args, "-e", e)
@@ -503,6 +538,20 @@ func fetchReceipt(statusURL string) (proxy.Receipt, error) {
 		return out.Receipt, fmt.Errorf("status is not readable: %w", err)
 	}
 	return out.Receipt, nil
+}
+
+// removeScanContainers reaps the bundle-scan containers labelled with this
+// run's proxy name. Best-effort, like the rest of teardown: a leaked created
+// container holds disk, not anything the next run needs.
+func removeScanContainers(value string) {
+	out, err := exec.Command("docker", "ps", "-aq",
+		"-f", "label="+bundlescan.ContainerLabelKey+"="+value).Output()
+	if err != nil {
+		return
+	}
+	for _, id := range strings.Fields(string(out)) {
+		_ = dockerQuiet("rm", "-f", id)
+	}
 }
 
 func containerRunning(name string) bool {
