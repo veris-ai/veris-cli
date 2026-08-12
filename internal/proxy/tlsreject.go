@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -169,7 +170,18 @@ func (l *trustLog) snapshot() []TrustFailure {
 // receiptSnapshot is the receipt plus the trust-failure ledger, merged at
 // snapshot time so the receipt itself keeps counting only what the sandbox
 // actually received.
+//
+// It drains in-flight handshakes first. A connection is counted before its
+// handshake starts and the client's dial error can return a beat before the
+// server-side goroutine records the rejection — and the run's verdict reads
+// the receipt exactly once, so an in-flight recorder missed here would turn
+// a refused mapped host into a false pass. The bound covers a handshake that
+// is genuinely stuck; it never waits on an idle proxy.
 func (s *Server) receiptSnapshot() Receipt {
+	deadline := time.Now().Add(2 * time.Second)
+	for s.handshakesInFlight.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
 	out := s.receipt.snapshot()
 	out.TrustFailures = s.trustFailures.snapshot()
 	return out
@@ -208,6 +220,9 @@ type tlsAcceptListener struct {
 	inner net.Listener
 	cfg   *tls.Config
 	fail  func(sni string, leafSelected bool, err error)
+	// active counts handshakes accepted but not yet resolved-and-recorded,
+	// so the receipt snapshot can drain them before taking a verdict.
+	active *atomic.Int64
 
 	// states carries per-connection handshake progress from GetCertificate,
 	// which knows the SNI, to the handshake driver, which sees the error.
@@ -228,11 +243,12 @@ type handshakeState struct {
 
 func (s *Server) newTLSAcceptListener(inner net.Listener, base *tls.Config) net.Listener {
 	l := &tlsAcceptListener{
-		inner: inner,
-		fail:  s.recordHandshakeFailure,
-		conns: make(chan net.Conn),
-		errs:  make(chan error, 1),
-		done:  make(chan struct{}),
+		inner:  inner,
+		fail:   s.recordHandshakeFailure,
+		active: &s.handshakesInFlight,
+		conns:  make(chan net.Conn),
+		errs:   make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 	// One cloned config for the listener's whole life, so session tickets
 	// stay shared across connections exactly as with the base config.
@@ -285,6 +301,10 @@ func (l *tlsAcceptListener) acceptLoop() {
 			return
 		}
 		delay = 0
+		// Counted on this goroutine, before any handshake byte moves: by the
+		// time a client's dial returns, its connection is already in the
+		// counter, which is what makes draining the snapshot sound.
+		l.active.Add(1)
 		go l.handshake(raw)
 	}
 }
@@ -301,6 +321,11 @@ func (l *tlsAcceptListener) handshake(raw net.Conn) {
 	if err != nil {
 		writePlaintextHTTPHint(raw, err)
 		l.fail(state.sni, state.leafSelected, err)
+	}
+	// Resolved AND recorded -- decrementing before l.fail would reopen the
+	// exact window the counter closes.
+	l.active.Add(-1)
+	if err != nil {
 		_ = conn.Close()
 		return
 	}

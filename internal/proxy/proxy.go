@@ -65,6 +65,11 @@ type Server struct {
 
 	receipt       receipt
 	trustFailures trustLog
+	// handshakesInFlight counts accepted connections whose TLS handshake has
+	// not resolved. The receipt snapshot drains it: a client's dial error can
+	// return a beat before the server-side goroutine records the rejection,
+	// and the verdict reads the receipt exactly once.
+	handshakesInFlight atomic.Int64
 }
 
 // New builds a Server. It does not listen; call Handler and serve it, or use

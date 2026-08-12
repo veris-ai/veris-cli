@@ -271,7 +271,8 @@ func TestATemporaryAcceptErrorDoesNotKillTheListener(t *testing.T) {
 	}
 	cert := selfSignedCert(t)
 	l := &tlsAcceptListener{
-		inner: &flakyListener{Listener: inner, tempErrs: 3},
+		inner:  &flakyListener{Listener: inner, tempErrs: 3},
+		active: new(atomic.Int64),
 		cfg: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
@@ -334,5 +335,32 @@ func TestPlaintextHTTPToTheHTTPSPortGetsTheCourtesy400(t *testing.T) {
 	if got := string(buf[:n]); !strings.Contains(got, "400 Bad Request") ||
 		!strings.Contains(got, "HTTP request to an HTTPS server") {
 		t.Fatalf("plaintext probe answered %q, want the courtesy 400", got)
+	}
+}
+
+// The run's verdict reads the receipt exactly once, immediately after the
+// workload exits -- and a dial's certificate error returns a beat before the
+// server-side goroutine records it. The snapshot drains in-flight handshakes,
+// so the rejection must be visible with no polling at all.
+func TestTheSnapshotWaitsForInFlightHandshakes(t *testing.T) {
+	h := newTransparentHarness(t)
+	empty := x509.NewCertPool()
+	for i := int64(1); i <= 10; i++ {
+		if _, err := tls.Dial("tcp", h.httpsAddr, &tls.Config{
+			ServerName: "api.stripe.com",
+			RootCAs:    empty,
+			MinVersion: tls.VersionTLS12,
+		}); err == nil {
+			t.Fatal("a client with no roots accepted the minted certificate")
+		}
+		var got int64
+		for _, f := range h.running.Receipt().TrustFailures {
+			if f.Host == "api.stripe.com" {
+				got = f.Rejected
+			}
+		}
+		if got != i {
+			t.Fatalf("after dial %d the snapshot shows %d rejections; the drain missed one", i, got)
+		}
 	}
 }
