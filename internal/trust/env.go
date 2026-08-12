@@ -263,6 +263,17 @@ func replacingCAVars(bundle string) []Var {
 		{"DENO_CERT", bundle, "Deno", false},
 		{"PIP_CERT", bundle, "pip", false},
 		{"npm_config_cafile", bundle, "npm registry traffic", false},
+		// SDKs and tools that ship their own CA bundle and read it instead of
+		// the system store. Each of these is the vendor's documented override,
+		// so setting it keeps the client on the code path that ships.
+		{"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", bundle, "gRPC core ships roots.pem and reads neither SSL_CERT_FILE nor the system store", false},
+		{"BUNDLE_SSL_CA_CERT", bundle, "Bundler; RubyGems ships its own roots", false},
+		{"COMPOSER_CAFILE", bundle, "Composer", false},
+		{"HEX_CACERTS_PATH", bundle, "Elixir Hex ships its own CA bundle", false},
+		{"JULIA_SSL_CA_ROOTS_PATH", bundle, "Julia; takes precedence over SSL_CERT_FILE in its network stack", false},
+		{"NIX_SSL_CERT_FILE", bundle, "Nix may use its own bundle; documented interception override", false},
+		{"PERL_LWP_SSL_CA_FILE", bundle, "Perl LWP", false},
+		{"CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE", bundle, "gcloud CLI bundles its own certifi", false},
 	}
 }
 
