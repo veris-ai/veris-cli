@@ -467,13 +467,29 @@ func runWorkload(spec dockerRun, proxyName, name, share string,
 	if isTerminal(os.Stdin) {
 		args = append(args, "-i")
 	}
-	for _, v := range spec.Volumes {
-		args = append(args, "-v", v)
-	}
 	// Read-only: the workload has no business editing its own trust roots.
 	// Docker orders binds by destination, so these land over anything a -v
-	// above mounted at an ancestor path.
+	// mounted at an ancestor path. A user -v at exactly an overlay's path --
+	// a file bound onto a known bundle path -- is REPLACED by the overlay
+	// instead: docker refuses two mounts at one destination, and the overlay
+	// already carries that file's own bytes plus the Veris CA.
+	overlayAt := make(map[string]bundlescan.Overlay, len(overlays))
 	for _, o := range overlays {
+		overlayAt[o.ContainerPath] = o
+	}
+	mounted := make(map[string]bool, len(overlays))
+	for _, v := range spec.Volumes {
+		if o, ok := overlayAt[bundlescan.ParseVolume(v).Dest]; ok {
+			args = append(args, "-v", o.HostPath+":"+o.ContainerPath+":ro")
+			mounted[o.ContainerPath] = true
+			continue
+		}
+		args = append(args, "-v", v)
+	}
+	for _, o := range overlays {
+		if mounted[o.ContainerPath] {
+			continue
+		}
 		args = append(args, "-v", o.HostPath+":"+o.ContainerPath+":ro")
 	}
 	if len(overlays) > 0 {

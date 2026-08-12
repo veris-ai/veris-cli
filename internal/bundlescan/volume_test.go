@@ -19,24 +19,28 @@ func TestParseVolumeVariants(t *testing.T) {
 	}
 
 	cases := []struct {
-		spec    string
-		source  string
-		dest    string
-		hostDir bool
+		spec     string
+		source   string
+		dest     string
+		hostDir  bool
+		hostFile bool
 	}{
-		{dir + ":/app", dir, "/app", true},
-		{dir + ":/app:ro", dir, "/app", true},
-		{dir + ":/app/", dir, "/app", true}, // trailing slash normalised
-		{file + ":/app/bundle.pem:ro", file, "/app/bundle.pem", false},
-		{"named-vol:/data", "named-vol", "/data", false},
-		{"/does/not/exist:/x", "/does/not/exist", "/x", false},
-		{"/anon-dest", "", "/anon-dest", false},
+		{dir + ":/app", dir, "/app", true, false},
+		{dir + ":/app:ro", dir, "/app", true, false},
+		{dir + ":/app/", dir, "/app", true, false}, // trailing slash normalised
+		{file + ":/app/bundle.pem:ro", file, "/app/bundle.pem", false, true},
+		{"named-vol:/data", "named-vol", "/data", false, false},
+		{"/does/not/exist:/x", "/does/not/exist", "/x", false, false},
+		{"/anon-dest", "", "/anon-dest", false, false},
 	}
 	for _, c := range cases {
 		m := ParseVolume(c.spec)
-		if m.Source != c.source || m.Dest != c.dest || m.HostDir != c.hostDir {
-			t.Errorf("ParseVolume(%q) = {Source:%q Dest:%q HostDir:%v}, want {%q %q %v}",
-				c.spec, m.Source, m.Dest, m.HostDir, c.source, c.dest, c.hostDir)
+		if m.Source != c.source || m.Dest != c.dest ||
+			m.HostDir != c.hostDir || m.HostFile != c.hostFile {
+			t.Errorf("ParseVolume(%q) = {Source:%q Dest:%q HostDir:%v HostFile:%v}, "+
+				"want {%q %q %v %v}",
+				c.spec, m.Source, m.Dest, m.HostDir, m.HostFile,
+				c.source, c.dest, c.hostDir, c.hostFile)
 		}
 	}
 }
@@ -126,6 +130,95 @@ func TestScanVolumeFollowsASymlinkedSource(t *testing.T) {
 	}
 	if !bytes.Equal(cands[0].Content, ca) {
 		t.Error("the target's bytes must be carried on the candidate")
+	}
+}
+
+func TestScanVolumeFollowsAnInTreeDirectorySymlink(t *testing.T) {
+	// site-packages/certifi is a relative symlink to a sibling inside the
+	// same mount -- the container resolves it, so the bundle behind it is
+	// really readable at the symlink's own path.
+	ca := testCA(t, "Linked Dir Root")
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "real-certifi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "real-certifi", "cacert.pem"), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "site-packages"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../real-certifi", filepath.Join(src, "site-packages", "certifi")); err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ContainerPath != "/app/site-packages/certifi/cacert.pem" {
+		t.Fatalf("the bundle behind an in-tree dir symlink must be found at the "+
+			"symlink's path, got %+v", cands)
+	}
+	if !bytes.Equal(cands[0].Content, ca) {
+		t.Error("the target's bytes must be carried on the candidate")
+	}
+}
+
+func TestScanVolumeTerminatesADirectorySymlinkLoop(t *testing.T) {
+	ca := testCA(t, "Loop Root")
+	src := t.TempDir()
+	for _, d := range []string{"a", "b", filepath.Join("b", "certifi")} {
+		if err := os.MkdirAll(filepath.Join(src, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(src, "b", "certifi", "cacert.pem"), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../b", filepath.Join(src, "a", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../a", filepath.Join(src, "b", "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pin is termination: an unvisited-set walk recurses a<->b forever.
+	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, c := range cands {
+		got[c.ContainerPath] = true
+	}
+	if !got["/app/b/certifi/cacert.pem"] || !got["/app/a/link/certifi/cacert.pem"] {
+		t.Fatalf("both the direct and the linked path must be found, got %+v", cands)
+	}
+}
+
+func TestScanVolumeIgnoresAnEscapingDirectorySymlink(t *testing.T) {
+	// The link's target sits OUTSIDE the mount, so the bind exposes nothing
+	// behind it in the container; following it would patch a phantom path.
+	ca := testCA(t, "Outside Root")
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "certifi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "certifi", "cacert.pem"), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(src, "pkgs")); err != nil {
+		t.Fatal(err)
+	}
+
+	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("a dir symlink escaping the mount must not be followed, got %+v", cands)
 	}
 }
 
@@ -289,20 +382,65 @@ func TestCollectKeepsAnImageCandidateUnderAnAnonymousVolume(t *testing.T) {
 }
 
 func TestCollectRefusesAnExactMountOverACandidate(t *testing.T) {
+	// A DIRECTORY bound at the exact bundle path: unlike a file bind, its
+	// contents cannot be the bundle, so the conflict refuses.
 	ca := testCA(t, "Root")
-	file := filepath.Join(t.TempDir(), "own.pem")
-	if err := os.WriteFile(file, ca, 0o644); err != nil {
-		t.Fatal(err)
-	}
 	fake := &fakeDocker{exportTar: buildTar(t, []tarEntry{
 		{name: certifiPath, typ: tar.TypeReg, body: ca},
 	})}
 	s := &Scanner{Docker: fake}
 
 	_, err := s.Collect(context.Background(), "img:latest",
-		[]string{file + ":/" + certifiPath + ":ro"})
+		[]string{t.TempDir() + ":/" + certifiPath + ":ro"})
 	if err == nil || !strings.Contains(err.Error(), "already mounts that exact path") {
-		t.Fatalf("an exact user mount over a candidate must refuse, got %v", err)
+		t.Fatalf("an exact non-file mount over a candidate must refuse, got %v", err)
+	}
+}
+
+func TestCollectPatchesAHostFileMountedAtABundlePath(t *testing.T) {
+	imageCA := testCA(t, "Image Root")
+	fileCA := testCA(t, "File Root")
+	file := filepath.Join(t.TempDir(), "own.pem")
+	if err := os.WriteFile(file, fileCA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeDocker{exportTar: buildTar(t, []tarEntry{
+		{name: certifiPath, typ: tar.TypeReg, body: imageCA},
+	})}
+	s := &Scanner{Docker: fake}
+
+	cands, err := s.Collect(context.Background(), "img:latest",
+		[]string{file + ":/" + certifiPath + ":ro"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ContainerPath != "/"+certifiPath {
+		t.Fatalf("a file bound at a bundle path must be the candidate there, got %+v", cands)
+	}
+	if !bytes.Equal(cands[0].Content, fileCA) {
+		t.Error("the file bind masks the image copy, so its bytes are the effective ones")
+	}
+	overlays, skipped, err := WriteOverlays(t.TempDir(), testCA(t, "Veris Local CA"), cands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overlays) != 1 || len(skipped) != 0 ||
+		overlays[0].ContainerPath != "/"+certifiPath {
+		t.Fatalf("the file bind's candidate must get an overlay, got %+v", overlays)
+	}
+}
+
+func TestCollectRefusesAJunkHostFileAtABundlePath(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "own.pem")
+	if err := os.WriteFile(file, []byte("not a bundle at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &Scanner{Docker: &fakeDocker{exportTar: buildTar(t, nil)}}
+
+	_, err := s.Collect(context.Background(), "img:latest",
+		[]string{file + ":/" + certifiPath + ":ro"})
+	if err == nil || !strings.Contains(err.Error(), "not a CA bundle") {
+		t.Fatalf("junk bound at a bundle path must refuse loudly, got %v", err)
 	}
 }
 

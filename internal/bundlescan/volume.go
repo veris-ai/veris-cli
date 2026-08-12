@@ -17,14 +17,16 @@ type Mount struct {
 	Raw    string
 	Source string // host path or volume name; "" for an anonymous volume
 	Dest   string
-	// HostDir marks a source that is an existing host directory -- the only
-	// kind of mount the scan can look inside.
-	HostDir bool
-	// walkRoot is the symlink-resolved source a HostDir walk reads. Docker
+	// HostDir marks a source that is an existing host directory, and HostFile
+	// one that is an existing regular file -- the two kinds of mount the scan
+	// can look inside.
+	HostDir  bool
+	HostFile bool
+	// resolvedSource is the symlink-resolved source the scan reads. Docker
 	// resolves a symlinked source the same way before binding it, and WalkDir
 	// does not follow a symlink root -- walking the raw source would scan
 	// nothing while claiming the mount as covered.
-	walkRoot string
+	resolvedSource string
 }
 
 // ParseVolume splits a -v value. It validates nothing docker would refuse
@@ -40,9 +42,15 @@ func ParseVolume(spec string) Mount {
 	// a path can be stat'ed and walked.
 	if strings.Contains(m.Source, "/") {
 		if resolved, err := filepath.EvalSymlinks(m.Source); err == nil {
-			if info, err := os.Stat(resolved); err == nil && info.IsDir() {
-				m.HostDir = true
-				m.walkRoot = resolved
+			if info, err := os.Stat(resolved); err == nil {
+				switch {
+				case info.IsDir():
+					m.HostDir = true
+					m.resolvedSource = resolved
+				case info.Mode().IsRegular():
+					m.HostFile = true
+					m.resolvedSource = resolved
+				}
 			}
 		}
 	}
@@ -67,45 +75,113 @@ const maxWalkDepth = 12
 // trip it without building a fifty-thousand-file tree.
 var maxWalkFiles = 50000
 
-// ScanVolume walks a bind mount's host directory with the same table the
-// image scan uses. The volume shadows whatever the image holds under the same
-// destination, so the copy found here is the one the SDK will actually read.
+// ScanVolume reads a bind mount with the same table the image scan uses. The
+// mount shadows whatever the image holds under the same destination, so the
+// copy found here is the one the SDK will actually read. A directory source
+// is walked; a regular-file source is judged by its destination alone.
 func ScanVolume(m Mount) ([]Candidate, error) {
+	if m.HostFile {
+		return scanFileMount(m)
+	}
 	if !m.HostDir {
 		return nil, nil
 	}
-	root := m.walkRoot
+	root := m.resolvedSource
 	if root == "" {
 		root = m.Source
 	}
-	var out []Candidate
-	files := 0
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	w := &volumeWalk{m: m, root: root, visited: map[string]bool{root: true}}
+	if err := w.walk(root, ""); err != nil {
+		return nil, err
+	}
+	return w.out, nil
+}
+
+// scanFileMount handles a host FILE bound directly at a known bundle path:
+// the destination alone anchors the match, and the file's bytes are what the
+// SDK will read there. A lookalike that fails validation refuses rather than
+// skips -- silently ignoring the mount would leave the effective bundle
+// unpatched with everything looking healthy.
+func scanFileMount(m Mount) ([]Candidate, error) {
+	rl, ok := matchRule(strings.TrimPrefix(m.Dest, "/"))
+	if !ok {
+		return nil, nil
+	}
+	src := m.resolvedSource
+	if src == "" {
+		src = m.Source
+	}
+	content, err := readBounded(src)
+	if err != nil {
+		return nil, fmt.Errorf("%s bundle at %s (-v %s): %w", rl.SDK, m.Dest, m.Raw, err)
+	}
+	if err := validate(content); err != nil {
+		return nil, fmt.Errorf("%s bundle at %s (-v %s): %v", rl.SDK, m.Dest, m.Raw, err)
+	}
+	return []Candidate{{
+		SDK:           rl.SDK,
+		ContainerPath: m.Dest,
+		Content:       content,
+		Origin:        src,
+		mountDest:     m.Dest,
+	}}, nil
+}
+
+// volumeWalk carries one mount's walk state: the file budget and the visited
+// set span every directory the walk enters, symlinked or not.
+type volumeWalk struct {
+	m       Mount
+	root    string
+	files   int
+	visited map[string]bool // resolved directories already walked
+	out     []Candidate
+}
+
+// walk scans one real directory. prefix is the mount-relative path this
+// directory answers to -- "" for the root, the symlink's own path for a tree
+// reached through one -- because the container resolves the link too, and the
+// symlink-side path is where the bundle is read and over-mounted.
+func (w *volumeWalk) walk(dir, prefix string) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return fmt.Errorf("bundle scan of %s: %w", m.Source, err)
+			return fmt.Errorf("bundle scan of %s: %w", w.m.Source, err)
 		}
-		rel, err := filepath.Rel(root, p)
+		rel, err := filepath.Rel(dir, p)
 		if err != nil {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		if prefix != "" {
+			if rel == "." {
+				rel = prefix
+			} else {
+				rel = prefix + "/" + rel
+			}
+		}
 		if d.IsDir() {
 			if rel != "." && strings.Count(rel, "/")+1 >= maxWalkDepth {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		files++
-		if files > maxWalkFiles {
+		if d.Type()&fs.ModeSymlink != 0 {
+			if followed, err := w.follow(p, rel); followed || err != nil {
+				return err
+			}
+			// Not a directory to descend into: fall through to the file
+			// handling, where stat and read chase the link to its bytes.
+		}
+		w.files++
+		if w.files > maxWalkFiles {
 			return fmt.Errorf(
 				"bundle scan of %s exceeded its %d-file budget before finishing; "+
 					"narrow the -v mount, or drop --patch-bundled-cas",
-				m.Source, maxWalkFiles)
+				w.m.Source, maxWalkFiles)
 		}
 		// The table is matched against the path the CONTAINER sees: the mount
 		// destination can supply the anchoring SDK directory itself, so the
 		// source-relative path alone under-matches.
-		cpath := path.Join(m.Dest, rel)
+		cpath := path.Join(w.m.Dest, rel)
 		rl, ok := matchRule(strings.TrimPrefix(cpath, "/"))
 		if !ok {
 			return nil
@@ -117,19 +193,42 @@ func ScanVolume(m Mount) ([]Candidate, error) {
 		if err := validate(content); err != nil {
 			return fmt.Errorf("%s bundle at %s: %v", rl.SDK, p, err)
 		}
-		out = append(out, Candidate{
+		w.out = append(w.out, Candidate{
 			SDK:           rl.SDK,
 			ContainerPath: cpath,
 			Content:       content,
 			Origin:        p,
-			mountDest:     m.Dest,
+			mountDest:     w.m.Dest,
 		})
 		return nil
 	})
+}
+
+// follow descends into a directory symlink whose target stays INSIDE the
+// mount: the container resolves the link the same way, so a bundle behind it
+// is really reachable at the link's own path -- which WalkDir alone would
+// never visit. The visited set is keyed by resolved directory, so a link
+// cycle terminates; a link escaping the root is left alone, because the bind
+// exposes nothing outside its source and the host-side target says nothing
+// about what the container would find there.
+func (w *volumeWalk) follow(p, rel string) (bool, error) {
+	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
-		return nil, err
+		// Dangling or looping on itself; nothing behind it to scan.
+		return false, nil
 	}
-	return out, nil
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return false, nil
+	}
+	if resolved != w.root && !strings.HasPrefix(resolved, w.root+string(filepath.Separator)) {
+		return true, nil
+	}
+	if w.visited[resolved] {
+		return true, nil
+	}
+	w.visited[resolved] = true
+	return true, w.walk(resolved, rel)
 }
 
 // readBounded reads a candidate file, refusing the oversized before reading:
@@ -190,12 +289,27 @@ func (s *Scanner) Collect(ctx context.Context, image string, volumes []string) (
 //     file does not exist in the container at all;
 //   - an anonymous volume: docker copies it up from the IMAGE, so the image
 //     candidate stays effective and a shallower bind's copy is masked;
-//   - anything the scan cannot see inside (a named volume, a host file): a
-//     known bundle would ship unpatched with everything looking healthy, so
-//     that refuses instead.
+//   - anything the scan cannot see inside (a named volume): a known bundle
+//     would ship unpatched with everything looking healthy, so that refuses
+//     instead.
+//
+// A file bind AT a candidate's exact path is the deepest cover there can be:
+// its own candidate speaks for the path and every other copy is masked. Any
+// other exact-destination mount is the conflict refuseExactMounts judges
+// with its own message.
 func dropShadowed(cands []Candidate, mounts []Mount) ([]Candidate, error) {
 	var out []Candidate
 	for _, c := range cands {
+		if c.mountDest == c.ContainerPath {
+			out = append(out, c)
+			continue
+		}
+		if ex := mountAt(c.ContainerPath, mounts); ex != nil {
+			if !ex.HostFile {
+				out = append(out, c)
+			}
+			continue
+		}
 		gov := deepestCovering(c.ContainerPath, mounts)
 		switch {
 		case gov == nil || gov.Dest == c.mountDest:
@@ -215,6 +329,16 @@ func dropShadowed(cands []Candidate, mounts []Mount) ([]Candidate, error) {
 		}
 	}
 	return out, nil
+}
+
+// mountAt returns the mount bound exactly at p, or nil.
+func mountAt(p string, mounts []Mount) *Mount {
+	for i := range mounts {
+		if mounts[i].Dest == p {
+			return &mounts[i]
+		}
+	}
+	return nil
 }
 
 // deepestCovering returns the deepest mount whose destination sits strictly
@@ -254,19 +378,23 @@ func dedupeByPath(cands []Candidate) []Candidate {
 	return out
 }
 
-// refuseExactMounts fails when the user already binds EXACTLY a path the run
-// would over-mount: two mounts at one destination is a docker error, and
-// silently dropping ours would leave the user's unpatched copy in play.
+// refuseExactMounts fails when the user binds EXACTLY a candidate's path
+// with something the scan could not read: two mounts at one destination is a
+// docker error, and silently dropping ours would leave the user's unpatched
+// copy in play. A regular-file bind never lands here -- scanFileMount made
+// it the candidate itself, and the run replaces that bind with the patched
+// copy.
 func refuseExactMounts(cands []Candidate, mounts []Mount) error {
 	for _, c := range cands {
 		for _, m := range mounts {
-			if m.Dest == c.ContainerPath {
-				return fmt.Errorf(
-					"--patch-bundled-cas wants to over-mount the %s bundle at %s, but "+
-						"-v %s already mounts that exact path; remove that mount, or "+
-						"append the published Veris CA to the file it binds and drop "+
-						"the flag", c.SDK, c.ContainerPath, m.Raw)
+			if m.Dest != c.ContainerPath || m.Dest == c.mountDest {
+				continue
 			}
+			return fmt.Errorf(
+				"--patch-bundled-cas wants to over-mount the %s bundle at %s, but "+
+					"-v %s already mounts that exact path; remove that mount, or "+
+					"append the published Veris CA to the file it binds and drop "+
+					"the flag", c.SDK, c.ContainerPath, m.Raw)
 		}
 	}
 	return nil
