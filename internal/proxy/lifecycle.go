@@ -98,24 +98,28 @@ func (s *Server) Start(opts ListenOptions) (*Running, error) {
 			// Interception targets are ordinary REST APIs; a request slower
 			// than this is a hung upstream, not a legitimate slow call.
 			ReadHeaderTimeout: 30 * time.Second,
-			TLSConfig:         sp.tlsCfg,
+			// Kept even though the accept layer below handshakes for itself:
+			// Serve only installs net/http's HTTP/2 handler when the server's
+			// own TLSConfig offers "h2". Without it, every ALPN-negotiated h2
+			// connection silently falls back to HTTP/1.1.
+			TLSConfig: sp.tlsCfg,
 		}
 		r.servers = append(r.servers, hs)
 
-		serve := hs.Serve
 		if sp.tlsCfg != nil {
-			// ServeTLS rather than Serve over a tls.NewListener: it is what
-			// installs net/http's HTTP/2 handler for an ALPN-negotiated "h2"
-			// connection. Wrapping the listener by hand leaves TLSNextProto
-			// empty, so every client silently falls back to HTTP/1.1 no matter
-			// what the config offers.
-			serve = func(l net.Listener) error { return hs.ServeTLS(l, "", "") }
+			// The handshake runs in this listener, not inside net/http, which
+			// discards handshake errors -- a client refusing the minted
+			// certificate would be indistinguishable from one that never
+			// called. net/http still negotiates h2: an already-handshaken
+			// *tls.Conn arriving through plain Serve is dispatched through
+			// TLSNextProto by its negotiated protocol.
+			ln = s.newTLSAcceptListener(ln, sp.tlsCfg)
 		}
 
 		r.wg.Add(1)
-		go func(serve func(net.Listener) error, ln net.Listener) {
+		go func(hs *http.Server, ln net.Listener) {
 			defer r.wg.Done()
-			err := serve(ln)
+			err := hs.Serve(ln)
 			// Shutdown and Close both surface as ErrServerClosed; that is a
 			// clean stop, not a failure worth waking the caller for.
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -124,7 +128,7 @@ func (s *Server) Start(opts ListenOptions) (*Running, error) {
 				default:
 				}
 			}
-		}(serve, ln)
+		}(hs, ln)
 	}
 	return r, nil
 }
@@ -188,4 +192,4 @@ func (r *Running) Shutdown(ctx context.Context) error {
 // Receipt snapshots what this run sent to the sandbox. Reading it in-process
 // rather than over the status endpoint matters: there is no "could not reach
 // the proxy" state to confuse with "the run sent nothing".
-func (r *Running) Receipt() Receipt { return r.srv.receipt.snapshot() }
+func (r *Running) Receipt() Receipt { return r.srv.receiptSnapshot() }

@@ -292,6 +292,15 @@ func cmdRun(args []string) error {
 	for _, u := range unmet {
 		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", u)
 	}
+	// Trust failures are recorded only by transparent listeners, which this
+	// local tier never opens (goproxy's CONNECT loop discards its own MITM
+	// handshake error) -- so today this can fire only via the containerised
+	// path, and is wired here so both tiers share one verdict when that gap
+	// closes.
+	trustMsgs, trustFatal := trustFailureDiagnostics(receipt)
+	for _, m := range trustMsgs {
+		fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", m)
+	}
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris-proxy: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -303,7 +312,7 @@ func cmdRun(args []string) error {
 	if status != 0 {
 		return exitCode(status)
 	}
-	if len(unmet) > 0 {
+	if len(unmet) > 0 || trustFatal {
 		return exitCode(exitRequirementUnmet)
 	}
 	if shutErr != nil {
@@ -455,6 +464,66 @@ func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Rec
 			"never called its dependencies, or interception missed them. " +
 			"--require-service <name> sharpens this to a per-service assertion",
 	}
+}
+
+// trustFailureDiagnostics turns the receipt's per-host TLS trust failures
+// into printed diagnostics. fatal marks the case that must fail the run: a
+// mapped host whose minted certificate a client refused outright, and which
+// completed no request, never exercised its integration -- whatever the
+// command's own exit code said. An aborted-only host is reported in
+// probabilistic wording and changes nothing: an EOF is consistent with a
+// refusal but never proof of one.
+func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
+	// Receipt hosts arrive as the client wrote them; trust failures are keyed
+	// by lowercased SNI. Fold case here, or a completed request with a
+	// mixed-case Host header would fail to suppress the fatal verdict.
+	completed := make(map[string]int64, len(r.ByHost))
+	for host, n := range r.ByHost {
+		completed[strings.ToLower(host)] += n
+	}
+	for _, f := range r.TrustFailures {
+		// A host that also completed requests was exercised: some client in
+		// the run refused the CA, but the command's own verdict stands.
+		if !f.Mapped || completed[f.Host] > 0 {
+			continue
+		}
+		switch {
+		case f.Rejected > 0:
+			fatal = true
+			msgs = append(msgs, fmt.Sprintf(
+				"%s: %d TLS handshake(s) rejected (%s) after the certificate was "+
+					"minted; 0 requests completed -- the client refused the "+
+					"interception CA, likely an SDK-bundled CA bundle or certificate "+
+					"pinning; see the Certificates section of the README",
+				f.Host, f.Rejected, dominantReason(f.Reasons)))
+		case f.Aborted > 0:
+			msgs = append(msgs, fmt.Sprintf(
+				"%s: %d TLS handshake(s) ended after the certificate was minted; "+
+					"0 requests completed -- CA rejection or certificate pinning is "+
+					"likely, but the connection closed without a TLS alert, so this "+
+					"is not certain; see the Certificates section of the README",
+				f.Host, f.Aborted))
+		}
+	}
+	return msgs, fatal
+}
+
+// dominantReason names the most frequent certificate alert, so the diagnostic
+// leads with what most of the failed handshakes actually said.
+func dominantReason(reasons map[string]int64) string {
+	names := make([]string, 0, len(reasons))
+	for name := range reasons {
+		names = append(names, name)
+	}
+	// By name first, so a tie between alerts reads the same on every run.
+	sort.Strings(names)
+	best, bestN := "certificate_rejected", int64(0)
+	for _, name := range names {
+		if reasons[name] > bestN {
+			best, bestN = name, reasons[name]
+		}
+	}
+	return best
 }
 
 func unmetRequirements(reqs []requirement, r proxy.Receipt) []string {

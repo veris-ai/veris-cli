@@ -63,7 +63,8 @@ type Server struct {
 	// endpoint can report what the app received.
 	inbound atomic.Pointer[*Ingress]
 
-	receipt receipt
+	receipt       receipt
+	trustFailures trustLog
 }
 
 // New builds a Server. It does not listen; call Handler and serve it, or use
@@ -345,7 +346,7 @@ func (s *Server) state(path string) map[string]any {
 		// The receipt too, so a caller outside this process can enforce a
 		// --require-service. `run` reads it in-process when it owns the proxy;
 		// when the proxy is in another container it has to come over the wire.
-		out["receipt"] = s.receipt.snapshot()
+		out["receipt"] = s.receiptSnapshot()
 		// And the inbound one, for exactly the same reason: with the proxy in
 		// another container, `run --image` can only enforce --require-callback
 		// over the wire.

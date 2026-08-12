@@ -288,6 +288,99 @@ func TestAnImageMayRunWithNoCommandOfItsOwn(t *testing.T) {
 	}
 }
 
+// The SDK-bundled-CA failure mode: a mapped host whose minted certificate the
+// client refused, with nothing completed, was never actually tested -- the
+// suite may still exit 0, so the trust verdict must own the exit code the way
+// an unmet requirement does.
+func TestATrustRejectedHostWithNoTrafficFailsTheRun(t *testing.T) {
+	rejected := proxy.Receipt{
+		ByHost: map[string]int64{},
+		TrustFailures: []proxy.TrustFailure{{
+			Host: "api.stripe.com", Mapped: true, Rejected: 3,
+			Reasons: map[string]int64{"unknown_ca": 3},
+		}},
+	}
+	msgs, fatal := trustFailureDiagnostics(rejected)
+	if !fatal {
+		t.Fatal("a mapped host with rejections and no completed requests must fail the run")
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("msgs = %v, want exactly one diagnostic", msgs)
+	}
+	for _, want := range []string{
+		"api.stripe.com", "3 TLS handshake(s) rejected", "unknown_ca",
+		"0 requests completed", "refused the interception CA",
+	} {
+		if !strings.Contains(msgs[0], want) {
+			t.Errorf("diagnostic is missing %q: %s", want, msgs[0])
+		}
+	}
+
+	// The same rejections beside completed requests: some client refused the
+	// CA, but the integration was exercised -- the command's verdict stands.
+	rejected.ByHost = map[string]int64{"api.stripe.com": 5}
+	if msgs, fatal := trustFailureDiagnostics(rejected); fatal || len(msgs) != 0 {
+		t.Fatalf("a host with completed requests must not fail: fatal=%v msgs=%v", fatal, msgs)
+	}
+
+	// Trust failures are keyed by lowercased SNI, but the explicit-proxy tier
+	// records receipt hosts as the client wrote them -- a mixed-case Host on
+	// the completed requests must still suppress the fatal verdict.
+	rejected.ByHost = map[string]int64{"API.Stripe.Com": 5}
+	if msgs, fatal := trustFailureDiagnostics(rejected); fatal || len(msgs) != 0 {
+		t.Fatalf("a mixed-case completed host must not fail: fatal=%v msgs=%v", fatal, msgs)
+	}
+}
+
+// Rejections on an unmapped host are background noise -- telemetry, an
+// unrelated pinned client -- not missing sandbox traffic.
+func TestAnUnmappedHostsRejectionsNeverFailTheRun(t *testing.T) {
+	r := proxy.Receipt{
+		ByHost: map[string]int64{},
+		TrustFailures: []proxy.TrustFailure{{
+			Host: "telemetry.example.com", Rejected: 4,
+			Reasons: map[string]int64{"unknown_ca": 4},
+		}},
+	}
+	if msgs, fatal := trustFailureDiagnostics(r); fatal || len(msgs) != 0 {
+		t.Fatalf("unmapped rejections changed the verdict: fatal=%v msgs=%v", fatal, msgs)
+	}
+}
+
+// An EOF after the leaf was selected is consistent with a refusal and with a
+// crashed client; the wire cannot tell them apart. The wording stays
+// probabilistic and the exit code stays the command's own.
+func TestAbortedOnlyHandshakesWarnWithoutFailing(t *testing.T) {
+	r := proxy.Receipt{
+		ByHost: map[string]int64{},
+		TrustFailures: []proxy.TrustFailure{{
+			Host: "api.stripe.com", Mapped: true, Aborted: 2,
+		}},
+	}
+	msgs, fatal := trustFailureDiagnostics(r)
+	if fatal {
+		t.Fatal("aborted-only handshakes must not change the exit code")
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("msgs = %v, want exactly one diagnostic", msgs)
+	}
+	for _, want := range []string{"api.stripe.com", "likely", "not certain"} {
+		if !strings.Contains(msgs[0], want) {
+			t.Errorf("diagnostic is missing %q: %s", want, msgs[0])
+		}
+	}
+	if strings.Contains(msgs[0], "refused the interception CA") {
+		t.Errorf("an EOF must never be worded as a confirmed refusal: %s", msgs[0])
+	}
+}
+
+func TestDominantReasonPrefersTheMostFrequentAlert(t *testing.T) {
+	got := dominantReason(map[string]int64{"bad_certificate": 1, "unknown_ca": 5})
+	if got != "unknown_ca" {
+		t.Errorf("dominantReason = %q, want unknown_ca", got)
+	}
+}
+
 func TestAnEnvironmentRunThatSentNothingFailsByDefault(t *testing.T) {
 	// The environment already names the services, so nobody should have to
 	// spell out --require-service for "the suite reached the sandbox at all".

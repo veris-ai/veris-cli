@@ -45,6 +45,12 @@ type Receipt struct {
 	Hits      []Hit            `json:"hits"`
 	ByHost    map[string]int64 `json:"by_host"`
 	ByService map[string]int64 `json:"by_service"`
+
+	// TrustFailures lists, per SNI host, TLS handshakes that ended after the
+	// proxy selected a certificate: the client saw the minted leaf and
+	// refused or abandoned it. Entries here beside zero completed requests
+	// are what an SDK-bundled CA bundle looks like from outside.
+	TrustFailures []TrustFailure `json:"tls_trust_failures,omitempty"`
 }
 
 func (r *receipt) record(host string, target *config.Target) {
