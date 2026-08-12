@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/veris-ai/veris-proxy/internal/routes"
 )
 
 // A Calendar sandbox always contains google-identity too: Calendar issues no
@@ -25,7 +27,7 @@ func googleSandbox(base string) *Snapshot {
 }
 
 func TestAConfigIsDerivedWithNoFileAuthored(t *testing.T) {
-	cfg, skipped, err := ToConfig(googleSandbox("http://sandbox.test"))
+	cfg, skipped, err := ToConfig(googleSandbox("http://sandbox.test"), nil)
 	if err != nil {
 		t.Fatalf("ToConfig: %v", err)
 	}
@@ -49,7 +51,7 @@ func TestAConfigIsDerivedWithNoFileAuthored(t *testing.T) {
 // table had it on www.googleapis.com, which would route a client's token
 // introspection at a host that does not serve it.
 func TestTokeninfoIsRoutedWhereGoogleServesIt(t *testing.T) {
-	cfg, _, err := ToConfig(googleSandbox("http://sandbox.test"))
+	cfg, _, err := ToConfig(googleSandbox("http://sandbox.test"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +73,7 @@ func TestTokeninfoIsRoutedWhereGoogleServesIt(t *testing.T) {
 // each a prefix, and must load -- the proxy rejects two services claiming one
 // host and prefix.
 func TestTheDerivedConfigResolvesTheSharedGoogleHost(t *testing.T) {
-	cfg, _, err := ToConfig(googleSandbox("http://sandbox.test"))
+	cfg, _, err := ToConfig(googleSandbox("http://sandbox.test"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +101,7 @@ func TestANonHTTPServiceIsReportedRatherThanDropped(t *testing.T) {
 			{Name: "pg", URL: "postgres://user:pw@10.0.0.2:5432/db"},
 		},
 	}
-	cfg, skipped, err := ToConfig(snapshot)
+	cfg, skipped, err := ToConfig(snapshot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +121,7 @@ func TestAServiceWithNoMeasuredHostIsReported(t *testing.T) {
 			{Name: "not-a-real-vendor", URL: "http://sandbox.test/s/sbx_x/nope"},
 		},
 	}
-	_, skipped, err := ToConfig(snapshot)
+	_, skipped, err := ToConfig(snapshot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,9 +136,105 @@ func TestASandboxWithNothingRoutableIsAnError(t *testing.T) {
 	_, _, err := ToConfig(&Snapshot{
 		SandboxID: "sbx_empty",
 		Services:  []Service{{Name: "pg", URL: "postgres://h/db"}},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("a sandbox with nothing routable should be an error")
+	}
+}
+
+// Routes served by the control plane beat the embedded table: they are the
+// same measured record, but current rather than frozen at this binary's
+// release.
+func TestControlPlaneRoutesBeatTheEmbeddedTable(t *testing.T) {
+	snapshot := googleSandbox("http://sandbox.test")
+	snapshot.Services[0].Routes = []routes.Entry{
+		{Host: "calendar.fresh.example", Paths: []string{"/v9"}},
+	}
+	cfg, _, err := ToConfig(snapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calendarHosts []string
+	for _, svc := range cfg.Services {
+		if svc.Name == "google-calendar" {
+			calendarHosts = append(calendarHosts, svc.Hosts...)
+		}
+	}
+	if len(calendarHosts) != 1 || calendarHosts[0] != "calendar.fresh.example" {
+		t.Errorf("calendar hosts = %v, want only the served route", calendarHosts)
+	}
+	// The sibling served no routes, so it still resolves from the table.
+	var identityRouted bool
+	for _, svc := range cfg.Services {
+		if svc.Name == "google-identity" {
+			identityRouted = true
+		}
+	}
+	if !identityRouted {
+		t.Error("google-identity lost its embedded-table routes")
+	}
+}
+
+// A newer control plane with one malformed row must not take down every run
+// against it; a service whose rows all drop falls back to the table.
+func TestMalformedServedRoutesFallBackToTheTable(t *testing.T) {
+	snapshot := googleSandbox("http://sandbox.test")
+	snapshot.Services[0].Routes = []routes.Entry{{Host: "  "}}
+	cfg, _, err := ToConfig(snapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, svc := range cfg.Services {
+		if svc.Name == "google-calendar" && svc.Hosts[0] != "www.googleapis.com" {
+			t.Errorf("calendar host = %q, want the embedded table's", svc.Hosts[0])
+		}
+	}
+}
+
+// --route replaces every derived route for the service it names, and can route
+// a service neither the control plane nor the table knows -- the "measurement
+// has not landed yet" case the flag exists for.
+func TestARouteOverrideReplacesAndEnables(t *testing.T) {
+	snapshot := &Snapshot{
+		SandboxID: "sbx_o",
+		Services: []Service{
+			{Name: "stripe", URL: "http://sandbox.test/s/sbx_o/stripe"},
+			{Name: "brand-new", URL: "http://sandbox.test/s/sbx_o/brand-new"},
+		},
+	}
+	overrides := map[string][]routes.Entry{
+		"stripe":    {{Host: "api.stripe.dev"}},
+		"brand-new": {{Host: "api.newvendor.example", Paths: []string{"/v1"}}},
+	}
+	cfg, skipped, err := ToConfig(snapshot, overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("unexpectedly skipped: %+v", skipped)
+	}
+	hosts := map[string]string{}
+	for _, svc := range cfg.Services {
+		hosts[svc.Name] = svc.Hosts[0]
+	}
+	if hosts["stripe"] != "api.stripe.dev" {
+		t.Errorf("stripe host = %q, want the override", hosts["stripe"])
+	}
+	if hosts["brand-new"] != "api.newvendor.example" {
+		t.Errorf("brand-new host = %q, want the override", hosts["brand-new"])
+	}
+}
+
+// A typo'd --route silently ignored would leave its author believing a
+// dependency was covered. It is an error naming what the sandbox does run.
+func TestAnOverrideForAnAbsentServiceIsAnError(t *testing.T) {
+	_, _, err := ToConfig(googleSandbox("http://sandbox.test"),
+		map[string][]routes.Entry{"sptire": {{Host: "api.stripe.com"}}})
+	if err == nil || !strings.Contains(err.Error(), "sptire") {
+		t.Fatalf("err = %v, want a refusal naming the typo", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "google-calendar") {
+		t.Errorf("err = %v, want it to list what the sandbox runs", err)
 	}
 }
 
@@ -223,7 +321,7 @@ func TestADatabaseServiceIsHandedOverNotRouted(t *testing.T) {
 				EnvHint: "DATABASE_URL"},
 		},
 	}
-	cfg, skipped, err := ToConfig(snapshot)
+	cfg, skipped, err := ToConfig(snapshot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +350,7 @@ func TestADatabaseOnlySandboxStillYieldsAConfig(t *testing.T) {
 			{Name: "postgres", URL: "postgres://u:p@h:5432/app", EnvHint: "DATABASE_URL"},
 		},
 	}
-	cfg, _, err := ToConfig(snapshot)
+	cfg, _, err := ToConfig(snapshot, nil)
 	if err != nil {
 		t.Fatalf("a lone database is a real sandbox shape, got: %v", err)
 	}

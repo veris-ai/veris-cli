@@ -110,6 +110,11 @@
         ]
       }
     ],
+    "hubspot": [
+      {
+        "host": "api.hubapi.com"
+      }
+    ],
     "marqeta": [
       {
         "host": "sandbox-api.marqeta.com"
