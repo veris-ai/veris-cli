@@ -47,6 +47,13 @@ func TestMain(m *testing.M) {
 		// cleanup handler or a JVM with a shutdown hook can look like.
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		// Announce that the trap is armed. The parent test must not signal
+		// before this exists: supervise installs ITS handler before starting
+		// this child, so the marker also proves the test binary can survive
+		// the SIGTERM it is about to send itself.
+		if ready := os.Getenv("VERIS_TEST_READY_FILE"); ready != "" {
+			_ = os.WriteFile(ready, []byte("armed"), 0o600)
+		}
 		time.Sleep(5 * time.Minute)
 		os.Exit(0)
 	default:
@@ -142,14 +149,20 @@ func TestASignalledChildThatIgnoresItIsEventuallyKilled(t *testing.T) {
 
 	cfg := writeConfig(t, sandbox(t))
 	argv := child(t, "stubborn")
+	ready := filepath.Join(t.TempDir(), "stubborn-armed")
+	t.Setenv("VERIS_TEST_READY_FILE", ready)
 
 	done := make(chan error, 1)
 	go func() {
 		done <- cmdRun(append([]string{"--config", cfg, "--quiet", "--"}, argv...))
 	}()
 
-	// Let the child install its trap, then ask it to stop.
-	time.Sleep(500 * time.Millisecond)
+	// Signal only once the child says its trap is armed. A fixed sleep raced
+	// cmdRun's own startup (fresh-CA keygen takes seconds on a loaded runner):
+	// a SIGTERM arriving before supervise installs its handler takes the
+	// default action and kills the whole test binary -- the intermittent
+	// "signal: terminated" CI failure.
+	waitForFile(t, ready)
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("signal self: %v", err)
 	}
