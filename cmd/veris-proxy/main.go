@@ -343,6 +343,22 @@ func cmdServe(args []string) error {
 	}
 	announce(log, running, cfg, authority)
 
+	// The shutdown handler arms BEFORE anything announces readiness. The ready
+	// marker's contract is "everything is armed": a supervisor (or docker stop)
+	// that signals the moment the marker appears must find this handler, not
+	// the default action -- which would kill the process with listeners bound
+	// and the deferred cleanup (tunnel close, sandbox delete) never run.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	go func() {
+		<-stop
+		log.Info("shutting down")
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		_ = running.Shutdown(ctx)
+	}()
+
 	// Order matters and is the contract: the environment is complete before
 	// the readiness marker exists, so a supervisor that sees the marker can
 	// source the environment without a second wait.
@@ -383,19 +399,6 @@ func cmdServe(args []string) error {
 			return fmt.Errorf("write ready file: %w", err)
 		}
 	}
-
-	// Shut down cleanly on signal so the CLI can stop us between runs without
-	// cutting in-flight requests. Exiting from the handler would skip that.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(stop)
-	go func() {
-		<-stop
-		log.Info("shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancel()
-		_ = running.Shutdown(ctx)
-	}()
 
 	if ing != nil {
 		// A tunnel that dies mid-run leaves the proxy healthy and registered at
