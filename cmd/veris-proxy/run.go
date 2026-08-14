@@ -81,6 +81,10 @@ func cmdRun(args []string) error {
 			"instead of attaching to an existing --sandbox")
 	ttlMinutes := fs.Int("ttl-minutes", 0,
 		"how long a sandbox created by --environment may live if teardown never runs")
+	promoteOnSuccess := fs.Bool("promote-on-success", false,
+		"if the run passes and the sandbox received traffic, make its world the "+
+			"environment's default before teardown, so later runs start from it "+
+			"instead of rebuilding it")
 	fs.Func("require-callback",
 		"fail unless your app received a callback on this path[:count] (* for any path)",
 		func(v string) error {
@@ -163,6 +167,9 @@ func cmdRun(args []string) error {
 			{"--ttl-minutes", *ttlMinutes > 0, callbackWhy("--ttl-minutes")},
 			{"--expose-token", *exposeToken != "", callbackWhy("--expose-token")},
 			{"--expose-hostname", *exposeHostname != "", callbackWhy("--expose-hostname")},
+			{"--promote-on-success", *promoteOnSuccess,
+				"it promotes the sandbox --environment deployed, and that is the " +
+					"container tier"},
 			{"--patch-bundled-cas", *patchBundledCAs,
 				"the reason is the image's filesystem, not the callback path: it " +
 					"patches CA files inside a container image"},
@@ -178,6 +185,17 @@ func cmdRun(args []string) error {
 		return errors.New(
 			"--require-callback asserts what your app received, and nothing can " +
 				"arrive without --expose <port>. Add it, or drop the requirement")
+	}
+
+	// Promotion needs a sandbox this run is responsible for. Promoting one
+	// somebody else created would freeze and scrub a world in use elsewhere,
+	// which is the opposite of a flag on the run's own lifecycle.
+	if *promoteOnSuccess && *environment == "" {
+		return errors.New(
+			"--promote-on-success keeps the world of the sandbox this run deploys, " +
+				"and only --environment deploys one. Add --environment <id>, or " +
+				"promote a sandbox you already have with " +
+				"`veris-proxy promote --sandbox <id>`")
 	}
 
 	// The container receives one routing target. An inherited VERIS_SANDBOX_ID
@@ -221,28 +239,29 @@ func cmdRun(args []string) error {
 			// Precedence has to hold here too: an explicit --config must not
 			// lose to a VERIS_SANDBOX_ID left in the environment, which would
 			// silently route the run at a different sandbox.
-			Sandbox:         sandboxOrEnvironment(sources, *environment),
-			APIBase:         firstNonEmpty(sources.APIBase, os.Getenv("VERIS_API_BASE")),
-			APIKey:          firstNonEmpty(sources.APIKey, os.Getenv("VERIS_API_KEY")),
-			Config:          sources.File,
-			Volumes:         volumes,
-			EnvVars:         envVars,
-			Workdir:         *workdir,
-			Argv:            argv,
-			Requirements:    reqs,
-			Quiet:           *quiet,
-			KeepProxy:       *keepProxy,
-			Expose:          *expose,
-			ExposeHost:      *exposeHost,
-			TunnelToken:     firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
-			TunnelHostname:  *exposeHostname,
-			Environment:     *environment,
-			TTLMinutes:      *ttlMinutes,
-			CallbackReqs:    callbackReqs,
-			PatchBundledCAs: *patchBundledCAs,
-			ProxyUID:        *proxyUID,
-			Strict:          *strict,
-			LogLevel:        *logLevel,
+			Sandbox:          sandboxOrEnvironment(sources, *environment),
+			APIBase:          firstNonEmpty(sources.APIBase, os.Getenv("VERIS_API_BASE")),
+			APIKey:           firstNonEmpty(sources.APIKey, os.Getenv("VERIS_API_KEY")),
+			Config:           sources.File,
+			Volumes:          volumes,
+			EnvVars:          envVars,
+			Workdir:          *workdir,
+			Argv:             argv,
+			Requirements:     reqs,
+			Quiet:            *quiet,
+			KeepProxy:        *keepProxy,
+			Expose:           *expose,
+			ExposeHost:       *exposeHost,
+			TunnelToken:      firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
+			TunnelHostname:   *exposeHostname,
+			Environment:      *environment,
+			TTLMinutes:       *ttlMinutes,
+			PromoteOnSuccess: *promoteOnSuccess,
+			CallbackReqs:     callbackReqs,
+			PatchBundledCAs:  *patchBundledCAs,
+			ProxyUID:         *proxyUID,
+			Strict:           *strict,
+			LogLevel:         *logLevel,
 		})
 	}
 

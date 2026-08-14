@@ -58,6 +58,12 @@ type dockerRun struct {
 	TTLMinutes     int
 	CallbackReqs   []requirement
 
+	// PromoteOnSuccess keeps the world this run built: on a clean verdict the
+	// sandbox becomes the environment's default before teardown deletes it.
+	// Host-side on purpose -- the workload's exit status is knowable only
+	// here, and "success" is the whole condition.
+	PromoteOnSuccess bool
+
 	// PatchBundledCAs (experimental) over-mounts known SDK-bundled CA files
 	// with copies that also carry the Veris CA. See bundledca.go.
 	PatchBundledCAs bool
@@ -251,6 +257,16 @@ func runContainerised(spec dockerRun) error {
 	}
 	if fatal {
 		return exitCode(exitRequirementUnmet)
+	}
+
+	// The verdict is clean, and the sandbox still exists: teardown is deferred
+	// and runs after this. That ordering is the whole reason promotion can be
+	// a flag on the run at all -- a moment later the world it captures is
+	// gone.
+	if spec.PromoteOnSuccess {
+		promoteAfterRun(spec, envSandboxID, receipt)
+	} else {
+		adviseUnpromotedEnvironment(spec, receipt)
 	}
 	return nil
 }

@@ -81,6 +81,27 @@ See `container/README.md` for the two docker commands this is doing for you,
 for running the proxy against an image you cannot restart, and for adding it to
 an image you already have.
 
+### Preflight: assert the run is possible before starting one
+
+```sh
+veris-proxy preflight --environment env_abc123 --image your-image
+```
+
+One command, about a second, exit 2 if anything is missing: the API key, the
+control plane, docker's daemon, the environment, and — when named — the test
+image. Each failure prints the fix for that one thing.
+
+It suggests nothing else. That is deliberate: the failure mode this closes is
+not a missing precondition, it is what happens next. A run that hits a missing
+credential mid-flight gets routed around — a hand-written config file, a
+tunnel, a base URL edited into the code under test — and every green earned
+that way tests a code path that does not ship.
+
+It also reports one thing that is not a precondition: whether the environment
+has a promoted world. Without one, every sandbox boots the stock profile, so
+whatever accounts, connections and fixtures the tests need are rebuilt on every
+run, and nothing otherwise says so.
+
 ### Receiving webhooks
 
 The proxy routes your code OUT to the sandbox. A webhook comes back IN, and a
@@ -150,6 +171,39 @@ when it replaces someone else's URL.
 
 The URL is a capability, in either mode: anyone holding it can POST to your app.
 
+### Keeping the world a run built
+
+A run that seeds accounts, completes an OAuth grant or drives a half-finished
+checkout has built something every later run needs. Promotion makes that
+sandbox's state the environment's default, so the next sandbox starts from it
+instead of rebuilding it:
+
+```sh
+veris-proxy run --environment env_abc123 --image your-image --promote-on-success -- pytest -q
+```
+
+Only on a clean verdict — the command exited 0, every `--require-*` held, and
+the receipt is non-empty. A world nothing reached, or one a failing suite left
+behind, must not become every future run's starting point.
+
+For a long session, where the world is worth keeping but the run ends by being
+interrupted, promote explicitly with the sandbox id the run logged:
+
+```sh
+veris-proxy promote --sandbox sbx_abc123
+```
+
+Either way it is the LAST thing done with that sandbox. The capture is a
+boundary, not a snapshot: the sandbox stops answering vendor requests, its
+clock is frozen at the promote instant, and run-scoped state (deliveries,
+request logs, the callback binding) is scrubbed so the baseline carries the
+world and not the session that built it. Mid-suite it would destroy the world
+the suite is using. `reset_environment` clears the pin.
+
+Callback destinations that were not this run's own receiver are dropped unless
+`--keep-external-destinations` says otherwise — baking a third party's URL into
+a baseline points every future sandbox at them.
+
 ### Non-HTTP services: handed over, not proxied
 
 A sandbox can hold services that are not HTTP — a Postgres service's `url` is
@@ -184,8 +238,10 @@ veris-proxy run --sandbox sbx_abc123 -- pytest -q
 
 | Command | Purpose |
 |---|---|
+| `preflight` | Assert every precondition a run has, and report whether the environment has a promoted world. Exit 2 if one is missing. |
 | `serve` | Run the proxy. This is what the container image runs. |
 | `run` | Fallback: run a LOCAL command with proxy env vars, and report what it sent. |
+| `promote` | Make a sandbox's state the environment's default world. Do it last: the sandbox is left frozen and scrubbed. |
 | `check` | Assert a live proxy belongs to THIS run. Exit 2 if not. |
 
 `serve --write-env FILE` and `serve --ready-file FILE` are how a supervisor
@@ -200,6 +256,8 @@ command computing it from config could not.
 
 `run` exits with the command's own status, or 3 if a `--require-service` /
 `--require-host` assertion went unmet, or 4 if the outcome is indeterminate.
+`preflight` and `check` share exit 2: this binary asserted something about the
+world and it did not hold.
 
 `run`, `serve` and `env` all take the same routing flags, most explicit first:
 `--config <file>` · `--sandbox <id>` · `$VERIS_PROXY_CONFIG` ·

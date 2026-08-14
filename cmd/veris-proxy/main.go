@@ -33,9 +33,11 @@ var version = "dev"
 const usage = `veris-proxy - route code under test at a Veris dependency sandbox
 
 Usage:
-  veris-proxy serve   [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]
-  veris-proxy run     [--sandbox <id>] [--image <image>] [--require-service <n>] -- <cmd>
-  veris-proxy check   [--expect-canary <token>] [--any-run] [--proxy <url>]
+  veris-proxy preflight [--environment <id>] [--image <image>]
+  veris-proxy serve     [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]
+  veris-proxy run       [--environment <id>] [--image <image>] [--require-service <n>] -- <cmd>
+  veris-proxy promote   --sandbox <id> [--environment <id>]
+  veris-proxy check     [--expect-canary <token>] [--any-run] [--proxy <url>]
   veris-proxy version
 
 What to route (run and serve both accept these, most explicit first):
@@ -49,6 +51,13 @@ What to route (run and serve both accept these, most explicit first):
                                       for this run (repeatable)
 
 Commands:
+  preflight
+          Assert every precondition a run has -- credential, control plane,
+          docker, the environment, optionally the test image -- and exit 2 if
+          one is missing. Cheap enough to run before every run, and it also
+          reports whether the environment has a promoted world, which is the
+          only way to learn that a run is rebuilding state somebody already
+          built.
   serve   Run the proxy. This is what the container image runs, and what a
           long-lived local session runs. Add --transparent for the kernel
           redirect, which is the only tier that covers every runtime.
@@ -60,6 +69,12 @@ Commands:
           environment variables set, which covers only libraries that honour
           them; it builds the JVM truststore itself when a JDK is present.
 
+  promote Make a sandbox's current state the environment's default world, so
+          every later sandbox starts from it instead of the boot profile.
+          The capture is a boundary: that sandbox is left frozen and
+          scrubbed, so promote LAST, when the run is finished with it.
+          "run --promote-on-success" is the same move for a one-shot run.
+
   check   Assert that a live proxy belongs to THIS run, and exit 2 if not.
           A proxy left running from an earlier run against a different
           sandbox would otherwise let a suite pass against the wrong data.
@@ -67,7 +82,8 @@ Commands:
 Exit codes:
   0  success
   1  usage or configuration error
-  2  check failed: no proxy, not ours, or a different run
+  2  an assertion failed: preflight found a missing precondition, or check
+     found no proxy, not ours, or a different run
   3  the run did not call a service it was required to call
   4  the run's outcome is indeterminate
   n  otherwise, whatever the command under "run" exited with
@@ -102,6 +118,10 @@ func run(args []string) error {
 		return cmdRun(args[1:])
 	case "serve":
 		return cmdServe(args[1:])
+	case "preflight":
+		return cmdPreflight(args[1:])
+	case "promote":
+		return cmdPromote(args[1:])
 	case "check":
 		return cmdCheck(args[1:])
 	case "version", "--version", "-v":
