@@ -109,6 +109,21 @@ func cmdRun(args []string) error {
 		envVars = append(envVars, v)
 		return nil
 	})
+	var capAdd []string
+	fs.Func("cap-add",
+		"Linux `capability` to hand back to your container, repeatable (with "+
+			"--image). The workload runs with every capability dropped; an "+
+			"entrypoint that switches users (su, gosu, service) needs SETUID and "+
+			"SETGID, or build the image to run as that USER. ALL and SYS_ADMIN "+
+			"are refused",
+		func(v string) error {
+			c, err := parseCapability(v)
+			if err != nil {
+				return err
+			}
+			capAdd = append(capAdd, c)
+			return nil
+		})
 
 	var reqs []requirement
 	fs.Func("require-service", "fail unless this service was called (name[:count])", func(v string) error {
@@ -128,7 +143,7 @@ func cmdRun(args []string) error {
 		return nil
 	})
 
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	// An empty argv is only a mistake WITHOUT --image. With one, it is the
@@ -166,6 +181,10 @@ func cmdRun(args []string) error {
 			{"--patch-bundled-cas", *patchBundledCAs,
 				"the reason is the image's filesystem, not the callback path: it " +
 					"patches CA files inside a container image"},
+			{"--cap-add", len(capAdd) > 0,
+				"capabilities belong to a container, and without --image the " +
+					"command runs as a local child process with whatever it " +
+					"inherits"},
 		}
 		for _, f := range imageOnly {
 			if f.set {
@@ -227,6 +246,7 @@ func cmdRun(args []string) error {
 			Config:          sources.File,
 			Volumes:         volumes,
 			EnvVars:         envVars,
+			CapAdd:          capAdd,
 			Workdir:         *workdir,
 			Argv:            argv,
 			Requirements:    reqs,
@@ -243,6 +263,7 @@ func cmdRun(args []string) error {
 			ProxyUID:        *proxyUID,
 			Strict:          *strict,
 			LogLevel:        *logLevel,
+			LogFormat:       *logFormat,
 		})
 	}
 

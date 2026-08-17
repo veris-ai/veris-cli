@@ -41,6 +41,12 @@ docker run --rm --network container:veris-proxy --cap-drop=ALL \
   your-image pytest -q
 ```
 
+`--cap-drop=ALL` in step 2 is the same hardened default `veris-proxy run
+--image` uses. An entrypoint that switches users (`su`, `gosu`, `service`)
+needs `--cap-add=SETUID --cap-add=SETGID` after it — `run --image` takes the
+same as `--cap-add SETUID --cap-add SETGID` — or build the image to run as
+that `USER` and drop the switch.
+
 No command after the image in step 1: that is what selects this mode. The
 entrypoint resolves the sandbox, installs the redirect, drops to an
 unprivileged uid, and leaves two files in the mounted directory —
