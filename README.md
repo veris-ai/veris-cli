@@ -16,15 +16,36 @@ faithful.
 
 ## Install
 
+The repo is private, so every form below needs repo access: `gh auth login`
+(or `GH_TOKEN` exported) first.
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.sh | sh
+gh api -H 'Accept: application/vnd.github.raw+json' repos/veris-ai/veris-proxy/contents/scripts/install.sh | sh
 ```
 
-Fetches the latest released static binary for this OS/arch into
+Fetches the installer through the authenticated `gh`; the installer then
+downloads the latest released static binary for this OS/arch into
 `~/.local/bin` (override with `VERIS_INSTALL_DIR`; pin with
-`VERIS_PROXY_VERSION`). No root and no package manager, so the same line
-works on a laptop, a CI runner, and inside a container build. Windows:
-download the `.exe` from the releases page.
+`VERIS_PROXY_VERSION`). No root and no package manager, so it works the same
+on a laptop, a CI runner, and inside a container build. Where `gh` is absent
+(a container build, a minimal CI image), the installer downloads with
+`GH_TOKEN`/`GITHUB_TOKEN` through the REST API instead, and the same token
+fetches the script:
+
+```sh
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/veris-ai/veris-proxy/contents/scripts/install.sh | sh
+```
+
+Without the installer, one `gh` call does the same job:
+
+```sh
+gh release download --repo veris-ai/veris-proxy --pattern "veris-proxy-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" -O ~/.local/bin/veris-proxy --clobber && chmod +x ~/.local/bin/veris-proxy
+```
+
+Windows: download the `.exe` from the releases page. The unauthenticated
+`curl -fsSL .../scripts/install.sh | sh` one-liner returns once the repo (or
+its releases) is public; until then an unauthenticated run of the installer
+stops on the 404 with a one-line pointer to `gh auth login` / `GH_TOKEN`.
 
 ## Quick start
 
