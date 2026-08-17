@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +47,11 @@ type dockerRun struct {
 	Workdir    string
 	Argv       []string
 
+	// CapAdd is handed back to the workload container after --cap-drop=ALL,
+	// one --cap-add per entry, already validated by parseCapability. Never
+	// applied to the proxy container, whose capabilities are its own.
+	CapAdd []string
+
 	Requirements []requirement
 
 	// The callback direction. Ingress runs in the proxy container, where
@@ -67,6 +74,7 @@ type dockerRun struct {
 	KeepProxy bool
 	Strict    bool
 	LogLevel  string
+	LogFormat string
 }
 
 func runContainerised(spec dockerRun) error {
@@ -188,11 +196,19 @@ func runContainerised(spec dockerRun) error {
 	if err != nil {
 		return err
 	}
+	// Which sandbox the run is routed at, read back from the proxy rather
+	// than assumed: with --environment it was deployed inside the container
+	// and this is the only place the host can learn it. In attach mode the
+	// answer is the --sandbox that was passed, which stands in if the read
+	// failed.
+	routed := fetchSandboxID(statusURL)
 	if spec.Environment != "" {
-		envSandboxID = fetchSandboxID(statusURL)
+		envSandboxID = routed
 	}
 	if !spec.Quiet {
 		fmt.Fprintf(os.Stderr, "veris-proxy: interception live in %s\n", name)
+		announceSandbox(os.Stderr, newLogger(spec.LogLevel, spec.LogFormat),
+			firstNonEmpty(routed, spec.Sandbox))
 	}
 
 	// After readiness on purpose: the scan's patched copies append the CA the
@@ -301,6 +317,50 @@ func fetchSandboxID(statusURL string) string {
 	return state.SandboxID
 }
 
+// announceSandbox prints the line the integration-testing skill documents --
+// `sandbox ready sandbox_id=<id>` -- so a mid-run seed or a diagnosis can
+// address the sandbox this run is using. Until now only serve's own log said
+// it, inside the container, where nothing on the host reads it. An unknown id
+// is not announced as one: it is said at info level, and only there, so the
+// default output never carries a claim the status endpoint did not make.
+func announceSandbox(w io.Writer, log *slog.Logger, sandboxID string) {
+	if sandboxID == "" {
+		log.Info("sandbox id unknown (status endpoint did not report one)")
+		return
+	}
+	fmt.Fprintf(w, "veris-proxy: sandbox ready sandbox_id=%s\n", sandboxID)
+}
+
+// capabilityName is the shape of a Linux capability as docker names it:
+// upper-case, with or without the CAP_ prefix.
+var capabilityName = regexp.MustCompile(`^(CAP_)?[A-Z][A-Z0-9_]*$`)
+
+// parseCapability validates one --cap-add value. The workload runs with every
+// capability dropped, and this hands back exactly the named one; the two that
+// would hand back the isolation itself are refused with the reason.
+func parseCapability(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	if !capabilityName.MatchString(v) {
+		return "", fmt.Errorf(
+			"--cap-add %q: not a Linux capability name; they are upper-case, "+
+				"like SETUID or CAP_SETUID", raw)
+	}
+	switch strings.TrimPrefix(v, "CAP_") {
+	case "ALL":
+		return "", errors.New(
+			"--cap-add ALL hands the workload every capability, which defeats " +
+				"the isolation the container tier promises; name the ones the " +
+				"image needs (SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER, ...)")
+	case "SYS_ADMIN":
+		return "", errors.New(
+			"--cap-add SYS_ADMIN is root in all but name (mounts, namespaces and " +
+				"most of what --privileged grants), which defeats the isolation " +
+				"the container tier promises; name the specific capability the " +
+				"image needs instead")
+	}
+	return v, nil
+}
+
 // deleteDeployedSandbox is the host-side half of --environment teardown.
 func deleteDeployedSandbox(spec dockerRun, sandboxID string) {
 	if spec.Environment == "" || sandboxID == "" {
@@ -360,6 +420,21 @@ func refuseExemptWorkloadUID(image string, uid int) error {
 }
 
 func startProxyContainer(spec dockerRun, name, network, share string) error {
+	args, err := proxyContainerArgs(spec, name, network, share)
+	if err != nil {
+		return err
+	}
+	if err := dockerQuiet(args...); err != nil {
+		return fmt.Errorf("start the proxy container (is %s present? try docker pull): %w",
+			spec.ProxyImage, err)
+	}
+	return nil
+}
+
+// proxyContainerArgs is the `docker run` for the proxy's own container.
+// NET_ADMIN is the one capability it holds, for the redirect; the workload's
+// --cap-add never reaches here.
+func proxyContainerArgs(spec dockerRun, name, network, share string) ([]string, error) {
 	args := []string{
 		"run", "-d", "--name", name, "--network", network,
 		"--cap-add=NET_ADMIN",
@@ -375,7 +450,7 @@ func startProxyContainer(spec dockerRun, name, network, share string) error {
 	case spec.Config != "":
 		abs, err := filepath.Abs(spec.Config)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		args = append(args, "-v", abs+":/veris-share/config.json:ro",
 			"-e", "VERIS_CONFIG=/veris-share/config.json")
@@ -417,12 +492,7 @@ func startProxyContainer(spec dockerRun, name, network, share string) error {
 	// No command after the image: that is what selects the mode where this
 	// container only intercepts and the workload lives in its own.
 	args = append(args, spec.ProxyImage)
-
-	if err := dockerQuiet(args...); err != nil {
-		return fmt.Errorf("start the proxy container (is %s present? try docker pull): %w",
-			spec.ProxyImage, err)
-	}
-	return nil
+	return args, nil
 }
 
 // waitForReady blocks on the marker the proxy writes once every listener is
@@ -448,16 +518,42 @@ func waitForReady(share, name string, budget time.Duration) error {
 func runWorkload(spec dockerRun, proxyName, name, share string,
 	overlays []bundlescan.Overlay,
 ) (int, error) {
+	args := workloadArgs(spec, proxyName, name, share, overlays, isTerminal(os.Stdin))
+	cmd := exec.Command("docker", args...) //nolint:gosec // argv built above
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode(), nil
+		}
+		return 0, fmt.Errorf("run %s: %w", spec.Image, err)
+	}
+	return 0, nil
+}
+
+// workloadArgs is the `docker run` for the image under test.
+func workloadArgs(spec dockerRun, proxyName, name, share string,
+	overlays []bundlescan.Overlay, interactive bool,
+) []string {
 	args := []string{
 		"run", "--rm", "--name", name,
 		// The load-bearing flag: one network namespace, so the proxy's
 		// iptables rules apply to this container's sockets too.
 		"--network", "container:" + proxyName,
+		// Hardened by default: the workload holds no capability at all. An
+		// entrypoint that switches users (su, gosu, service) needs SETUID and
+		// SETGID back, and --cap-add hands back exactly what it names, after
+		// the drop so the order docker applies them is the order written.
 		"--cap-drop=ALL",
-		"--env-file", filepath.Join(share, "veris.env"),
-		"-v", share + ":/veris-share",
 	}
-	if isTerminal(os.Stdin) {
+	for _, c := range spec.CapAdd {
+		args = append(args, "--cap-add="+c)
+	}
+	args = append(args,
+		"--env-file", filepath.Join(share, "veris.env"),
+		"-v", share+":/veris-share",
+	)
+	if interactive {
 		args = append(args, "-i")
 	}
 	// Read-only: the workload has no business editing its own trust roots.
@@ -501,18 +597,7 @@ func runWorkload(spec dockerRun, proxyName, name, share string,
 	args = append(args, spec.Image)
 	// Nothing appended when the caller named no command, so the image's own
 	// ENTRYPOINT and CMD run untouched.
-	args = append(args, spec.Argv...)
-
-	cmd := exec.Command("docker", args...) //nolint:gosec // argv built above
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ExitCode(), nil
-		}
-		return 0, fmt.Errorf("run %s: %w", spec.Image, err)
-	}
-	return 0, nil
+	return append(args, spec.Argv...)
 }
 
 // proxyStatusURL reads back the loopback port docker chose for the proxy's

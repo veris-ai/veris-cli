@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +43,11 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "fail":
 		os.Exit(7)
+	case "cli":
+		// The binary as a script sees it: the dispatcher on the argv handed
+		// over in the environment, exiting exactly the way main does. The
+		// test flags in os.Args are why the argv travels separately.
+		os.Exit(exitStatus(run(strings.Fields(os.Getenv("VERIS_TEST_CLI_ARGS")))))
 	case "stubborn":
 		// Traps SIGTERM and keeps running, which is what a shell script with a
 		// cleanup handler or a JVM with a shutdown hook can look like.
@@ -100,6 +106,27 @@ func child(t *testing.T, role string) []string {
 	t.Helper()
 	t.Setenv(childMarker, role)
 	return []string{os.Args[0], "-test.run=TestMain"}
+}
+
+// cli runs `veris-proxy args...` as a separate process and reports what a
+// script would see: the two streams apart, and the exit code.
+func cli(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	argv := child(t, "cli")
+	t.Setenv("VERIS_TEST_CLI_ARGS", strings.Join(args, " "))
+	cmd := exec.Command(argv[0], argv[1:]...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err := cmd.Run()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+	case errors.As(err, &ee):
+		code = ee.ExitCode()
+	default:
+		t.Fatalf("run %v: %v", args, err)
+	}
+	return out.String(), errOut.String(), code
 }
 
 func TestRunInterceptsTheChildsRequests(t *testing.T) {
@@ -179,6 +206,74 @@ func TestRunNeedsACommand(t *testing.T) {
 	cfg := writeConfig(t, sandbox(t))
 	if err := cmdRun([]string{"--config", cfg}); err == nil {
 		t.Fatal("run with no command should be a usage error")
+	}
+}
+
+// `veris-proxy run --help 2>&1` exited 1 with the usage followed by
+// "veris-proxy: flag: help requested": flag.ContinueOnError reports -h the
+// same way it reports a bad flag, and main treated both as a failure. Help that
+// was asked for is the answer -- on stdout, exit 0 -- on every subcommand; a
+// genuine flag error keeps usage on stderr and a non-zero exit.
+func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
+	for _, argv := range [][]string{
+		{"run", "--help"}, {"run", "-h"}, {"serve", "--help"}, {"check", "-h"},
+	} {
+		stdout, stderr, code := cli(t, argv...)
+		if code != 0 {
+			t.Errorf("%v exited %d, want 0 (stderr: %q)", argv, code, stderr)
+		}
+		if !strings.Contains(stdout, "Usage of "+argv[0]+":") {
+			t.Errorf("%v: usage should be on stdout, got %q", argv, stdout)
+		}
+		if stderr != "" {
+			t.Errorf("%v: nothing belongs on stderr for help that was asked for, got %q", argv, stderr)
+		}
+	}
+
+	stdout, stderr, code := cli(t, "run", "--no-such-flag")
+	if code != 1 {
+		t.Errorf("a bad flag exited %d, want 1", code)
+	}
+	if stdout != "" {
+		t.Errorf("a bad flag must put nothing on stdout, got %q", stdout)
+	}
+	for _, want := range []string{"flag provided but not defined: -no-such-flag", "Usage of run:"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("a bad flag should report %q on stderr, got %q", want, stderr)
+		}
+	}
+	// The top-level help was already right and stays so.
+	if stdout, _, code := cli(t, "--help"); code != 0 || !strings.Contains(stdout, "Usage:") {
+		t.Errorf("top-level --help: exit %d, stdout %q", code, stdout)
+	}
+}
+
+// --cap-add is a container property, so it needs --image; and it hands back
+// named capabilities, never the isolation itself. Both refusals happen before
+// anything reaches docker.
+func TestCapAddNeedsAnImageAndRefusesTheIsolationDefeaters(t *testing.T) {
+	isolateHome(t)
+	cfg := writeConfig(t, sandbox(t))
+
+	err := cmdRun([]string{"--config", cfg, "--cap-add", "SETUID", "--", "true"})
+	if err == nil || !strings.Contains(err.Error(), "--cap-add needs --image") {
+		t.Errorf("--cap-add without --image should be refused as image-only, got: %v", err)
+	}
+	for _, c := range []string{"ALL", "CAP_SYS_ADMIN", "setuid"} {
+		err := cmdRun([]string{"--config", cfg, "--image", "veris-nonexistent:probe", "--cap-add", c})
+		if err == nil || !strings.Contains(err.Error(), "-cap-add") {
+			t.Errorf("--cap-add %s should be refused at parse time, got: %v", c, err)
+		}
+	}
+	// A legitimate one gets past the flag and the image-only check, proved
+	// the way TestAnImageMayRunWithNoCommandOfItsOwn proves it: the next
+	// refusal in line is the incompatible --listen, not anything about caps.
+	err = cmdRun([]string{
+		"--config", cfg, "--image", "veris-nonexistent:probe",
+		"--cap-add", "SETUID", "--cap-add", "SETGID", "--listen", ":0",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--listen") {
+		t.Errorf("SETUID/SETGID should be accepted; expected the --listen refusal, got: %v", err)
 	}
 }
 

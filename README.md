@@ -57,10 +57,16 @@ on the proxy container, which we build.
 
 ```
 veris-proxy: interception live in veris-proxy-35681
+veris-proxy: sandbox ready sandbox_id=sbx_9f2c1e
    7 customers, first: gus.thornton@example.com
 veris-proxy: the sandbox received 1 request(s):
   stripe                       1
 ```
+
+The `sandbox ready` line names the sandbox this run is routed at — the one
+`--environment` just deployed, or the `--sandbox` you passed — so something
+seeding state mid-run, or you diagnosing one, can address it. Your container
+sees the same id as `VERIS_SANDBOX_ID`.
 
 An `--environment` run that sent the sandbox nothing exits 3 on its own —
 deploying a sandbox for a suite that never called it is a failure, not a
@@ -69,6 +75,16 @@ assertions and takes over the verdict entirely. Attaching with `--sandbox`
 asserts nothing by default: the receipt is still printed, so a run that sent
 nothing says so, but the exit code stays your command's. `-v`, `-e` and
 `-w` pass through to your container.
+
+Your container runs with **every Linux capability dropped**. That is the
+hardened default and it stays; what it costs is any entrypoint that switches
+users — `su`, `gosu`, `service` — which fails with `cannot set groups:
+Operation not permitted`. `--cap-add SETUID --cap-add SETGID` hands back
+exactly the named capabilities and nothing else (`CHOWN`, `DAC_OVERRIDE`,
+`FOWNER`, `NET_BIND_SERVICE` and the rest of the ordinary set are accepted;
+`ALL` and `SYS_ADMIN` are refused, since they hand back the isolation itself).
+Or skip the switch: build the image to run as the target `USER` and it needs
+nothing. The proxy container's own capabilities are unaffected either way.
 
 The proxy's own image comes from a repository holding that image and nothing
 else, so pulling it grants nothing else; `--proxy-image` overrides it.
@@ -343,7 +359,9 @@ whether you control the image:
   our container rather than yours: it is root, it has iptables, it drops
   itself. Yours needs no capability, no iptables, no entrypoint change and no
   particular base image, so distroless and scratch work. It does not matter how
-  you built it.
+  you built it. `run --image` starts it with `--cap-drop=ALL`; `--cap-add`
+  hands back exactly the capabilities you name, for an entrypoint that has to
+  switch users.
 - **One container, proxy inside.** Simpler to operate, and the trade is that
   those requirements move onto your image, which must also start as root.
   Missing any of them the entrypoint refuses rather than silently degrading.

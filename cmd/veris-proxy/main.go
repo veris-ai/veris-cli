@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,7 +35,7 @@ const usage = `veris-proxy - route code under test at a Veris dependency sandbox
 
 Usage:
   veris-proxy serve   [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]
-  veris-proxy run     [--sandbox <id>] [--image <image>] [--require-service <n>] -- <cmd>
+  veris-proxy run     [--sandbox <id>] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>
   veris-proxy check   [--expect-canary <token>] [--any-run] [--proxy <url>]
   veris-proxy version
 
@@ -55,7 +56,11 @@ Commands:
   run     Run a command against a sandbox and report what it sent.
           --image runs it in a container, with the proxy in its own container
           beside it -- the image needs no capability, no iptables and no
-          change, and no docker commands are yours to write.
+          change, and no docker commands are yours to write. That container
+          runs with every capability dropped; --cap-add <CAP> hands back
+          exactly the named ones (an entrypoint that switches users with
+          su/gosu/service needs SETUID and SETGID, or build the image to run
+          as that USER). Once live it prints "sandbox ready sandbox_id=<id>".
           Without --image the command runs LOCALLY with proxy and CA
           environment variables set, which covers only libraries that honour
           them; it builds the JVM truststore itself when a JDK is present.
@@ -74,21 +79,54 @@ Exit codes:
 `
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		// A command that ran and failed carries its own status out; printing
-		// anything here would talk over its output.
-		var code exitCode
-		if errors.As(err, &code) {
-			os.Exit(int(code))
-		}
-		var ce checkFailure
-		if errors.As(err, &ce) {
-			fmt.Fprintf(os.Stderr, "veris-proxy: %v\n", err)
-			os.Exit(2)
-		}
-		fmt.Fprintf(os.Stderr, "veris-proxy: %v\n", err)
-		os.Exit(1)
+	os.Exit(exitStatus(run(os.Args[1:])))
+}
+
+// exitStatus maps what run returned to the process exit code -- the table in
+// the usage text -- and prints the message where one is owed. Split from main
+// so a test can hold it to that table.
+func exitStatus(err error) int {
+	if err == nil {
+		return 0
 	}
+	// Usage that was asked for is the answer, not a failure: parseFlags has
+	// already printed it to stdout, and a script probing `run --help` reads
+	// the exit code.
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	// A command that ran and failed carries its own status out; printing
+	// anything here would talk over its output.
+	var code exitCode
+	if errors.As(err, &code) {
+		return int(code)
+	}
+	fmt.Fprintf(os.Stderr, "veris-proxy: %v\n", err)
+	var ce checkFailure
+	if errors.As(err, &ce) {
+		return 2
+	}
+	return 1
+}
+
+// parseFlags is fs.Parse with --help treated as a request rather than an
+// error. flag.ContinueOnError reports both -h and a bad flag the same way --
+// usage on fs.Output(), which is stderr, and a non-nil error -- so `run --help`
+// exited 1 with "flag: help requested" appended. Usage that was asked for goes
+// to stdout and returns flag.ErrHelp for exitStatus to map to 0; a genuine flag
+// error keeps the flag package's own report, the error then usage on stderr,
+// and exits 1 as before.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	var out bytes.Buffer
+	fs.SetOutput(&out)
+	err := fs.Parse(args)
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		_, _ = os.Stdout.Write(out.Bytes())
+	case err != nil:
+		_, _ = os.Stderr.Write(out.Bytes())
+	}
+	return err
 }
 
 func run(args []string) error {
@@ -177,7 +215,7 @@ func cmdServe(args []string) error {
 		"emit only the CA variables, for a tier where the kernel already does the routing")
 	envFormat := fs.String("env-format", "posix",
 		"posix (sourceable exports) or docker (for `docker run --env-file`)")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	log := newLogger(*logLevel, *logFormat)
@@ -506,7 +544,7 @@ func cmdCheck(args []string) error {
 		"accept any live Veris proxy, without checking which run it belongs to")
 	timeout := fs.Duration("timeout", 5*time.Second, "probe timeout")
 	quiet := fs.Bool("quiet", false, "print nothing on success")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 
