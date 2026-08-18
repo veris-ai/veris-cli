@@ -214,8 +214,9 @@ func runContainerised(spec dockerRun) error {
 	// After readiness on purpose: the scan's patched copies append the CA the
 	// proxy container publishes into the share, which exists only now.
 	var overlays []bundlescan.Overlay
+	var unknownBundles []string
 	if spec.PatchBundledCAs {
-		if overlays, err = bundledCAOverlays(spec, share, name); err != nil {
+		if overlays, unknownBundles, err = bundledCAOverlays(spec, share, name); err != nil {
 			return err
 		}
 	}
@@ -261,7 +262,11 @@ func runContainerised(spec dockerRun) error {
 		}
 		unmet = append(unmet, unmetCallbacks(spec.CallbackReqs, inbound)...)
 	}
-	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt)
+	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt, trustAdvice{
+		ContainerTier:  true,
+		PatchEnabled:   spec.PatchBundledCAs,
+		UnknownBundles: unknownBundles,
+	})
 	if status != 0 {
 		return exitCode(status)
 	}

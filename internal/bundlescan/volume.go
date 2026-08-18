@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -79,12 +80,12 @@ var maxWalkFiles = 50000
 // mount shadows whatever the image holds under the same destination, so the
 // copy found here is the one the SDK will actually read. A directory source
 // is walked; a regular-file source is judged by its destination alone.
-func ScanVolume(m Mount) ([]Candidate, error) {
+func ScanVolume(m Mount) ([]Candidate, []string, error) {
 	if m.HostFile {
 		return scanFileMount(m)
 	}
 	if !m.HostDir {
-		return nil, nil
+		return nil, nil, nil
 	}
 	root := m.resolvedSource
 	if root == "" {
@@ -92,9 +93,9 @@ func ScanVolume(m Mount) ([]Candidate, error) {
 	}
 	w := &volumeWalk{m: m, root: root, chain: map[string]bool{root: true}}
 	if err := w.walk(root, ""); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return w.out, nil
+	return w.out, w.unknown, nil
 }
 
 // scanFileMount handles a host FILE bound directly at a known bundle path:
@@ -102,28 +103,35 @@ func ScanVolume(m Mount) ([]Candidate, error) {
 // SDK will read there. A lookalike that fails validation refuses rather than
 // skips -- silently ignoring the mount would leave the effective bundle
 // unpatched with everything looking healthy.
-func scanFileMount(m Mount) ([]Candidate, error) {
-	rl, ok := matchRule(strings.TrimPrefix(m.Dest, "/"))
-	if !ok {
-		return nil, nil
-	}
+func scanFileMount(m Mount) ([]Candidate, []string, error) {
 	src := m.resolvedSource
 	if src == "" {
 		src = m.Source
 	}
+	rl, ok := matchRule(strings.TrimPrefix(m.Dest, "/"))
+	if !ok {
+		// Not a known bundle path -- but a bundle-shaped file bound anywhere
+		// is a candidate worth naming when trust later fails. Best-effort.
+		if candidateBasename(m.Dest) {
+			if content, err := readBounded(src); err == nil && validate(content) == nil {
+				return nil, []string{m.Dest}, nil
+			}
+		}
+		return nil, nil, nil
+	}
 	content, err := readBounded(src)
 	if err != nil {
-		return nil, fmt.Errorf("%s bundle at %s (-v %s): %w", rl.SDK, m.Dest, m.Raw, err)
+		return nil, nil, fmt.Errorf("%s bundle at %s (-v %s): %w", rl.SDK, m.Dest, m.Raw, err)
 	}
 	if err := validate(content); err != nil {
-		return nil, fmt.Errorf("%s bundle at %s (-v %s): %v", rl.SDK, m.Dest, m.Raw, err)
+		return nil, nil, fmt.Errorf("%s bundle at %s (-v %s): %v", rl.SDK, m.Dest, m.Raw, err)
 	}
 	return []Candidate{{
 		SDK:           rl.SDK,
 		ContainerPath: m.Dest,
 		Content:       content,
 		mountDest:     m.Dest,
-	}}, nil
+	}}, nil, nil
 }
 
 // volumeWalk carries one mount's walk state. The file budget spans every
@@ -138,6 +146,9 @@ type volumeWalk struct {
 	files int
 	chain map[string]bool // resolved directories the current recursion is inside
 	out   []Candidate
+	// unknown holds validated CA-bundle-shaped container paths the rule
+	// table does not know: report-only material for the trust diagnostics.
+	unknown []string
 }
 
 // walk scans one real directory. prefix is the mount-relative path this
@@ -187,6 +198,14 @@ func (w *volumeWalk) walk(dir, prefix string) error {
 		cpath := path.Join(w.m.Dest, rel)
 		rl, ok := matchRule(strings.TrimPrefix(cpath, "/"))
 		if !ok {
+			// Report-only channel: a bundle-shaped file the table does not
+			// know is named when trust later fails, never patched. Best-effort
+			// -- an unreadable or lookalike file is dropped, not fatal.
+			if candidateBasename(cpath) && len(w.unknown) < maxUnknownScanned {
+				if content, err := readBounded(p); err == nil && validate(content) == nil {
+					w.unknown = append(w.unknown, cpath)
+				}
+			}
 			return nil
 		}
 		content, err := readBounded(p)
@@ -257,34 +276,72 @@ func readBounded(p string) ([]byte, error) {
 // Collect is the whole discovery for one run: the image scan, a walk of each
 // -v bind, and the shadowing rules that decide which copy of a bundle the SDK
 // will actually read.
-func (s *Scanner) Collect(ctx context.Context, image string, volumes []string) ([]Candidate, error) {
+//
+// The second return is the unknown-candidate report: validated
+// CA-bundle-shaped paths the rule table does not know, from the image and the
+// mounts, deduped, capped at maxUnknownReported, with SDK-looking paths ahead
+// of system ones. Never patched -- printed by the trust diagnostics when a
+// client refuses the minted certificate anyway.
+func (s *Scanner) Collect(ctx context.Context, image string, volumes []string) ([]Candidate, []string, error) {
 	mounts := make([]Mount, 0, len(volumes))
 	for _, v := range volumes {
 		mounts = append(mounts, ParseVolume(v))
 	}
 
-	imageCands, err := s.ScanImage(ctx, image)
+	imageCands, unknown, err := s.ScanImage(ctx, image)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	all := imageCands
 	for _, m := range mounts {
-		volCands, err := ScanVolume(m)
+		volCands, volUnknown, err := ScanVolume(m)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		all = append(all, volCands...)
+		unknown = append(unknown, volUnknown...)
 	}
 	all, err = dropShadowed(all, mounts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	all = dedupeByPath(all)
 	if err := refuseExactMounts(all, mounts); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return all, nil
+	return all, capUnknown(unknown), nil
+}
+
+// capUnknown dedupes and orders the unknown-candidate report. SDK-looking
+// paths (site-packages, node_modules, vendored trees) sort ahead of system
+// trust stores under /etc or /usr/share: when an SDK refused the minted
+// certificate, its own vendored bundle is the likelier read.
+func capUnknown(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	var out []string
+	for _, p := range paths {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	system := func(p string) int {
+		if strings.HasPrefix(p, "/etc/") || strings.HasPrefix(p, "/usr/share/") {
+			return 1
+		}
+		return 0
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if a, b := system(out[i]), system(out[j]); a != b {
+			return a < b
+		}
+		return out[i] < out[j]
+	})
+	if len(out) > maxUnknownReported {
+		out = out[:maxUnknownReported]
+	}
+	return out
 }
 
 // dropShadowed keeps only the candidates whose bytes the container will

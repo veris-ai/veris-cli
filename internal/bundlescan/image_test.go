@@ -99,7 +99,7 @@ func TestScanExportTarExtractsMatchesInOnePass(t *testing.T) {
 		{name: "app/testdata/cacert.pem", typ: tar.TypeReg, body: ca}, // off-table
 		{name: "etc/hostname", typ: tar.TypeReg, body: []byte("box")},
 	})
-	matches, err := scanExportTar(bytes.NewReader(tarBytes))
+	matches, _, err := scanExportTar(bytes.NewReader(tarBytes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestScanExportTarResolvesLinksInsideTheArchive(t *testing.T) {
 		{name: "usr/lib/python3/dist-packages/httplib2/cacerts.txt",
 			typ: tar.TypeLink, link: "etc/ssl/certs/ca-certificates.crt"},
 	})
-	matches, err := scanExportTar(bytes.NewReader(tarBytes))
+	matches, _, err := scanExportTar(bytes.NewReader(tarBytes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestScanExportTarRejectsAnEscapingSymlink(t *testing.T) {
 	tarBytes := buildTar(t, []tarEntry{
 		{name: "pkg/certifi/cacert.pem", typ: tar.TypeSymlink, link: "../../../outside.pem"},
 	})
-	_, err := scanExportTar(bytes.NewReader(tarBytes))
+	_, _, err := scanExportTar(bytes.NewReader(tarBytes))
 	if err == nil || !strings.Contains(err.Error(), "outside the image root") {
 		t.Fatalf("an escaping symlink must be rejected, got %v", err)
 	}
@@ -158,7 +158,7 @@ func TestScanExportTarBoundsLinkHops(t *testing.T) {
 			link: fmt.Sprintf("/hop%d", i+1),
 		})
 	}
-	_, err := scanExportTar(bytes.NewReader(buildTar(t, entries)))
+	_, _, err := scanExportTar(bytes.NewReader(buildTar(t, entries)))
 	if err == nil || !strings.Contains(err.Error(), "link hops") {
 		t.Fatalf("a link chain past the hop limit must be rejected, got %v", err)
 	}
@@ -168,7 +168,7 @@ func TestScanExportTarRejectsAnOversizedBundle(t *testing.T) {
 	tarBytes := buildTar(t, []tarEntry{
 		{name: certifiPath, typ: tar.TypeReg, body: bytes.Repeat([]byte("A"), maxBundleSize+1)},
 	})
-	_, err := scanExportTar(bytes.NewReader(tarBytes))
+	_, _, err := scanExportTar(bytes.NewReader(tarBytes))
 	if err == nil || !strings.Contains(err.Error(), "larger than any CA bundle") {
 		t.Fatalf("an oversized match must be rejected, got %v", err)
 	}
@@ -179,7 +179,7 @@ func TestScanImageAbortsOnAMatchThatDoesNotValidate(t *testing.T) {
 		{name: certifiPath, typ: tar.TypeReg, body: []byte("not a bundle")},
 	})}
 	s := &Scanner{Docker: fake}
-	_, err := s.ScanImage(context.Background(), "img:latest")
+	_, _, err := s.ScanImage(context.Background(), "img:latest")
 	if err == nil || !strings.Contains(err.Error(), certifiPath) {
 		t.Fatalf("a known candidate that fails validation must abort naming the file, got %v", err)
 	}
@@ -196,11 +196,11 @@ func TestScanImageCachesMatchedPathsByImageID(t *testing.T) {
 	}
 	s := &Scanner{Docker: fake, CacheDir: t.TempDir()}
 
-	first, err := s.ScanImage(context.Background(), "img:latest")
+	first, _, err := s.ScanImage(context.Background(), "img:latest")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.ScanImage(context.Background(), "img:latest")
+	second, _, err := s.ScanImage(context.Background(), "img:latest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestScanImageCacheMissesWhenTheRuleTableChanges(t *testing.T) {
 	}
 	s := &Scanner{Docker: fake, CacheDir: t.TempDir()}
 
-	if _, err := s.ScanImage(context.Background(), "img:latest"); err != nil {
+	if _, _, err := s.ScanImage(context.Background(), "img:latest"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -235,7 +235,7 @@ func TestScanImageCacheMissesWhenTheRuleTableChanges(t *testing.T) {
 	rules = append(append([]rule{}, rules...), rule{"future-sdk", "future-sdk/cacert.pem"})
 	defer func() { rules = old }()
 
-	if _, err := s.ScanImage(context.Background(), "img:latest"); err != nil {
+	if _, _, err := s.ScanImage(context.Background(), "img:latest"); err != nil {
 		t.Fatal(err)
 	}
 	if fake.exportCalls != 2 {
@@ -252,7 +252,7 @@ func TestScanImageBudgetSparesACompletedRead(t *testing.T) {
 	// A deadline this short has fired long before the verdict is read; only a
 	// scan that actually ended early may wear the budget error.
 	s := &Scanner{Docker: fake, Budget: time.Nanosecond}
-	cands, err := s.ScanImage(context.Background(), "img:latest")
+	cands, _, err := s.ScanImage(context.Background(), "img:latest")
 	if err != nil {
 		t.Fatalf("a fully read export must never be reported as not fully read: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestScanImageBudgetSparesACompletedRead(t *testing.T) {
 func TestScanImageBudgetAbortsLoudly(t *testing.T) {
 	fake := &fakeDocker{stuckExport: true}
 	s := &Scanner{Docker: fake, Budget: 30 * time.Millisecond}
-	_, err := s.ScanImage(context.Background(), "img:latest")
+	_, _, err := s.ScanImage(context.Background(), "img:latest")
 	if err == nil || !strings.Contains(err.Error(), "exceeded") ||
 		!strings.Contains(err.Error(), "budget") {
 		t.Fatalf("a scan past its budget must abort loudly, got %v", err)
@@ -276,19 +276,20 @@ func TestScanImageBudgetAbortsLoudly(t *testing.T) {
 
 func TestScanImageFetchesLinkTargetsOutsideTheStash(t *testing.T) {
 	ca := testCA(t, "Root D")
-	// tls-ca-bundle.pem is not a basename the pass stashes, so the content
-	// has to come back through the targeted docker cp.
+	// trust-anchors.pem is not a basename the pass stashes (no bundle marker
+	// in the name), so the content has to come back through the targeted
+	// docker cp.
 	fake := &fakeDocker{
 		exportTar: buildTar(t, []tarEntry{
 			{name: certifiPath, typ: tar.TypeSymlink,
-				link: "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"},
-			{name: "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+				link: "/etc/pki/ca-trust/extracted/pem/trust-anchors.pem"},
+			{name: "etc/pki/ca-trust/extracted/pem/trust-anchors.pem",
 				typ: tar.TypeReg, body: ca},
 		}),
 		cpFiles: map[string][]byte{"/" + certifiPath: ca},
 	}
 	s := &Scanner{Docker: fake}
-	cands, err := s.ScanImage(context.Background(), "img:latest")
+	cands, _, err := s.ScanImage(context.Background(), "img:latest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,5 +298,58 @@ func TestScanImageFetchesLinkTargetsOutsideTheStash(t *testing.T) {
 	}
 	if !fake.called("cp -L") {
 		t.Error("an off-stash link target must be fetched with docker cp -L")
+	}
+}
+
+// The unknown-candidate channel: bundle-shaped files OUTSIDE the rule table
+// are validated and reported by path, never patched. A known match stays out
+// of the report, and a lookalike that is not a real CA bundle is dropped --
+// the report exists to hand a refusal diagnostic the one file worth
+// over-mounting by hand.
+func TestScanImageReportsUnknownCandidates(t *testing.T) {
+	ca := testCA(t, "Root U")
+	fake := &fakeDocker{exportTar: buildTar(t, []tarEntry{
+		{name: certifiPath, typ: tar.TypeReg, body: ca},                                        // known rule
+		{name: "opt/trust/cacert.pem", typ: tar.TypeReg, body: ca},                             // unknown, real
+		{name: "app/fixtures/ca-bundle.crt", typ: tar.TypeReg, body: []byte("just a fixture")}, // lookalike
+		{name: "etc/hostname", typ: tar.TypeReg, body: []byte("box")},                          // not bundle-shaped
+	})}
+	s := &Scanner{Docker: fake}
+	cands, unknown, err := s.ScanImage(context.Background(), "img:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ContainerPath != "/"+certifiPath {
+		t.Fatalf("cands = %+v, want exactly the certifi match", cands)
+	}
+	if len(unknown) != 1 || unknown[0] != "/opt/trust/cacert.pem" {
+		t.Fatalf("unknown = %v, want exactly the validated off-table bundle", unknown)
+	}
+}
+
+// Unknown candidates ride the cache: a cache-hit run still has them to
+// report after a refusal, without re-exporting the image.
+func TestUnknownCandidatesSurviveTheCache(t *testing.T) {
+	ca := testCA(t, "Root V")
+	fake := &fakeDocker{
+		exportTar: buildTar(t, []tarEntry{
+			{name: certifiPath, typ: tar.TypeReg, body: ca},
+			{name: "opt/trust/cacert.pem", typ: tar.TypeReg, body: ca},
+		}),
+		cpFiles: map[string][]byte{"/" + certifiPath: ca},
+	}
+	s := &Scanner{Docker: fake, CacheDir: t.TempDir()}
+	if _, _, err := s.ScanImage(context.Background(), "img:latest"); err != nil {
+		t.Fatal(err)
+	}
+	_, unknown, err := s.ScanImage(context.Background(), "img:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.exportCalls != 1 {
+		t.Fatalf("the second scan ran %d exports; the cache should have spared it", fake.exportCalls)
+	}
+	if len(unknown) != 1 || unknown[0] != "/opt/trust/cacert.pem" {
+		t.Fatalf("cached unknown = %v, want the off-table bundle", unknown)
 	}
 }

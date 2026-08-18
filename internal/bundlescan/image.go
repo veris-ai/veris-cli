@@ -140,6 +140,10 @@ type cacheEntry struct {
 	// never fire against a cached image.
 	Rules   string        `json:"rules"`
 	Matches []cachedMatch `json:"matches"`
+	// Unknown holds validated CA-bundle-shaped paths outside the rule table,
+	// cached so a cache-hit run can still report them after a trust rejection
+	// without re-exporting the image.
+	Unknown []string `json:"unknown,omitempty"`
 }
 
 type cachedMatch struct {
@@ -147,22 +151,26 @@ type cachedMatch struct {
 	Path string `json:"path"` // container-absolute
 }
 
-// ScanImage returns every validated bundled-CA file in the image. A matched
-// path that cannot be extracted or validated is an error, not a skip: a known
-// bundle left unpatched fails the workload later with everything here looking
-// healthy.
-func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, error) {
+// ScanImage returns every validated bundled-CA file in the image, plus the
+// validated CA-bundle-shaped paths OUTSIDE the rule table (report-only, for
+// the trust diagnostics). A matched path that cannot be extracted or
+// validated is an error, not a skip: a known bundle left unpatched fails the
+// workload later with everything here looking healthy. An unknown path that
+// cannot be read or is not a real bundle is silently dropped instead -- it
+// was never going to be patched, only named.
+func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, []string, error) {
 	id, err := s.imageID(image)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if cached, ok := s.readCache(id); ok {
-		return s.extractCached(ctx, image, cached)
+	if entry, ok := s.readCache(id); ok {
+		cands, err := s.extractCached(ctx, image, entry.Matches)
+		return cands, entry.Unknown, err
 	}
 
 	ctr, err := s.createContainer(image)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer s.removeContainer(ctr)
 
@@ -171,9 +179,9 @@ func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, err
 	defer cancel()
 	rc, err := s.cli().Stream(sctx, "export", ctr)
 	if err != nil {
-		return nil, fmt.Errorf("bundle scan of %s: %w", image, err)
+		return nil, nil, fmt.Errorf("bundle scan of %s: %w", image, err)
 	}
-	matches, scanErr := scanExportTar(rc)
+	matches, unknownRaw, scanErr := scanExportTar(rc)
 	closeErr := rc.Close()
 	// The budget verdict only when the scan actually ended early: a killed
 	// export surfaces as a truncated tar or a failed exit, and either misread
@@ -182,15 +190,15 @@ func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, err
 	// however late the deadline fired.
 	if scanErr != nil || closeErr != nil {
 		if sctx.Err() != nil && ctx.Err() == nil {
-			return nil, fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"bundle scan of %s exceeded its %s budget: the image's filesystem was "+
 					"not fully read, so a bundle in the unread remainder would ship "+
 					"unpatched. Retry, or drop --patch-bundled-cas", image, budget)
 		}
 		if scanErr != nil {
-			return nil, fmt.Errorf("bundle scan of %s: %w", image, scanErr)
+			return nil, nil, fmt.Errorf("bundle scan of %s: %w", image, scanErr)
 		}
-		return nil, fmt.Errorf("bundle scan of %s: %w", image, closeErr)
+		return nil, nil, fmt.Errorf("bundle scan of %s: %w", image, closeErr)
 	}
 
 	var cands []Candidate
@@ -202,11 +210,11 @@ func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, err
 			// here, so fetch just that file; cp -L follows the link.
 			content, err = s.copyOut(ctx, ctr, "/"+m.path)
 			if err != nil {
-				return nil, fmt.Errorf("%s bundle at /%s: %w", m.rule.SDK, m.path, err)
+				return nil, nil, fmt.Errorf("%s bundle at /%s: %w", m.rule.SDK, m.path, err)
 			}
 		}
 		if err := validate(content); err != nil {
-			return nil, fmt.Errorf("%s bundle at /%s: %v", m.rule.SDK, m.path, err)
+			return nil, nil, fmt.Errorf("%s bundle at /%s: %v", m.rule.SDK, m.path, err)
 		}
 		cands = append(cands, Candidate{
 			SDK:           m.rule.SDK,
@@ -214,8 +222,22 @@ func (s *Scanner) ScanImage(ctx context.Context, image string) ([]Candidate, err
 			Content:       content,
 		})
 	}
-	s.writeCache(id, matches)
-	return cands, nil
+	var unknown []string
+	for _, u := range unknownRaw {
+		content := u.content
+		if content == nil {
+			// Best-effort, unlike a rule match: a candidate that cannot be
+			// fetched is dropped, not fatal.
+			if content, err = s.copyOut(ctx, ctr, "/"+u.path); err != nil {
+				continue
+			}
+		}
+		if validate(content) == nil {
+			unknown = append(unknown, "/"+u.path)
+		}
+	}
+	s.writeCache(id, matches, unknown)
+	return cands, unknown, nil
 }
 
 // extractCached is the cache-hit path: the paths are known, so each file is
@@ -338,13 +360,13 @@ func (s *Scanner) cachePath(id string) string {
 	return filepath.Join(s.CacheDir, discovery.SafeFileName(id)+".json")
 }
 
-func (s *Scanner) readCache(id string) ([]cachedMatch, bool) {
+func (s *Scanner) readCache(id string) (cacheEntry, bool) {
 	if s.CacheDir == "" {
-		return nil, false
+		return cacheEntry{}, false
 	}
 	raw, err := os.ReadFile(s.cachePath(id))
 	if err != nil {
-		return nil, false
+		return cacheEntry{}, false
 	}
 	var entry cacheEntry
 	// A cache that cannot be read is a cache miss, never an error: the export
@@ -352,18 +374,21 @@ func (s *Scanner) readCache(id string) ([]cachedMatch, bool) {
 	// miss too -- its match set predates the rules now in force.
 	if json.Unmarshal(raw, &entry) != nil || entry.ImageID != id ||
 		entry.Rules != rulesFingerprint() {
-		return nil, false
+		return cacheEntry{}, false
 	}
-	return entry.Matches, true
+	return entry, true
 }
 
 // writeCache is advisory: a cache that cannot be written costs the next run
 // an export, nothing else.
-func (s *Scanner) writeCache(id string, matches []tarMatch) {
+func (s *Scanner) writeCache(id string, matches []tarMatch, unknown []string) {
 	if s.CacheDir == "" {
 		return
 	}
-	entry := cacheEntry{ImageID: id, Rules: rulesFingerprint(), Matches: []cachedMatch{}}
+	entry := cacheEntry{
+		ImageID: id, Rules: rulesFingerprint(),
+		Matches: []cachedMatch{}, Unknown: unknown,
+	}
 	for _, m := range matches {
 		entry.Matches = append(entry.Matches, cachedMatch{SDK: m.rule.SDK, Path: "/" + m.path})
 	}
@@ -416,15 +441,25 @@ var stashNames = map[string]bool{
 	"cert.pem":            true,
 }
 
+// maxUnknownScanned bounds how many unknown candidate paths one scan carries
+// forward to validation. Report-only material: past this the scan is looking
+// at an image full of bundle-named fixtures, and more paths would not sharpen
+// the eventual diagnostic.
+const maxUnknownScanned = 24
+
 // scanExportTar streams the exported filesystem exactly once: match paths
 // against the table, hold the bytes of anything a match could resolve to, and
 // chase links afterwards. One pass, because the stream cannot be rewound and
 // a second export doubles the most expensive step.
-func scanExportTar(r io.Reader) ([]tarMatch, error) {
+//
+// unknown carries CA-bundle-shaped files the table does NOT know, bytes
+// attached where the stash held them. They are never patched -- only
+// validated and reported when a client later refuses the minted certificate,
+// as the difference between "over-mount this by hand" and "real pinning".
+func scanExportTar(r io.Reader) (matches []tarMatch, unknown []tarMatch, err error) {
 	tr := tar.NewReader(r)
 	stash := make(map[string][]byte)
 	links := make(map[string]tarLink)
-	var matches []tarMatch
 
 	for {
 		hdr, err := tr.Next()
@@ -432,7 +467,7 @@ func scanExportTar(r io.Reader) ([]tarMatch, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read the export: %w", err)
+			return nil, nil, fmt.Errorf("read the export: %w", err)
 		}
 		name := cleanTarPath(hdr.Name)
 		rl, matched := matchRule(name)
@@ -449,15 +484,19 @@ func scanExportTar(r io.Reader) ([]tarMatch, error) {
 				continue
 			}
 			if matched && hdr.Size > maxBundleSize {
-				return nil, fmt.Errorf("%s bundle at /%s: %w", rl.SDK, name, errTooLarge(hdr.Size))
+				return nil, nil, fmt.Errorf("%s bundle at /%s: %w", rl.SDK, name, errTooLarge(hdr.Size))
 			}
-			if stashNames[path.Base(name)] && hdr.Size <= maxBundleSize &&
+			if candidateBasename(name) && hdr.Size <= maxBundleSize &&
 				len(stash) < maxStashedFiles {
 				content, err := io.ReadAll(tr)
 				if err != nil {
-					return nil, fmt.Errorf("read /%s from the export: %w", name, err)
+					return nil, nil, fmt.Errorf("read /%s from the export: %w", name, err)
 				}
 				stash[name] = content
+			}
+			if !matched && candidateBasename(name) &&
+				hdr.Size <= maxBundleSize && len(unknown) < maxUnknownScanned {
+				unknown = append(unknown, tarMatch{path: name})
 			}
 		}
 		if matched {
@@ -468,11 +507,18 @@ func scanExportTar(r io.Reader) ([]tarMatch, error) {
 	for i := range matches {
 		final, err := resolveLinks(matches[i].path, links)
 		if err != nil {
-			return nil, fmt.Errorf("%s bundle at /%s: %w", matches[i].rule.SDK, matches[i].path, err)
+			return nil, nil, fmt.Errorf("%s bundle at /%s: %w", matches[i].rule.SDK, matches[i].path, err)
 		}
 		matches[i].content = stash[final]
 	}
-	return matches, nil
+	for i := range unknown {
+		// Best-effort: an unknown path whose links cannot be chased simply
+		// carries no bytes, and validation later drops it.
+		if final, err := resolveLinks(unknown[i].path, links); err == nil {
+			unknown[i].content = stash[final]
+		}
+	}
+	return matches, unknown, nil
 }
 
 // resolveLinks chases a matched path through the archive's link members to
