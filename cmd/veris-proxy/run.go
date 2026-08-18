@@ -337,7 +337,9 @@ func cmdRun(args []string) error {
 	// path, and is wired here so both tiers share one verdict when that gap
 	// closes.
 	unmet := unmetRequirements(reqs, receipt)
-	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt)
+	// The host tier cannot patch bundles (no image to scan), so the advice
+	// points at the container tier.
+	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt, trustAdvice{})
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris-proxy: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -515,6 +517,43 @@ func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Rec
 	}
 }
 
+// trustAdvice is what the run knew that the receipt does not: which tier ran,
+// whether --patch-bundled-cas was on, and which CA-bundle-shaped files the
+// scan saw but does not know. Together they let a refusal diagnostic name the
+// exact next action instead of a README section -- the difference between an
+// agent correcting itself in one retry and an agent exploring.
+type trustAdvice struct {
+	ContainerTier  bool
+	PatchEnabled   bool
+	UnknownBundles []string
+}
+
+// nextStep is the single prescriptive tail appended to a refusal diagnostic.
+// Every branch ends in an action or a stop -- never only a pointer -- because
+// the reader is often an agent deciding what to run next. The three states:
+// flag off (turn it on), flag on with unknown candidates (over-mount the
+// named file), flag on with none (real pinning; no retry will change it).
+func (a trustAdvice) nextStep() string {
+	switch {
+	case !a.ContainerTier:
+		return "Next: run containerised (run --image ...) with --patch-bundled-cas"
+	case !a.PatchEnabled:
+		return "Next: re-run with --patch-bundled-cas"
+	case len(a.UnknownBundles) > 0:
+		return fmt.Sprintf(
+			"--patch-bundled-cas already covered every known bundle, so this "+
+				"client trusts something else. CA-bundle-shaped file(s) the scan "+
+				"does not know: %s. Next: append the published Veris CA to a copy "+
+				"of one and bind it over that exact path (-v copy:/path:ro)",
+			strings.Join(a.UnknownBundles, ", "))
+	default:
+		return "--patch-bundled-cas already covered every known bundle and no " +
+			"other CA-bundle-shaped file exists in the image or -v mounts: this " +
+			"is likely real certificate pinning (SPKI or fingerprint), which no " +
+			"added root can satisfy. Stop and report it; retrying will not change it"
+	}
+}
+
 // trustFailureDiagnostics turns the receipt's per-host TLS trust failures
 // into printed diagnostics. fatal marks the case that must fail the run: a
 // mapped host whose minted certificate a client refused outright, and which
@@ -525,7 +564,7 @@ func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Rec
 // code under test, so the line must print either way. An aborted-only host is
 // reported in probabilistic wording and changes nothing: an EOF is consistent
 // with a refusal but never proof of one.
-func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
+func trustFailureDiagnostics(r proxy.Receipt, advice trustAdvice) (msgs []string, fatal bool) {
 	// Receipt hosts arrive as the client wrote them; trust failures are keyed
 	// by lowercased SNI. Fold case here, or a completed request with a
 	// mixed-case Host header would fail to suppress the fatal verdict.
@@ -550,9 +589,10 @@ func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
 					"%s: %d TLS handshake(s) rejected (%s) after the certificate "+
 						"was minted, even though %d request(s) completed -- another "+
 						"client in this run refused the interception CA, likely an "+
-						"SDK-bundled CA bundle (try --patch-bundled-cas); its "+
-						"traffic never reached the sandbox",
-					f.Host, f.Rejected, dominantReason(f.Reasons), done))
+						"SDK-bundled CA bundle; its traffic never reached the "+
+						"sandbox. %s",
+					f.Host, f.Rejected, dominantReason(f.Reasons), done,
+					advice.nextStep()))
 			}
 			continue
 		}
@@ -562,16 +602,16 @@ func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
 			msgs = append(msgs, fmt.Sprintf(
 				"%s: %d TLS handshake(s) rejected (%s) after the certificate was "+
 					"minted; 0 requests completed -- the client refused the "+
-					"interception CA, likely an SDK-bundled CA bundle or certificate "+
-					"pinning; see the Certificates section of the README",
-				f.Host, f.Rejected, dominantReason(f.Reasons)))
+					"interception CA. %s",
+				f.Host, f.Rejected, dominantReason(f.Reasons), advice.nextStep()))
 		case f.Aborted > 0:
 			msgs = append(msgs, fmt.Sprintf(
 				"%s: %d TLS handshake(s) ended after the certificate was minted; "+
 					"0 requests completed -- CA rejection or certificate pinning is "+
 					"likely, but the connection closed without a TLS alert, so this "+
-					"is not certain; see the Certificates section of the README",
-				f.Host, f.Aborted))
+					"is not certain. If the workload's error looks like a "+
+					"connection or certificate failure, treat it as a refusal: %s",
+				f.Host, f.Aborted, advice.nextStep()))
 		}
 	}
 	return msgs, fatal
@@ -595,11 +635,11 @@ func dominantReason(reasons map[string]int64) string {
 // reportUnmetAndTrust prints the run's two failure groups -- the unmet
 // requirements, then the TLS trust diagnostics -- and returns whether either
 // is fatal to the verdict. One place so both tiers report in the same order.
-func reportUnmetAndTrust(w io.Writer, unmet []string, receipt proxy.Receipt) (fatal bool) {
+func reportUnmetAndTrust(w io.Writer, unmet []string, receipt proxy.Receipt, advice trustAdvice) (fatal bool) {
 	for _, u := range unmet {
 		fmt.Fprintf(w, "veris-proxy: %s\n", u)
 	}
-	trustMsgs, trustFatal := trustFailureDiagnostics(receipt)
+	trustMsgs, trustFatal := trustFailureDiagnostics(receipt, advice)
 	for _, m := range trustMsgs {
 		fmt.Fprintf(w, "veris-proxy: %s\n", m)
 	}

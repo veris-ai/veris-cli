@@ -479,17 +479,23 @@ Three mechanisms close that gap, in the order to reach for them:
    its exact path. The SDK keeps loading its own bundle through its own code
    path; the file just carries one more root. A bundle it cannot read or
    patch fails the run loudly, and one line per overlay says what happened.
-3. **The diagnostics tell you when you need either.** A client that refuses
-   the minted certificate is recorded per host — a certificate alert at high
-   confidence, an EOF after leaf selection as probable — and a mapped host
-   whose handshakes were all refused with zero completed vendor-surface
-   requests fails the run with exit 3 and a message naming the host and the
-   likely cause. A host that completed requests AND refused handshakes —
-   one client trusts the CA, another carries its own bundle — keeps the
-   command's own exit code but still prints the refusal, naming the host and
-   suggesting `--patch-bundled-cas`: mixed traffic must never silence the
-   diagnostic, and control-plane reads never count as the host having been
-   exercised.
+3. **The diagnostics name the next action, whatever the SDK.** Detection is
+   handshake-level and language-agnostic: any client in any runtime that
+   refuses the minted certificate is recorded per host — a certificate alert
+   at high confidence, an EOF after leaf selection as probable — and a
+   mapped host whose handshakes were all refused with zero completed
+   vendor-surface requests fails the run with exit 3. Every refusal message
+   ends in a prescription, not a pointer: without `--patch-bundled-cas`, it
+   says to re-run with it; with the flag on, the scan's report of
+   CA-bundle-shaped files it does *not* know (found in the same pass, never
+   patched) names the exact file to over-mount by hand — and when no such
+   file exists anywhere in the image or mounts, the message says this is
+   real certificate pinning and to stop, because no retry changes it. A host
+   that completed requests AND refused handshakes — one client trusts the
+   CA, another carries its own bundle — keeps the command's own exit code
+   but still prints the refusal with the same next step: mixed traffic must
+   never silence the diagnostic, and control-plane reads never count as the
+   host having been exercised.
 
 What none of this covers is real pinning — an SDK comparing SPKI or
 certificate hashes after chain validation (OkHttp `CertificatePinner`, curl

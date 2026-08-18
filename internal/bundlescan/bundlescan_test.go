@@ -184,3 +184,22 @@ func TestBundleContainsComparesByDER(t *testing.T) {
 		t.Error("layout changes must not defeat the dedupe")
 	}
 }
+
+// The heuristic is name-based and slightly broad on purpose (report-only):
+// bundle names in, source files and unrelated certs out.
+func TestCandidateBasenameShapes(t *testing.T) {
+	for name, want := range map[string]bool{
+		"opt/trust/cacert.pem":                true,
+		"app/certs/CA-Bundle.crt":             true,
+		"etc/ssl/certs/ca-certificates.crt":   true,
+		"vendor/grpc/roots/ca_cert_store.bin": true,
+		"usr/lib/node_modules/x/cert.pem":     true,
+		"app/main.py":                         false,
+		"etc/ssl/certs/server.crt":            false,
+		"app/certificate.go":                  false,
+	} {
+		if got := candidateBasename(name); got != want {
+			t.Errorf("candidateBasename(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

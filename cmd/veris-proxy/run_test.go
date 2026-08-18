@@ -431,7 +431,7 @@ func TestATrustRejectedHostWithNoTrafficFailsTheRun(t *testing.T) {
 			Reasons: map[string]int64{"unknown_ca": 3},
 		}},
 	}
-	msgs, fatal := trustFailureDiagnostics(rejected)
+	msgs, fatal := trustFailureDiagnostics(rejected, trustAdvice{ContainerTier: true})
 	if !fatal {
 		t.Fatal("a mapped host with rejections and no completed requests must fail the run")
 	}
@@ -453,7 +453,7 @@ func TestATrustRejectedHostWithNoTrafficFailsTheRun(t *testing.T) {
 	// here once let a fully TLS-broken SDK pass with everything looking
 	// healthy.
 	rejected.ByHost = map[string]int64{"api.stripe.com": 5}
-	msgs, fatal = trustFailureDiagnostics(rejected)
+	msgs, fatal = trustFailureDiagnostics(rejected, trustAdvice{ContainerTier: true})
 	if fatal {
 		t.Fatal("a host with completed requests must not change the exit code")
 	}
@@ -473,7 +473,7 @@ func TestATrustRejectedHostWithNoTrafficFailsTheRun(t *testing.T) {
 	// records receipt hosts as the client wrote them -- a mixed-case Host on
 	// the completed requests must still suppress the fatal verdict.
 	rejected.ByHost = map[string]int64{"API.Stripe.Com": 5}
-	if msgs, fatal := trustFailureDiagnostics(rejected); fatal || len(msgs) != 1 {
+	if msgs, fatal := trustFailureDiagnostics(rejected, trustAdvice{ContainerTier: true}); fatal || len(msgs) != 1 {
 		t.Fatalf("a mixed-case completed host must warn without failing: fatal=%v msgs=%v", fatal, msgs)
 	}
 }
@@ -488,7 +488,7 @@ func TestAnUnmappedHostsRejectionsNeverFailTheRun(t *testing.T) {
 			Reasons: map[string]int64{"unknown_ca": 4},
 		}},
 	}
-	if msgs, fatal := trustFailureDiagnostics(r); fatal || len(msgs) != 0 {
+	if msgs, fatal := trustFailureDiagnostics(r, trustAdvice{ContainerTier: true}); fatal || len(msgs) != 0 {
 		t.Fatalf("unmapped rejections changed the verdict: fatal=%v msgs=%v", fatal, msgs)
 	}
 }
@@ -503,7 +503,7 @@ func TestAbortedOnlyHandshakesWarnWithoutFailing(t *testing.T) {
 			Host: "api.stripe.com", Mapped: true, Aborted: 2,
 		}},
 	}
-	msgs, fatal := trustFailureDiagnostics(r)
+	msgs, fatal := trustFailureDiagnostics(r, trustAdvice{ContainerTier: true})
 	if fatal {
 		t.Fatal("aborted-only handshakes must not change the exit code")
 	}
@@ -517,6 +517,46 @@ func TestAbortedOnlyHandshakesWarnWithoutFailing(t *testing.T) {
 	}
 	if strings.Contains(msgs[0], "refused the interception CA") {
 		t.Errorf("an EOF must never be worded as a confirmed refusal: %s", msgs[0])
+	}
+}
+
+// Every refusal diagnostic must end in an action or a stop, because its
+// reader is often an agent deciding what to run next: flag off names the
+// flag, flag on with candidates names the exact file to over-mount, flag on
+// with none says pinning and stop -- the difference between one deterministic
+// retry and a blind search.
+func TestRefusalAdviceNamesTheNextAction(t *testing.T) {
+	rejected := proxy.Receipt{
+		ByHost: map[string]int64{},
+		TrustFailures: []proxy.TrustFailure{{
+			Host: "api.stripe.com", Mapped: true, Rejected: 2,
+			Reasons: map[string]int64{"unknown_ca": 2},
+		}},
+	}
+	for _, tc := range []struct {
+		name   string
+		advice trustAdvice
+		want   []string
+	}{
+		{"flag off", trustAdvice{ContainerTier: true},
+			[]string{"re-run with --patch-bundled-cas"}},
+		{"host tier", trustAdvice{},
+			[]string{"run --image", "--patch-bundled-cas"}},
+		{"flag on, unknown candidate", trustAdvice{ContainerTier: true, PatchEnabled: true,
+			UnknownBundles: []string{"/opt/trust/cacert.pem"}},
+			[]string{"/opt/trust/cacert.pem", "bind it over that exact path"}},
+		{"flag on, nothing left", trustAdvice{ContainerTier: true, PatchEnabled: true},
+			[]string{"real certificate pinning", "Stop and report"}},
+	} {
+		msgs, fatal := trustFailureDiagnostics(rejected, tc.advice)
+		if !fatal || len(msgs) != 1 {
+			t.Fatalf("%s: fatal=%v msgs=%v, want one fatal diagnostic", tc.name, fatal, msgs)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(msgs[0], want) {
+				t.Errorf("%s: diagnostic is missing %q: %s", tc.name, want, msgs[0])
+			}
+		}
 	}
 }
 

@@ -47,7 +47,9 @@ var rules = []rule{
 
 // rulesFingerprint identifies the table's contents, so a cache entry written
 // under an older table reads as a miss rather than pinning its match set
-// after a rule lands.
+// after a rule lands. The unknown-candidate heuristic version rides the same
+// hash: an entry cached before candidates existed must also read as a miss,
+// or a rejection would report "no candidates" off a cache that never looked.
 func rulesFingerprint() string {
 	h := sha256.New()
 	for _, r := range rules {
@@ -56,7 +58,39 @@ func rulesFingerprint() string {
 		h.Write([]byte(r.Suffix))
 		h.Write([]byte{0})
 	}
+	h.Write([]byte(candidateHeuristicVersion))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// candidateHeuristicVersion names the current candidateBasename behavior;
+// bump it when the heuristic changes so caches re-scan.
+const candidateHeuristicVersion = "unknown-v1"
+
+// maxUnknownReported caps how many unknown candidate paths a run reports. The
+// report exists to hand an agent the one or two paths worth over-mounting;
+// past a handful it stops informing and starts listing.
+const maxUnknownReported = 6
+
+// candidateBasename reports whether a file NAME is shaped like a CA bundle.
+// This drives the report-only unknown-candidate channel: a file matching here
+// but no rule in the table is never patched -- quietly adding a root to a
+// test fixture would change the code under test -- but when a client refuses
+// the minted certificate anyway, these paths are the difference between "an
+// SDK the scan does not know" (over-mount it by hand) and "real pinning"
+// (stop). Deliberately name-based and slightly broad: a false positive costs
+// one printed line after an already-failed run, a false negative costs the
+// agent a blind search.
+func candidateBasename(name string) bool {
+	base := strings.ToLower(path.Base(name))
+	if stashNames[base] {
+		return true
+	}
+	for _, marker := range []string{"cacert", "ca-cert", "ca_cert", "ca-bundle", "ca_bundle", "ca-certificates"} {
+		if strings.Contains(base, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchRule reports which rule a slash-separated, root-relative path

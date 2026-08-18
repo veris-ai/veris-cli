@@ -60,7 +60,7 @@ func TestScanVolumeFindsBundlesUnderTheMountDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cands, err := ScanVolume(ParseVolume(src + ":/work:ro"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/work:ro"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestScanVolumeMatchesTheDestinationAnchoredPath(t *testing.T) {
 	}
 	dest := "/usr/local/lib/python3.12/site-packages/certifi"
 
-	cands, err := ScanVolume(ParseVolume(src + ":" + dest))
+	cands, _, err := ScanVolume(ParseVolume(src + ":" + dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestScanVolumeFollowsASymlinkedSource(t *testing.T) {
 	if !m.HostDir {
 		t.Fatal("a symlink to a directory is a directory bind; it must classify as HostDir")
 	}
-	cands, err := ScanVolume(m)
+	cands, _, err := ScanVolume(m)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestScanVolumeFollowsAnInTreeDirectorySymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/app"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestScanVolumeTerminatesADirectorySymlinkLoop(t *testing.T) {
 	}
 
 	// The pin is termination: an unvisited-set walk recurses a<->b forever.
-	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/app"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestScanVolumeIgnoresAnEscapingDirectorySymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/app"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestScanVolumeWalksEachAliasOfASharedTarget(t *testing.T) {
 		}
 	}
 
-	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/app"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestScanVolumeDoesNotFollowAnAbsoluteDirectorySymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cands, err := ScanVolume(ParseVolume(src + ":/app"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/app"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestScanVolumeAbortsOnItsFileBudget(t *testing.T) {
 	maxWalkFiles = 4
 	defer func() { maxWalkFiles = old }()
 
-	_, err := ScanVolume(ParseVolume(src + ":/work"))
+	_, _, err := ScanVolume(ParseVolume(src + ":/work"))
 	if err == nil || !strings.Contains(err.Error(), "file budget") {
 		t.Fatalf("a walk past its file budget must abort loudly, got %v", err)
 	}
@@ -316,7 +316,7 @@ func TestScanVolumeStaysAboveItsDepthBound(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(deep, "certifi", "cacert.pem"), ca, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cands, err := ScanVolume(ParseVolume(src + ":/work"))
+	cands, _, err := ScanVolume(ParseVolume(src + ":/work"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestCollectPrefersTheVolumeCopyOverTheImage(t *testing.T) {
 	})}
 	s := &Scanner{Docker: fake}
 
-	cands, err := s.Collect(context.Background(), "img:latest", []string{src + ":/app"})
+	cands, _, err := s.Collect(context.Background(), "img:latest", []string{src + ":/app"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestCollectGovernsBindCandidatesByTheDeepestMount(t *testing.T) {
 	}
 
 	s := &Scanner{Docker: &fakeDocker{exportTar: buildTar(t, nil)}}
-	cands, err := s.Collect(context.Background(), "img:latest",
+	cands, _, err := s.Collect(context.Background(), "img:latest",
 		[]string{outer + ":/app", deeper + ":/app/certifi"})
 	if err != nil {
 		t.Fatal(err)
@@ -396,7 +396,7 @@ func TestCollectGovernsBindCandidatesByTheDeepestMount(t *testing.T) {
 	// A deeper mount WITHOUT the file masks the outer copy entirely: the path
 	// does not exist in the container, so nothing may be over-mounted there.
 	s = &Scanner{Docker: &fakeDocker{exportTar: buildTar(t, nil)}}
-	cands, err = s.Collect(context.Background(), "img:latest",
+	cands, _, err = s.Collect(context.Background(), "img:latest",
 		[]string{outer + ":/app", t.TempDir() + ":/app/certifi"})
 	if err != nil {
 		t.Fatal(err)
@@ -417,7 +417,7 @@ func TestCollectRefusesADeeperUnscannableMountOverABindCandidate(t *testing.T) {
 	}
 
 	s := &Scanner{Docker: &fakeDocker{exportTar: buildTar(t, nil)}}
-	_, err := s.Collect(context.Background(), "img:latest",
+	_, _, err := s.Collect(context.Background(), "img:latest",
 		[]string{outer + ":/app", "named-vol:/app/certifi"})
 	if err == nil || !strings.Contains(err.Error(), "cannot see inside") {
 		t.Fatalf("a named volume over a bind's bundle must refuse, got %v", err)
@@ -433,7 +433,7 @@ func TestCollectKeepsAnImageCandidateUnderAnAnonymousVolume(t *testing.T) {
 
 	// An anonymous volume is copied up from the image, so the image scan
 	// already saw the effective bytes and the deeper overlay composes.
-	cands, err := s.Collect(context.Background(), "img:latest", []string{"/app"})
+	cands, _, err := s.Collect(context.Background(), "img:latest", []string{"/app"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestCollectRefusesAnExactMountOverACandidate(t *testing.T) {
 	})}
 	s := &Scanner{Docker: fake}
 
-	_, err := s.Collect(context.Background(), "img:latest",
+	_, _, err := s.Collect(context.Background(), "img:latest",
 		[]string{t.TempDir() + ":/" + certifiPath + ":ro"})
 	if err == nil || !strings.Contains(err.Error(), "already mounts that exact path") {
 		t.Fatalf("an exact non-file mount over a candidate must refuse, got %v", err)
@@ -473,7 +473,7 @@ func TestCollectPatchesAHostFileMountedAtABundlePath(t *testing.T) {
 	})}
 	s := &Scanner{Docker: fake}
 
-	cands, err := s.Collect(context.Background(), "img:latest",
+	cands, _, err := s.Collect(context.Background(), "img:latest",
 		[]string{file + ":/" + certifiPath + ":ro"})
 	if err != nil {
 		t.Fatal(err)
@@ -501,7 +501,7 @@ func TestCollectRefusesAJunkHostFileAtABundlePath(t *testing.T) {
 	}
 	s := &Scanner{Docker: &fakeDocker{exportTar: buildTar(t, nil)}}
 
-	_, err := s.Collect(context.Background(), "img:latest",
+	_, _, err := s.Collect(context.Background(), "img:latest",
 		[]string{file + ":/" + certifiPath + ":ro"})
 	if err == nil || !strings.Contains(err.Error(), "not a CA bundle") {
 		t.Fatalf("junk bound at a bundle path must refuse loudly, got %v", err)
@@ -515,8 +515,52 @@ func TestCollectRefusesAnUnscannableMountShadowingABundle(t *testing.T) {
 	})}
 	s := &Scanner{Docker: fake}
 
-	_, err := s.Collect(context.Background(), "img:latest", []string{"named-vol:/app"})
+	_, _, err := s.Collect(context.Background(), "img:latest", []string{"named-vol:/app"})
 	if err == nil || !strings.Contains(err.Error(), "cannot see inside") {
 		t.Fatalf("a named volume shadowing a bundle must refuse, got %v", err)
+	}
+}
+
+func writeFile(t *testing.T, root, rel string, body []byte) {
+	t.Helper()
+	p := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A mounted tree can carry the unknown bundle too -- a vendored trust file in
+// a bind-mounted venv or node_modules -- and the walk names it by the path
+// the CONTAINER sees.
+func TestVolumeWalkReportsUnknownCandidates(t *testing.T) {
+	ca := testCA(t, "Root W")
+	src := t.TempDir()
+	writeFile(t, src, "vendor/trust/cacert.pem", ca)
+	writeFile(t, src, "vendor/fixtures/ca-bundle.crt", []byte("fixture, not a bundle"))
+
+	_, unknown, err := ScanVolume(ParseVolume(src + ":/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unknown) != 1 || unknown[0] != "/app/vendor/trust/cacert.pem" {
+		t.Fatalf("unknown = %v, want the validated off-table bundle at its container path", unknown)
+	}
+}
+
+// The report is capped and ordered: SDK-looking paths ahead of system trust
+// stores, because when an SDK refused the certificate its own vendored bundle
+// is the likelier read.
+func TestCapUnknownOrdersSDKPathsFirst(t *testing.T) {
+	got := capUnknown([]string{
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/opt/venv/lib/app/vendor/cacert.pem",
+		"/etc/ssl/certs/ca-certificates.crt", // duplicate
+	})
+	want := []string{"/opt/venv/lib/app/vendor/cacert.pem", "/etc/ssl/certs/ca-certificates.crt"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("capUnknown = %v, want %v", got, want)
 	}
 }

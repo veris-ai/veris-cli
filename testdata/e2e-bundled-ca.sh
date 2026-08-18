@@ -26,6 +26,13 @@
 #      the requirement is unmet (exit 3), and the rejection still prints.
 #   5. the same mixed probe with the flag -- both halves complete and the
 #      SDK's own traffic satisfies the requirement.
+#   6. an UNKNOWN bundle-pinning client (httpx verifying against its own CA
+#      file at a path the scan table does not know), WITH the flag -- the
+#      run exits 3 and the diagnostic names that exact file as a candidate
+#      to over-mount by hand. The self-correction handoff under test.
+#   7. the manual over-mount the case-6 advice prescribes -- a copy of that
+#      file with the Veris CA appended, bound over the same path -- and the
+#      unknown client completes.
 #
 # `run --image` puts the proxy on a network of its own, so the stand-in
 # sandbox is published on the host and addressed as host.docker.internal,
@@ -89,14 +96,31 @@ except stripe.APIConnectionError as exc:
 except Exception as exc:
     print("PROBE OK (stub reached; SDK raised %s)" % type(exc).__name__, flush=True)
 PY
+# The unknown probe mimics an SDK the scan table does not know: httpx handed
+# its own CA file at a private path. The scan cannot patch it -- but after a
+# refusal it must NAME it, which is the whole self-correction handoff.
+cat > "$WORK/unknown.py" <<'PY'
+import httpx
+
+try:
+    r = httpx.get("https://api.stripe.com/v1/charges",
+                  verify="/opt/trust/cacert.pem", timeout=10)
+    print("PROBE OK (status %d)" % r.status_code, flush=True)
+except Exception as exc:
+    print("PROBE FAIL %s: %s" % (type(exc).__name__, str(exc)[:120]), flush=True)
+PY
 # Installed at BUILD time so the bundled CA sits in the image layers, which is
 # where the scan has to find it. No version pin: the pinning under test is the
-# SDK's CA bundle, not its release.
+# SDK's CA bundle, not its release. /opt/trust/cacert.pem is the unknown
+# client's private trust file: real public roots, no Veris CA.
 cat > "$WORK/Dockerfile" <<'DOCKER'
 FROM python:3.12-slim
 RUN pip install --no-cache-dir stripe httpx
+RUN mkdir -p /opt/trust && \
+    cp /usr/local/lib/python3.12/site-packages/certifi/cacert.pem /opt/trust/cacert.pem
 COPY probe.py /probe.py
 COPY mixed.py /mixed.py
+COPY unknown.py /unknown.py
 DOCKER
 docker build -q -t "$APP" "$WORK" >/dev/null
 
@@ -218,5 +242,37 @@ echo "$out" | sed 's/^/    /' | tail -6
 echo "$out" | grep -q 'PROBE OK' \
   || { echo "FAIL: the SDK half did not complete after the overlay"; exit 1; }
 echo "    over-mounted, and the SDK's own traffic satisfies the requirement"
+
+say "6. an unknown bundle-pinning client, flag ON: the diagnostic names the file"
+set +e
+out=$(run_with --patch-bundled-cas --require-service stripe -- python3 /unknown.py); status=$?
+set -e
+echo "$out" | sed 's/^/    /' | tail -6
+[ "$status" -eq 3 ] || { echo "FAIL: expected exit 3, got $status"; exit 1; }
+echo "$out" | grep -q 'PROBE FAIL' \
+  || { echo "FAIL: the unknown client did not report a transport failure"; exit 1; }
+echo "$out" | grep -q '/opt/trust/cacert.pem' \
+  || { echo "FAIL: the diagnostic did not name the unknown bundle to over-mount"; exit 1; }
+echo "$out" | grep -q 'bind it over that exact path' \
+  || { echo "FAIL: the diagnostic did not prescribe the manual over-mount"; exit 1; }
+echo "    exit 3, and the advice names /opt/trust/cacert.pem"
+
+say "7. the prescribed manual over-mount fixes the unknown client"
+# Exactly what the case-6 advice says: the named file with the published
+# Veris CA appended, at the same path. The proxy container mints a fresh CA
+# per run, so the append uses the LIVE run's /veris-share/veris-ca.pem: the
+# file is bound writable and patched in the run's own first step -- trust
+# data changed, code under test untouched.
+docker run --rm "$APP" cat /opt/trust/cacert.pem > "$WORK/patched-unknown.pem"
+set +e
+out=$(run_with --require-service stripe \
+  -v "$WORK/patched-unknown.pem:/opt/trust/cacert.pem" \
+  -- sh -c 'cat /veris-share/veris-ca.pem >> /opt/trust/cacert.pem && python3 /unknown.py'); status=$?
+set -e
+echo "$out" | sed 's/^/    /' | tail -5
+[ "$status" -eq 0 ] || { echo "FAIL: exit $status"; exit 1; }
+echo "$out" | grep -q 'PROBE OK' \
+  || { echo "FAIL: the over-mounted trust file did not fix the unknown client"; exit 1; }
+echo "    the file the diagnostic named, patched by hand, closes the loop"
 
 say "PASS: the diagnostics catch a bundle-pinning SDK, and the overlay fixes it"

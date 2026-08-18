@@ -29,20 +29,26 @@ const bundlesSubdir = "bundles"
 // failure posture is the binary's usual one: a known bundle that cannot be
 // extracted, validated or patched aborts the run, because leaving it in play
 // fails the workload's TLS later with everything here having looked healthy.
-func bundledCAOverlays(spec dockerRun, share, scanLabel string) ([]bundlescan.Overlay, error) {
+//
+// The second return is the unknown-candidate report: CA-bundle-shaped files
+// the scan table does not know, held quietly and printed only if a client
+// refuses the minted certificate anyway -- the handoff that tells the
+// operator (or an agent) exactly which file to over-mount by hand, or that
+// none exists and the client is really pinning.
+func bundledCAOverlays(spec dockerRun, share, scanLabel string) ([]bundlescan.Overlay, []string, error) {
 	caPEM, err := os.ReadFile(filepath.Join(share, trust.CertFileName))
 	if err != nil {
-		return nil, fmt.Errorf("--patch-bundled-cas needs the published Veris CA: %w", err)
+		return nil, nil, fmt.Errorf("--patch-bundled-cas needs the published Veris CA: %w", err)
 	}
 	scanner := &bundlescan.Scanner{CacheDir: bundleCacheDir(), ContainerLabel: scanLabel}
-	cands, err := scanner.Collect(context.Background(), spec.Image, spec.Volumes)
+	cands, unknown, err := scanner.Collect(context.Background(), spec.Image, spec.Volumes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	overlays, skipped, err := bundlescan.WriteOverlays(
 		filepath.Join(share, bundlesSubdir), caPEM, cands)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !spec.Quiet {
 		// A found-and-already-trusted bundle is reported too, or it would be
@@ -62,7 +68,7 @@ func bundledCAOverlays(spec dockerRun, share, scanLabel string) ([]bundlescan.Ov
 				"veris-proxy: %d bundled CA file(s) over-mounted\n", len(overlays))
 		}
 	}
-	return overlays, nil
+	return overlays, unknown, nil
 }
 
 // bundleCacheDir is where scan results live, keyed by immutable image ID. ""
