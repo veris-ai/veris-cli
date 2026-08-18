@@ -494,29 +494,63 @@ func TestAnUnmappedHostsRejectionsNeverFailTheRun(t *testing.T) {
 }
 
 // An EOF after the leaf was selected is consistent with a refusal and with a
-// crashed client; the wire cannot tell them apart. The wording stays
-// probabilistic and the exit code stays the command's own.
-func TestAbortedOnlyHandshakesWarnWithoutFailing(t *testing.T) {
+// crashed client; the wire cannot tell them apart, so the wording stays
+// probabilistic. The VERDICT depends on the rest of the receipt: beside an
+// empty one the run proved nothing and fails (Node closes without an alert
+// on exactly this path -- nango-server exited green while every vendor call
+// died); beside any vendor-surface traffic it stays advisory.
+func TestAbortedOnlyHandshakesFailOnlyAnEmptyRun(t *testing.T) {
 	r := proxy.Receipt{
 		ByHost: map[string]int64{},
 		TrustFailures: []proxy.TrustFailure{{
-			Host: "api.stripe.com", Mapped: true, Aborted: 2,
+			Host: "api.figma.com", Mapped: true, Aborted: 2,
 		}},
 	}
 	msgs, fatal := trustFailureDiagnostics(r, trustAdvice{ContainerTier: true})
-	if fatal {
-		t.Fatal("aborted-only handshakes must not change the exit code")
+	if !fatal {
+		t.Fatal("aborted handshakes beside an empty receipt must fail the run")
 	}
 	if len(msgs) != 1 {
 		t.Fatalf("msgs = %v, want exactly one diagnostic", msgs)
 	}
-	for _, want := range []string{"api.stripe.com", "likely", "not certain"} {
+	for _, want := range []string{
+		"api.figma.com", "likely", "not certain",
+		"proved nothing", "sibling container", "veris.env",
+	} {
 		if !strings.Contains(msgs[0], want) {
 			t.Errorf("diagnostic is missing %q: %s", want, msgs[0])
 		}
 	}
 	if strings.Contains(msgs[0], "refused the interception CA") {
 		t.Errorf("an EOF must never be worded as a confirmed refusal: %s", msgs[0])
+	}
+
+	// Vendor-surface traffic flowed (another service, or this host earlier):
+	// the EOF is back to advisory and the command's exit code stands.
+	r.Total = 3
+	if msgs, fatal := trustFailureDiagnostics(r, trustAdvice{ContainerTier: true}); fatal || len(msgs) != 1 {
+		t.Fatalf("aborted beside real traffic must warn without failing: fatal=%v msgs=%v", fatal, msgs)
+	}
+}
+
+// The sibling-container clause is container-tier knowledge: the host tier
+// has no compose sidecars to warn about, and appending it there would send
+// the reader chasing a /veris-share that does not exist.
+func TestSiblingNoteIsContainerTierOnly(t *testing.T) {
+	r := proxy.Receipt{
+		ByHost: map[string]int64{},
+		TrustFailures: []proxy.TrustFailure{{
+			Host: "api.stripe.com", Mapped: true, Rejected: 1,
+			Reasons: map[string]int64{"unknown_ca": 1},
+		}},
+	}
+	msgs, _ := trustFailureDiagnostics(r, trustAdvice{ContainerTier: true})
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "sibling container") {
+		t.Fatalf("container tier must carry the sibling note: %v", msgs)
+	}
+	msgs, _ = trustFailureDiagnostics(r, trustAdvice{})
+	if len(msgs) != 1 || strings.Contains(msgs[0], "sibling container") {
+		t.Fatalf("host tier must not carry the sibling note: %v", msgs)
 	}
 }
 

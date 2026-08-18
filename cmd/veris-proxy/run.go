@@ -554,6 +554,25 @@ func (a trustAdvice) nextStep() string {
 	}
 }
 
+// siblingNote covers the topology the workload-centric advice cannot: the
+// refusing client lives in a container the run did not start -- a compose
+// service joining the proxy's network namespace -- which shares the kernel
+// redirect but never receives the trust handoff (no env-file, no overlays).
+// nango-server was exactly this: routing worked, every vendor call died as
+// SELF_SIGNED_CERT_IN_CHAIN, and the workload container looked healthy.
+// Container tier only; the host tier has no sibling containers to warn about.
+func (a trustAdvice) siblingNote() string {
+	if !a.ContainerTier {
+		return ""
+	}
+	return " (A sibling container this run did not start -- e.g. a compose " +
+		"service sharing the proxy's network -- never receives the trust " +
+		"handoff: start it with the run's veris.env as an env-file, or mount " +
+		"the proxy's share and point its CA variable at " +
+		"/veris-share/veris-ca.pem; `docker inspect` the proxy container's " +
+		"/veris-share mount for the host path.)"
+}
+
 // trustFailureDiagnostics turns the receipt's per-host TLS trust failures
 // into printed diagnostics. fatal marks the case that must fail the run: a
 // mapped host whose minted certificate a client refused outright, and which
@@ -562,8 +581,12 @@ func (a trustAdvice) nextStep() string {
 // AND completed requests is reported but not fatal: two clients disagreed
 // about the CA, and the completing one may be the harness rather than the
 // code under test, so the line must print either way. An aborted-only host is
-// reported in probabilistic wording and changes nothing: an EOF is consistent
-// with a refusal but never proof of one.
+// reported in probabilistic wording -- an EOF is consistent with a refusal
+// but never proof of one -- and turns fatal only when the whole receipt is
+// empty: handshakes that died after leaf selection beside a sandbox that
+// received nothing is a run that proved nothing, and Node (nango-server's
+// runtime) closes without an alert on exactly this path, so leaving it
+// advisory let every such run exit green.
 func trustFailureDiagnostics(r proxy.Receipt, advice trustAdvice) (msgs []string, fatal bool) {
 	// Receipt hosts arrive as the client wrote them; trust failures are keyed
 	// by lowercased SNI. Fold case here, or a completed request with a
@@ -590,9 +613,9 @@ func trustFailureDiagnostics(r proxy.Receipt, advice trustAdvice) (msgs []string
 						"was minted, even though %d request(s) completed -- another "+
 						"client in this run refused the interception CA, likely an "+
 						"SDK-bundled CA bundle; its traffic never reached the "+
-						"sandbox. %s",
+						"sandbox. %s%s",
 					f.Host, f.Rejected, dominantReason(f.Reasons), done,
-					advice.nextStep()))
+					advice.nextStep(), advice.siblingNote()))
 			}
 			continue
 		}
@@ -602,16 +625,29 @@ func trustFailureDiagnostics(r proxy.Receipt, advice trustAdvice) (msgs []string
 			msgs = append(msgs, fmt.Sprintf(
 				"%s: %d TLS handshake(s) rejected (%s) after the certificate was "+
 					"minted; 0 requests completed -- the client refused the "+
-					"interception CA. %s",
-				f.Host, f.Rejected, dominantReason(f.Reasons), advice.nextStep()))
+					"interception CA. %s%s",
+				f.Host, f.Rejected, dominantReason(f.Reasons),
+				advice.nextStep(), advice.siblingNote()))
 		case f.Aborted > 0:
+			// Fatal only beside an empty receipt: with ANY vendor-surface
+			// traffic flowing, an EOF stays advisory, but dead handshakes as
+			// the run's ONLY TLS story mean nothing was proved.
+			empty := r.Total == 0
+			if empty {
+				fatal = true
+			}
+			verdict := "If the workload's error looks like a connection or " +
+				"certificate failure, treat it as a refusal: "
+			if empty {
+				verdict = "With the sandbox receiving nothing at all, this run " +
+					"proved nothing, so it fails rather than passing on silence. "
+			}
 			msgs = append(msgs, fmt.Sprintf(
 				"%s: %d TLS handshake(s) ended after the certificate was minted; "+
 					"0 requests completed -- CA rejection or certificate pinning is "+
 					"likely, but the connection closed without a TLS alert, so this "+
-					"is not certain. If the workload's error looks like a "+
-					"connection or certificate failure, treat it as a refusal: %s",
-				f.Host, f.Aborted, advice.nextStep()))
+					"is not certain. %s%s%s",
+				f.Host, f.Aborted, verdict, advice.nextStep(), advice.siblingNote()))
 		}
 	}
 	return msgs, fatal
