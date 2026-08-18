@@ -351,6 +351,13 @@ summary when the command finishes. `--require-service stripe:2` turns that into
 an exit code. A suite that quietly stopped calling its dependency passes the
 canary check and produces an empty receipt.
 
+`/veris/*` control-plane requests — seeding, manuals, wire traces — are
+counted apart and never satisfy `--require-service` or the empty-receipt
+check: they are usually the *harness* talking to the sandbox, and folding
+them into the service counts once let a run whose every SDK call failed TLS
+report its own setup reads as service traffic and pass. The printed receipt
+lists them on their own line.
+
 Without both, "interception silently did not happen" and "everything worked"
 look identical.
 
@@ -475,8 +482,14 @@ Three mechanisms close that gap, in the order to reach for them:
 3. **The diagnostics tell you when you need either.** A client that refuses
    the minted certificate is recorded per host — a certificate alert at high
    confidence, an EOF after leaf selection as probable — and a mapped host
-   whose handshakes were all refused with zero completed requests fails the
-   run with exit 3 and a message naming the host and the likely cause.
+   whose handshakes were all refused with zero completed vendor-surface
+   requests fails the run with exit 3 and a message naming the host and the
+   likely cause. A host that completed requests AND refused handshakes —
+   one client trusts the CA, another carries its own bundle — keeps the
+   command's own exit code but still prints the refusal, naming the host and
+   suggesting `--patch-bundled-cas`: mixed traffic must never silence the
+   diagnostic, and control-plane reads never count as the host having been
+   exercised.
 
 What none of this covers is real pinning — an SDK comparing SPKI or
 certificate hashes after chain validation (OkHttp `CertificatePinner`, curl

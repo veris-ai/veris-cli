@@ -146,7 +146,7 @@ func (s *Server) Config() *config.Config { return s.cfg }
 // receipt cannot drift from the counters.
 func (s *Server) recordIntercept(host string, target *config.Target, mode, method, path string) {
 	s.intercepted.Add(1)
-	s.receipt.record(host, target)
+	s.receipt.record(host, target, IsControlPlanePath(path))
 	s.log.Info("intercepted",
 		"service", target.Service,
 		"host", host,
