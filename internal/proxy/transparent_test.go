@@ -299,6 +299,15 @@ func TestTheReceiptRecordsWhatTheRunSent(t *testing.T) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
+	// A control-plane read reaches the sandbox but is the HARNESS's traffic:
+	// it lands beside, never inside, the vendor-surface counts.
+	resp, err = client.Get("https://api.stripe.com/veris/data")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
 	got := h.running.Receipt()
 	if got.Total != 3 {
 		t.Errorf("total = %d, want 3", got.Total)
@@ -309,8 +318,18 @@ func TestTheReceiptRecordsWhatTheRunSent(t *testing.T) {
 	if got.ByHost["api.openai.com"] != 0 {
 		t.Errorf("a blocked host was counted as a hit: %+v", got.ByHost)
 	}
-	if len(got.Hits) != 1 || got.Hits[0].Host != "api.stripe.com" || got.Hits[0].Prefix != "/" {
-		t.Errorf("hits = %+v, want one api.stripe.com entry at /", got.Hits)
+	if got.ControlTotal != 1 || got.ByServiceControl["stripe"] != 1 {
+		t.Errorf("control-plane read not counted apart: control_total=%d by_service_control=%+v",
+			got.ControlTotal, got.ByServiceControl)
+	}
+	if len(got.Hits) != 2 {
+		t.Fatalf("hits = %+v, want the vendor entry plus the control entry", got.Hits)
+	}
+	if got.Hits[0].Host != "api.stripe.com" || got.Hits[0].Prefix != "/" || got.Hits[0].Control {
+		t.Errorf("hits[0] = %+v, want the vendor-surface api.stripe.com entry", got.Hits[0])
+	}
+	if !got.Hits[1].Control {
+		t.Errorf("hits[1] = %+v, want the control-plane entry flagged", got.Hits[1])
 	}
 }
 

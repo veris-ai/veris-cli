@@ -303,6 +303,29 @@ func TestARequirementCountIsEnforced(t *testing.T) {
 	}
 }
 
+// A harness seeding its world reads /veris/* on the same service, and those
+// reads once counted toward --require-service -- which is how a run whose
+// every SDK call failed TLS still reported "stripe 4" and passed. They are
+// excluded now, and the unmet message names them so the excluded traffic does
+// not read as the traffic having vanished.
+func TestControlPlaneReadsDoNotSatisfyARequirement(t *testing.T) {
+	r := proxy.Receipt{
+		ByService:        map[string]int64{},
+		ByHost:           map[string]int64{},
+		ByServiceControl: map[string]int64{"stripe": 4},
+		ControlTotal:     4,
+	}
+	got := unmetRequirements([]requirement{{kind: "service", name: "stripe", count: 1}}, r)
+	if len(got) != 1 {
+		t.Fatalf("control-plane-only traffic satisfied the requirement: %v", got)
+	}
+	for _, want := range []string{"0 time(s)", "4 /veris/* control-plane request(s)"} {
+		if !strings.Contains(got[0], want) {
+			t.Errorf("unmet message is missing %q: %s", want, got[0])
+		}
+	}
+}
+
 // NODE_OPTIONS is the case that matters: replacing it would silently drop
 // whatever the developer or their CI had already put there.
 func TestMergeEnvExtendsAppendVariablesAndReplacesOthers(t *testing.T) {
@@ -424,19 +447,34 @@ func TestATrustRejectedHostWithNoTrafficFailsTheRun(t *testing.T) {
 		}
 	}
 
-	// The same rejections beside completed requests: some client refused the
-	// CA, but the integration was exercised -- the command's verdict stands.
+	// The same rejections beside completed requests: the command's verdict
+	// stands, but the refusal must still PRINT -- the completing client can be
+	// the harness while the refusing one is the code under test, and silence
+	// here once let a fully TLS-broken SDK pass with everything looking
+	// healthy.
 	rejected.ByHost = map[string]int64{"api.stripe.com": 5}
-	if msgs, fatal := trustFailureDiagnostics(rejected); fatal || len(msgs) != 0 {
-		t.Fatalf("a host with completed requests must not fail: fatal=%v msgs=%v", fatal, msgs)
+	msgs, fatal = trustFailureDiagnostics(rejected)
+	if fatal {
+		t.Fatal("a host with completed requests must not change the exit code")
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("mixed traffic must still warn: msgs=%v", msgs)
+	}
+	for _, want := range []string{
+		"api.stripe.com", "3 TLS handshake(s) rejected", "5 request(s) completed",
+		"--patch-bundled-cas", "never reached the sandbox",
+	} {
+		if !strings.Contains(msgs[0], want) {
+			t.Errorf("mixed-traffic warning is missing %q: %s", want, msgs[0])
+		}
 	}
 
 	// Trust failures are keyed by lowercased SNI, but the explicit-proxy tier
 	// records receipt hosts as the client wrote them -- a mixed-case Host on
 	// the completed requests must still suppress the fatal verdict.
 	rejected.ByHost = map[string]int64{"API.Stripe.Com": 5}
-	if msgs, fatal := trustFailureDiagnostics(rejected); fatal || len(msgs) != 0 {
-		t.Fatalf("a mixed-case completed host must not fail: fatal=%v msgs=%v", fatal, msgs)
+	if msgs, fatal := trustFailureDiagnostics(rejected); fatal || len(msgs) != 1 {
+		t.Fatalf("a mixed-case completed host must warn without failing: fatal=%v msgs=%v", fatal, msgs)
 	}
 }
 
@@ -503,6 +541,16 @@ func TestAnEnvironmentRunThatSentNothingFailsByDefault(t *testing.T) {
 	// Traffic flowed: nothing to add.
 	if got := environmentReceiptUnmet("env_1", nil, proxy.Receipt{Total: 2}); got != nil {
 		t.Fatalf("a non-empty receipt is not unmet, got %v", got)
+	}
+	// Control-plane reads alone are the harness talking to the sandbox, not
+	// the suite calling its dependencies -- still unmet, and the message says
+	// what DID arrive.
+	got := environmentReceiptUnmet("env_1", nil, proxy.Receipt{ControlTotal: 4})
+	if len(got) != 1 {
+		t.Fatalf("a control-plane-only receipt must be unmet, got %v", got)
+	}
+	if !strings.Contains(got[0], "4 /veris/* control-plane request(s)") {
+		t.Errorf("the unmet message should name the control traffic: %s", got[0])
 	}
 	// Attaching to an existing sandbox keeps the documented contract: the
 	// receipt is printed, the exit code stays the command's own.

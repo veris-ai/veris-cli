@@ -496,6 +496,18 @@ func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Rec
 	if environment == "" || len(reqs) > 0 || r.Total > 0 {
 		return nil
 	}
+	// Control-plane reads are the harness's own traffic, so they cannot stand
+	// in for the suite having called its dependencies -- but a run that made
+	// them deserves the sharper message: the pipe worked, the code under test
+	// never used it.
+	if r.ControlTotal > 0 {
+		return []string{fmt.Sprintf(
+			"this run deployed a sandbox and sent it only %d /veris/* "+
+				"control-plane request(s), no service traffic: either the suite "+
+				"never called its dependencies, or its clients failed before "+
+				"any request completed (a TLS trust diagnostic above names the "+
+				"host if a client refused the interception CA)", r.ControlTotal)}
+	}
 	return []string{
 		"this run deployed a sandbox and sent it nothing: either the suite " +
 			"never called its dependencies, or interception missed them. " +
@@ -506,22 +518,42 @@ func environmentReceiptUnmet(environment string, reqs []requirement, r proxy.Rec
 // trustFailureDiagnostics turns the receipt's per-host TLS trust failures
 // into printed diagnostics. fatal marks the case that must fail the run: a
 // mapped host whose minted certificate a client refused outright, and which
-// completed no request, never exercised its integration -- whatever the
-// command's own exit code said. An aborted-only host is reported in
-// probabilistic wording and changes nothing: an EOF is consistent with a
-// refusal but never proof of one.
+// completed no vendor-surface request, never exercised its integration --
+// whatever the command's own exit code said. A host that refused handshakes
+// AND completed requests is reported but not fatal: two clients disagreed
+// about the CA, and the completing one may be the harness rather than the
+// code under test, so the line must print either way. An aborted-only host is
+// reported in probabilistic wording and changes nothing: an EOF is consistent
+// with a refusal but never proof of one.
 func trustFailureDiagnostics(r proxy.Receipt) (msgs []string, fatal bool) {
 	// Receipt hosts arrive as the client wrote them; trust failures are keyed
 	// by lowercased SNI. Fold case here, or a completed request with a
 	// mixed-case Host header would fail to suppress the fatal verdict.
+	// Vendor-surface counts only: a /veris/* control-plane read is the
+	// harness talking to the sandbox, and letting it vouch for a host is how
+	// a fully TLS-broken SDK once passed with everything looking healthy.
 	completed := make(map[string]int64, len(r.ByHost))
 	for host, n := range r.ByHost {
 		completed[strings.ToLower(host)] += n
 	}
 	for _, f := range r.TrustFailures {
-		// A host that also completed requests was exercised: some client in
-		// the run refused the CA, but the command's own verdict stands.
-		if !f.Mapped || completed[f.Host] > 0 {
+		if !f.Mapped {
+			continue
+		}
+		if done := completed[f.Host]; done > 0 {
+			// Exercised AND refused: mixed traffic, so the command's verdict
+			// stands, but silence here would hide the one clue that a second
+			// client in the run -- an SDK with its own CA bundle -- never
+			// reached the sandbox at all.
+			if f.Rejected > 0 {
+				msgs = append(msgs, fmt.Sprintf(
+					"%s: %d TLS handshake(s) rejected (%s) after the certificate "+
+						"was minted, even though %d request(s) completed -- another "+
+						"client in this run refused the interception CA, likely an "+
+						"SDK-bundled CA bundle (try --patch-bundled-cas); its "+
+						"traffic never reached the sandbox",
+					f.Host, f.Rejected, dominantReason(f.Reasons), done))
+			}
 			continue
 		}
 		switch {
@@ -581,19 +613,40 @@ func unmetRequirements(reqs []requirement, r proxy.Receipt) []string {
 		if req.kind == "host" {
 			got = r.ByHost[req.name]
 		}
-		if got < req.count {
-			out = append(out, fmt.Sprintf(
-				"the run required %s %s at least %d time(s) but the sandbox saw it %d time(s)",
-				req.kind, req.name, req.count, got))
+		if got >= req.count {
+			continue
 		}
+		msg := fmt.Sprintf(
+			"the run required %s %s at least %d time(s) but the sandbox saw it %d time(s)",
+			req.kind, req.name, req.count, got)
+		// Control-plane reads used to count here, and a harness seeding its
+		// world could satisfy the requirement while every SDK call failed.
+		// Name what was excluded, or the count reads as the traffic vanishing.
+		if req.kind == "service" {
+			if n := r.ByServiceControl[req.name]; n > 0 {
+				msg += fmt.Sprintf(
+					" (%d /veris/* control-plane request(s) are not counted as "+
+						"service traffic)", n)
+			}
+		}
+		out = append(out, msg)
 	}
 	return out
 }
 
 // printReceipt is the run's proof of work: what the code under test actually
 // sent to the sandbox, as opposed to what it was configured to send.
+// Control-plane traffic prints on its own lines: it proves the harness could
+// reach the sandbox, never that the code under test did.
 func printReceipt(w *os.File, r proxy.Receipt) {
 	if r.Total == 0 {
+		if r.ControlTotal > 0 {
+			fmt.Fprintf(w,
+				"veris-proxy: the sandbox received no service traffic from this "+
+					"run -- only %d /veris/* control-plane request(s).\n",
+				r.ControlTotal)
+			return
+		}
 		fmt.Fprintln(w, "veris-proxy: the sandbox received nothing from this run.")
 		return
 	}
@@ -606,6 +659,10 @@ func printReceipt(w *os.File, r proxy.Receipt) {
 	fmt.Fprintf(w, "veris-proxy: the sandbox received %d request(s):\n", r.Total)
 	for _, name := range services {
 		fmt.Fprintf(w, "  %-28s %d\n", name, r.ByService[name])
+	}
+	if r.ControlTotal > 0 {
+		fmt.Fprintf(w, "  plus %d /veris/* control-plane request(s), not counted above\n",
+			r.ControlTotal)
 	}
 }
 
