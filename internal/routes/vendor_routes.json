@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "parity vendor-routes",
-  "source": "services/*/parity/backend.yaml (measured), plus service specs and shipped client deployment profiles",
+  "source": "services/*/parity/backend.yaml (measured), plus each vendor's own spec for path prefixes",
   "services": {
     "acuity-scheduling": [
       {
@@ -21,6 +21,11 @@
     "asana": [
       {
         "host": "app.asana.com"
+      }
+    ],
+    "atlassian-identity": [
+      {
+        "host": "auth.atlassian.com"
       }
     ],
     "attio": [
@@ -49,17 +54,14 @@
         "host": "sandbox.safaricom.co.ke"
       }
     ],
+    "figma": [
+      {
+        "host": "api.figma.com"
+      }
+    ],
     "frameio-v4": [
       {
         "host": "api.frame.io"
-      }
-    ],
-    "fineract": [
-      {
-        "host": "mifos.mifos.gazelle.test"
-      },
-      {
-        "host": "leopard.mifos.io"
       }
     ],
     "google-calendar": [
@@ -123,9 +125,48 @@
         "host": "api.hubapi.com"
       }
     ],
+    "huggingface": [
+      {
+        "host": "huggingface.co"
+      }
+    ],
+    "jira": [
+      {
+        "host": "api.atlassian.com"
+      }
+    ],
+    "linear": [
+      {
+        "host": "api.linear.app"
+      }
+    ],
     "marqeta": [
       {
         "host": "sandbox-api.marqeta.com"
+      }
+    ],
+    "microsoft-graph": [
+      {
+        "host": "graph.microsoft.com",
+        "paths": [
+          "/v1.0"
+        ]
+      }
+    ],
+    "microsoft-identity": [
+      {
+        "host": "graph.microsoft.com",
+        "paths": [
+          "/oidc/userinfo"
+        ]
+      },
+      {
+        "host": "login.microsoftonline.com"
+      }
+    ],
+    "notion": [
+      {
+        "host": "api.notion.com"
       }
     ],
     "quickbooks": [
@@ -149,6 +190,15 @@
       },
       {
         "host": "sandbox-quickbooks.api.intuit.com"
+      }
+    ],
+    "salesforce": [
+      {
+        "host": "login.salesforce.com",
+        "paths": [
+          "/services/oauth2/authorize",
+          "/services/oauth2/token"
+        ]
       }
     ],
     "stripe": [
