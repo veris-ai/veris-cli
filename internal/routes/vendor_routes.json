@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "parity vendor-routes",
-  "source": "services/*/parity/backend.yaml (measured), plus each vendor's own spec for path prefixes",
+  "source": "services/*/parity/backend.yaml (measured, plus its deployment_hosts for self-hosted vendors), and each vendor's own spec for path prefixes",
   "services": {
     "acuity-scheduling": [
       {
@@ -57,6 +57,14 @@
     "figma": [
       {
         "host": "api.figma.com"
+      }
+    ],
+    "fineract": [
+      {
+        "host": "leopard.mifos.io"
+      },
+      {
+        "host": "mifos.mifos.gazelle.test"
       }
     ],
     "frameio-v4": [
