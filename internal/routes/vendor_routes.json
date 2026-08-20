@@ -16,6 +16,12 @@
     "airtable": [
       {
         "host": "api.airtable.com"
+      },
+      {
+        "host": "content.airtable.com",
+        "paths": [
+          "/v0"
+        ]
       }
     ],
     "asana": [
