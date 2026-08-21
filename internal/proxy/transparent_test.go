@@ -152,8 +152,9 @@ func TestTransparentBlocksUnmappedHost(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502; body = %s", resp.StatusCode, body)
+	// Same status as the explicit-proxy tier: 421, which no HTTP client retries.
+	if resp.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("status = %d, want 421; body = %s", resp.StatusCode, body)
 	}
 	var e struct {
 		Error string `json:"error"`

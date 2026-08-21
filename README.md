@@ -308,11 +308,14 @@ package registries, an internal API and anything else the code under test talks
 to behave exactly as they always did, so pointing a project at a sandbox is one
 command rather than a configuration project.
 
-`--strict` (or `"mode": "strict"`) blocks unmapped hosts with a 502 and an
-actionable error, for a run that has to prove the code under test reached
-nothing but the sandbox. That guarantee is real, but it is not the only way to
-get it: the receipt below reports what the sandbox actually received, so a
-suite quietly talking to the real vendor is visible without having to forbid
+`--strict` (or `"mode": "strict"`) blocks unmapped hosts with a
+`421 Misdirected Request` and an actionable error, for a run that has to prove
+the code under test reached nothing but the sandbox. 421 because a missing route
+is permanent for the life of the run: 5xx sits in the retry set of every HTTP
+client, so a blocked request used to spend the caller's whole retry budget in
+backoff before failing anyway. That guarantee is real, but it is not the only
+way to get it: the receipt below reports what the sandbox actually received, so
+a suite quietly talking to the real vendor is visible without having to forbid
 every host nobody thought to list.
 
 ### The receipt makes a silent no-op impossible

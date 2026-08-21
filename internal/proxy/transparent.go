@@ -152,7 +152,10 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme, host st
 		s.blocked.Add(1)
 		s.log.Error("blocked unmapped host",
 			"host", host, "method", r.Method, "path", r.URL.Path, "mode", modeTransparent)
-		s.writeJSON(w, http.StatusBadGateway, map[string]any{
+		// 421, not 5xx: the missing route is permanent for the life of the run,
+		// and a 5xx refusal is retried by every HTTP client, so a blocked
+		// request burned the caller's whole retry budget before failing anyway.
+		s.writeJSON(w, http.StatusMisdirectedRequest, map[string]any{
 			"error":          "veris_unmapped_host",
 			"message":        fmt.Sprintf("%s is not mapped to a Veris simulated service.", host),
 			"host":           host,

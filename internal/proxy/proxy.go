@@ -272,6 +272,11 @@ func joinPath(base, rest string) string {
 // blockResponse is what the code under test sees when it tries to reach a host
 // with no mapping. It is written to be read by a developer staring at a failed
 // test, so it names the host and says exactly what to do about it.
+//
+// 421 rather than 502: a missing route is permanent for the life of the run, and
+// 5xx sits in the retry set of every HTTP client, so each blocked request cost
+// the caller its whole retry budget in backoff before failing anyway. 421 is
+// outside the standard retryable set (408/429/5xx), so the refusal is final.
 func (s *Server) blockResponse(req *http.Request, host string) *http.Response {
 	body, _ := json.MarshalIndent(map[string]any{
 		"error":   "veris_unmapped_host",
@@ -285,7 +290,7 @@ func (s *Server) blockResponse(req *http.Request, host string) *http.Response {
 		"known_services": s.serviceNames(),
 	}, "", "  ")
 
-	return newJSONResponse(req, http.StatusBadGateway, body)
+	return newJSONResponse(req, http.StatusMisdirectedRequest, body)
 }
 
 func (s *Server) controlResponse(req *http.Request) *http.Response {

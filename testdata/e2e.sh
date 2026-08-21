@@ -111,10 +111,11 @@ else
   fail "curl: wildcard host not routed"
 fi
 
-# The property the product depends on.
+# The property the product depends on. 421 rather than a 5xx so the refusal is
+# final: curl and every other client retry 5xx, and the route is not coming back.
 code=$(curl -sS -o "$WORK/blocked.json" -w '%{http_code}' \
        --proxy "$PROXY" --cacert "$CA" https://api.openai.com/v1/models)
-if [ "$code" = "502" ] && grep -q veris_unmapped_host "$WORK/blocked.json"; then
+if [ "$code" = "421" ] && grep -q veris_unmapped_host "$WORK/blocked.json"; then
   pass "strict mode: unmapped host blocked with an actionable error"
 else
   fail "strict mode: unmapped host got HTTP $code"
