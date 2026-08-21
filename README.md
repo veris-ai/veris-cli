@@ -111,12 +111,13 @@ restart, and for adding it to an image you already have.
 | Variable | Purpose | Default |
 |---|---|---|
 | `VERIS_API_KEY` | Reads the sandbox from the control plane. Never written to disk. | — |
-| `VERIS_API_BASE` | Control plane base URL. | `https://svc.api.veris.ai` |
 | `VERIS_SANDBOX_ID` | Sandbox to route at, when no flag or config names one. | — |
 | `VERIS_PROXY_CONFIG` | Path to a config file. | — |
 
-`--api-key`, `--api-base`, `--sandbox` and `--config` override the matching
-variable.
+`--api-key`, `--sandbox` and `--config` override the matching variable.
+
+The control plane is `https://svc.api.veris.ai`. There is nothing to point
+it at and nothing to configure.
 
 ### Receiving webhooks
 

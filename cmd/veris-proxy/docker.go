@@ -291,10 +291,15 @@ func ensureProxyImage(image string, quiet bool) error {
 	cmd := exec.Command("docker", "pull", image)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Run(); err != nil {
+		// The default image is public, so a failure here is the network, the
+		// daemon, or a --proxy-image someone pointed at a private registry.
+		// It is deliberately NOT a "run gcloud auth" instruction any more:
+		// that used to be required, and telling a client to authenticate to
+		// our cloud to run their own tests is the wall this default removed.
 		return fmt.Errorf("cannot pull the proxy image %s: %w. "+
-			"Pulling needs a logged-in gcloud; if it answered 401, run "+
-			"`gcloud auth configure-docker us-central1-docker.pkg.dev` once",
-			image, err)
+			"%s needs no credentials; check the daemon and the network, or "+
+			"log in to the registry if you passed your own --proxy-image",
+			image, err, defaultProxyImage)
 	}
 	return nil
 }

@@ -765,12 +765,11 @@ func javaTrustStore(authority *ca.CA) string {
 // defaultProxyImage is the proxy's own runner image -- NOT the image under
 // test, which has no default and never should.
 //
-// Its own repository, holding this image and nothing else, because of who pulls
-// it: the rest of our images are pulled by the cluster, and this one is pulled
-// by whoever is testing. Access is authenticated with the puller's own gcloud
-// login.
-const defaultProxyImage = "us-central1-docker.pkg.dev/veris-ai-prod/" +
-	"svc-sandbox-proxy-prod/veris-proxy:runner"
+// Public and anonymously pullable, because of who pulls it: our other images
+// are pulled by our cluster, and this one is pulled by whoever is testing, on
+// their laptop or in their CI. Requiring a registry login before the first run
+// is a wall in front of the one command this tool exists for.
+const defaultProxyImage = "ghcr.io/veris-ai/veris-proxy:runner"
 
 // sandboxOrEnvironment gives the container exactly one routing target.
 func sandboxOrEnvironment(src configSources, environment string) string {
