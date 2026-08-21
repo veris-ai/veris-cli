@@ -2,8 +2,8 @@
 // where a vendor shares one across products which path prefix, belongs to each
 // simulated service.
 //
-// The table is GENERATED from each service's measured parity backend
-// (`parity vendor-routes --write`) and embedded here, never hand-edited. A
+// The table is GENERATED from each service's measured vendor backend and
+// embedded here, never hand-edited. A
 // hand-maintained copy is a second place for the fact to live and a second
 // chance to be wrong about it: one said Google served /tokeninfo from
 // www.googleapis.com, while the measured record puts it on

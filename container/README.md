@@ -33,7 +33,7 @@ sockets too.
 docker run -d --name veris-proxy --network testnet --cap-add=NET_ADMIN \
   -e VERIS_SANDBOX_ID=sbx_abc123 -e VERIS_API_KEY=... \
   -v "$PWD/.veris":/veris-share \
-  us-central1-docker.pkg.dev/veris-ai-dev/svc-sandbox-proxy-dev/veris-proxy:runner
+  us-central1-docker.pkg.dev/veris-ai-prod/svc-sandbox-proxy-prod/veris-proxy:runner
 
 # 2. your image, unchanged. This command is printed by step 1, filled in.
 docker run --rm --network container:veris-proxy --cap-drop=ALL \
@@ -148,7 +148,7 @@ every requirement above lands on your image instead of ours:
 docker run --rm --cap-add=NET_ADMIN \
   -e VERIS_SANDBOX_ID=sbx_abc123 -e VERIS_API_KEY=... \
   -v "$PWD:/work" -w /work \
-  us-central1-docker.pkg.dev/veris-ai-dev/svc-sandbox-proxy-dev/veris-proxy:runner \
+  us-central1-docker.pkg.dev/veris-ai-prod/svc-sandbox-proxy-prod/veris-proxy:runner \
   pytest -q
 ```
 

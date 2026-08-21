@@ -769,8 +769,8 @@ func javaTrustStore(authority *ca.CA) string {
 // it: the rest of our images are pulled by the cluster, and this one is pulled
 // by whoever is testing. Access is authenticated with the puller's own gcloud
 // login.
-const defaultProxyImage = "us-central1-docker.pkg.dev/veris-ai-dev/" +
-	"svc-sandbox-proxy-dev/veris-proxy:runner"
+const defaultProxyImage = "us-central1-docker.pkg.dev/veris-ai-prod/" +
+	"svc-sandbox-proxy-prod/veris-proxy:runner"
 
 // sandboxOrEnvironment gives the container exactly one routing target.
 func sandboxOrEnvironment(src configSources, environment string) string {

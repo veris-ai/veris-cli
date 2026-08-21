@@ -10,15 +10,13 @@
 # Human-triggered, never CI: it costs a real sandbox.
 set -euo pipefail
 
-NAMESPACE=sandbox-system
-KUBE_CONTEXT="${KUBE_CONTEXT:-gke_veris-ai-dev_us-central1-a_svc-sandbox-gke-dev}"
-IP="${INGRESS_IP:-8.232.36.255}"
-BASE="http://$IP"
+# The control plane to provision against, and a key for it. Override BASE to
+# aim the run at a different environment.
+BASE="${VERIS_API_BASE:-https://svc.api.veris.ai}"
+API_KEY="${VERIS_API_KEY:?set VERIS_API_KEY to a control-plane API key}"
 WORK="$(mktemp -d)"
 trap 'chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
-API_KEY=$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get secret sandbox-api-secrets \
-  -o jsonpath='{.data.api_key}' | base64 -d)
 export VERIS_API_KEY="$API_KEY" VERIS_API_BASE="$BASE"
 auth=(-H "X-API-Key: $API_KEY")
 json=(-H 'Content-Type: application/json')
@@ -31,9 +29,9 @@ say "build"
 PROXY="$WORK/veris-proxy"
 
 # Only now, and only after every tool that reads a real home directory has run:
-# kubectl wants ~/.kube, and `go build` would rebuild its entire module cache
-# here as read-only files. ~/.veris is where the sandbox cache lives, and this
-# test must not disturb the developer's own.
+# `go build` would rebuild its entire module cache here as read-only files.
+# ~/.veris is where the sandbox cache lives, and this test must not disturb
+# the developer's own.
 export HOME="$WORK/home"
 mkdir -p "$HOME"
 
