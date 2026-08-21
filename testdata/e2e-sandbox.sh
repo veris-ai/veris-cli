@@ -11,17 +11,13 @@
 # Human-triggered, never CI: it costs a real sandbox.
 set -euo pipefail
 
-NAMESPACE=sandbox-system
-# The repo's own cluster, not whatever kubectl was last pointed at.
-KUBE_CONTEXT="${KUBE_CONTEXT:-gke_veris-ai-dev_us-central1-a_svc-sandbox-gke-dev}"
-IP="${INGRESS_IP:-8.232.36.255}"
-BASE="http://$IP"
+# The control plane to provision against, and a key for it. Override BASE to
+# aim the run at a different environment.
+BASE="${VERIS_API_BASE:-https://svc.api.veris.ai}"
+API_KEY="${VERIS_API_KEY:?set VERIS_API_KEY to a control-plane API key}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# Read into a variable, never echoed. Same source scripts/smoke.sh uses.
-API_KEY=$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get secret sandbox-api-secrets \
-  -o jsonpath='{.data.api_key}' | base64 -d)
 auth=(-H "X-API-Key: $API_KEY")
 json=(-H 'Content-Type: application/json')
 

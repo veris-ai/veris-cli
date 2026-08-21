@@ -27,7 +27,7 @@ import (
 
 // DefaultAPIBase is the control plane this binary talks to unless told
 // otherwise.
-const DefaultAPIBase = "https://api.veris.ai"
+const DefaultAPIBase = "https://svc.api.veris.ai"
 
 // Environment variables. The API key is read from the environment and NEVER
 // written to disk: a cached sandbox snapshot is state, not a credential store.
@@ -52,7 +52,7 @@ type Service struct {
 	EnvHint string `json:"env_hint"`
 	// Routes are the real hostnames this service answers for, when the control
 	// plane serves them. Same provenance as the embedded table -- generated
-	// from the measured parity backends, never authored -- but they arrive
+	// from the measured vendor backends, never authored -- but they arrive
 	// with the sandbox, so a service added to the platform is routable the day
 	// it lands instead of waiting for the next proxy release. Older control
 	// planes omit the field; the embedded table then decides.

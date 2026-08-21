@@ -1,7 +1,8 @@
 # veris-proxy
 
-Routes outbound HTTP(S) from code under test at simulated services in a Veris
-dependency sandbox. The code under test is never modified.
+Routes outbound HTTP(S) from code under test at simulated services in a
+[Veris](https://veris.ai) dependency sandbox. The code under test is never
+modified.
 
 A single static binary with no runtime dependencies, so it drops into any
 container image including Alpine and distroless.
@@ -16,36 +17,30 @@ faithful.
 
 ## Install
 
-The repo is private, so every form below needs repo access: `gh auth login`
-(or `GH_TOKEN` exported) first.
+macOS and Linux:
 
 ```sh
-gh api -H 'Accept: application/vnd.github.raw+json' repos/veris-ai/veris-proxy/contents/scripts/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.sh | sh
 ```
 
-Fetches the installer through the authenticated `gh`; the installer then
-downloads the latest released static binary for this OS/arch into
-`~/.local/bin` (override with `VERIS_INSTALL_DIR`; pin with
-`VERIS_PROXY_VERSION`). No root and no package manager, so it works the same
-on a laptop, a CI runner, and inside a container build. Where `gh` is absent
-(a container build, a minimal CI image), the installer downloads with
-`GH_TOKEN`/`GITHUB_TOKEN` through the REST API instead, and the same token
-fetches the script:
+Windows:
 
-```sh
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/veris-ai/veris-proxy/contents/scripts/install.sh | sh
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.ps1 | iex"
 ```
 
-Without the installer, one `gh` call does the same job:
+The installer downloads the released static binary for this OS/arch into
+`~/.local/bin` (`%LOCALAPPDATA%\Programs\veris-proxy` on Windows). No root and
+no package manager, so it works the same on a laptop, a CI runner, and inside
+a container build.
 
-```sh
-gh release download --repo veris-ai/veris-proxy --pattern "veris-proxy-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" -O ~/.local/bin/veris-proxy --clobber && chmod +x ~/.local/bin/veris-proxy
-```
+| Variable | Effect |
+|---|---|
+| `VERIS_INSTALL_DIR` | Install somewhere else |
+| `VERIS_PROXY_VERSION` | Pin a version, e.g. `v0.8.0` (default: latest) |
 
-Windows: download the `.exe` from the releases page. The unauthenticated
-`curl -fsSL .../scripts/install.sh | sh` one-liner returns once the repo (or
-its releases) is public; until then an unauthenticated run of the installer
-stops on the 404 with a one-line pointer to `gh auth login` / `GH_TOKEN`.
+Binaries for every supported platform are also attached to each
+[release](https://github.com/veris-ai/veris-proxy/releases).
 
 ## Quick start
 
@@ -107,22 +102,27 @@ exactly the named capabilities and nothing else (`CHOWN`, `DAC_OVERRIDE`,
 Or skip the switch: build the image to run as the target `USER` and it needs
 nothing. The proxy container's own capabilities are unaffected either way.
 
-The proxy's own image comes from a repository holding that image and nothing
-else, so pulling it grants nothing else; `--proxy-image` overrides it.
-Pulling needs a logged-in gcloud (`gcloud auth login`; if docker then still
-answers 401, `gcloud auth configure-docker us-central1-docker.pkg.dev` wires
-docker to that login). The auth requirement goes away once the image is
-published publicly.
+See [`container/README.md`](container/README.md) for the two docker commands
+this is doing for you, for running the proxy against an image you cannot
+restart, and for adding it to an image you already have.
 
-See `container/README.md` for the two docker commands this is doing for you,
-for running the proxy against an image you cannot restart, and for adding it to
-an image you already have.
+## Environment
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `VERIS_API_KEY` | Reads the sandbox from the control plane. Never written to disk. | — |
+| `VERIS_API_BASE` | Control plane base URL. | `https://svc.api.veris.ai` |
+| `VERIS_SANDBOX_ID` | Sandbox to route at, when no flag or config names one. | — |
+| `VERIS_PROXY_CONFIG` | Path to a config file. | — |
+
+`--api-key`, `--api-base`, `--sandbox` and `--config` override the matching
+variable.
 
 ### Receiving webhooks
 
 The proxy routes your code OUT to the sandbox. A webhook comes back IN, and a
-sandbox in the cluster cannot reach an app on your laptop. `--expose` opens a
-tunnel for that direction and registers it with the sandbox:
+hosted sandbox cannot reach an app on your laptop. `--expose` opens a tunnel
+for that direction and registers it with the sandbox:
 
 ```sh
 veris-proxy serve --sandbox sbx_abc123 --expose 3000
@@ -135,10 +135,9 @@ where cloudflared reaches your image over the shared namespace's loopback.
 The port is the one your app listens on. Your image starts only after the proxy
 reports ready, so the registration probe necessarily runs before anything is
 listening; the proxy waits for your port to open and re-probes, and the verdict
-you read is the one taken then. Your app is
-handed `VERIS_PUBLIC_URL` and registers that with the vendor itself — through
-the vendor's own API, because that registration call is the code path that
-ships.
+you read is the one taken then. Your app is handed `VERIS_PUBLIC_URL` and
+registers that with the vendor itself — through the vendor's own API, because
+that registration call is the code path that ships.
 
 ```
 veris-proxy: callbacks arrive at https://odd-forest-1a2b.trycloudflare.com
@@ -157,11 +156,6 @@ A quick tunnel needs no Cloudflare account and mints a new hostname each run.
 stable URL. If your app runs on the HOST while the proxy is in a container, add
 `--expose-host host.docker.internal` — loopback there is the container's own.
 
-`testdata/e2e-ingress.sh` drives the whole path against a real sandbox and a
-real tunnel, and asserts that the sandbox's own startup probe is EXCLUDED from
-the receipt — otherwise `--require-callback '*'` would pass with no vendor
-delivery at all.
-
 ### A sandbox of your own
 
 `--environment` works for a long-lived `serve` session the same way it does
@@ -172,10 +166,11 @@ veris-proxy serve --environment env_abc123 --expose 3000
 ```
 
 When you are receiving callbacks it is not just simpler but safer, for a
-reason worth stating plainly: `client.default_base_url` is a sandbox-wide singleton. Two
-concurrent runs sharing one sandbox overwrite each other's callback URL, and the
-first run's webhooks are then delivered to the second run's app — silently, with
-neither able to notice. A sandbox per run removes that entirely.
+reason worth stating plainly: `client.default_base_url` is a sandbox-wide
+singleton. Two concurrent runs sharing one sandbox overwrite each other's
+callback URL, and the first run's webhooks are then delivered to the second
+run's app — silently, with neither able to notice. A sandbox per run removes
+that entirely.
 
 It also removes the registration window. The tunnel needs only a local port, so
 it opens first and its URL is handed over at creation; the sandbox is never
@@ -206,16 +201,15 @@ still wins, exactly as `docker run` precedence has it.
 
 ### Without a container
 
-`veris-proxy run` without `--image` is the fallback for work that is not containerised. It runs
-your command as a local child process with proxy and CA environment variables
-set, which is a *request* rather than an enforcement — a library that ignores
-those variables reaches the real vendor. It does not cover Java, static Go
-binaries, Apache HttpClient or aiohttp; the container path does.
+`veris-proxy run` without `--image` is the fallback for work that is not
+containerised. It runs your command as a local child process with proxy and CA
+environment variables set, which is a *request* rather than an enforcement — a
+library that ignores those variables reaches the real vendor. It does not cover
+Java, static Go binaries, Apache HttpClient or aiohttp; the container path does.
 
 ```sh
 veris-proxy run --sandbox sbx_abc123 -- pytest -q
 ```
-
 
 ## Commands
 
@@ -228,12 +222,8 @@ veris-proxy run --sandbox sbx_abc123 -- pytest -q
 `serve --write-env FILE` and `serve --ready-file FILE` are how a supervisor
 picks the proxy up: the environment as sourceable POSIX exports, and an
 edge-triggered marker written last, so its existence means every listener is
-bound and the environment is complete. The container entrypoint uses both, and
-needs no other command — it cannot probe a port, because debian-slim and
-python-slim carry no curl, wget or nc and `sh` has no `/dev/tcp`.
-
-`--write-env` records the **bound** address, so `--listen :0` works; a separate
-command computing it from config could not.
+bound and the environment is complete. `--write-env` records the **bound**
+address, so `--listen :0` works.
 
 `run` exits with the command's own status, or 3 if a `--require-service` /
 `--require-host` assertion went unmet, or 4 if the outcome is indeterminate.
@@ -243,16 +233,12 @@ command computing it from config could not.
 `$VERIS_SANDBOX_ID`. The layers never merge. `serve --print-routes` shows what
 a sandbox id resolves to without starting anything.
 
-**`serve` is the primary command** — it is what the container image runs, and
-what a long-lived local session runs. **`run` is the fallback**: it `fork`/
-`exec`s a local command with the interception environment, which only covers
-libraries that honour those variables.
-
 ## Config
 
-JSON rather than YAML, because the Veris CLI owns the human-facing `veris.yaml`
-and compiles it down to this. That keeps the binary dependency-free and the
-wire format unambiguous. See `examples/proxy.json`.
+Naming a sandbox is usually all you need — the routes come from the control
+plane. A config file is for pinning them yourself. JSON rather than YAML keeps
+the binary dependency-free and the wire format unambiguous. See
+[`examples/proxy.json`](examples/proxy.json).
 
 ```json
 {
@@ -298,17 +284,16 @@ An unresolved service upstream is derived as
 ### Where the hostnames come from
 
 You do not have to write the `hosts` and `paths` above. They are **generated**
-from each service's measured parity backend — the host the oracle was actually
-driven against — by `parity vendor-routes --write`, embedded in the binary, and
-drift-tested against the backends on every run of the services suite.
+from each service's measured backend — the host the simulation was actually
+driven against — embedded in the binary, and drift-tested against those
+backends.
 
 That matters because the facts are not guessable. A hand-written table put
 Google's `/tokeninfo` on `www.googleapis.com`; the measured record puts it on
 `oauth2.googleapis.com`, where Google actually serves it, so a client's token
 introspection would have been routed at a service that does not answer there.
 Google's identity surface alone spans four hostnames, and three Google services
-share a fourth. A second copy of a measured fact is a second chance to be wrong
-about it.
+share a fourth.
 
 `--sandbox` combines that table with the control plane's answer for a given
 sandbox, so the config nobody wrote is still the measured one.
@@ -337,12 +322,9 @@ Two mechanisms, answering two different questions.
 It fails if the proxy is unreachable, if it is not a Veris proxy, or if it
 belongs to a different run — a proxy left running from an earlier run, pointing
 at a different sandbox, would otherwise let tests pass against the wrong
-simulated data.
-
-A canary always exists: the proxy mints one per process when the config names
-none, so the assertion never quietly weakens into a liveness probe. `check`
-refuses to run without one unless you pass `--any-run` and accept that it
-cannot detect a stale proxy.
+simulated data. A canary always exists: the proxy mints one per process when
+the config names none, so the assertion never quietly weakens into a liveness
+probe.
 
 The receipt answers the question the canary cannot: interception was live, but
 did this run actually *use* it? `run` records every request the sandbox
@@ -351,12 +333,10 @@ summary when the command finishes. `--require-service stripe:2` turns that into
 an exit code. A suite that quietly stopped calling its dependency passes the
 canary check and produces an empty receipt.
 
-`/veris/*` control-plane requests — seeding, manuals, wire traces — are
-counted apart and never satisfy `--require-service` or the empty-receipt
-check: they are usually the *harness* talking to the sandbox, and folding
-them into the service counts once let a run whose every SDK call failed TLS
-report its own setup reads as service traffic and pass. The printed receipt
-lists them on their own line.
+Sandbox control-plane requests — seeding, manuals, wire traces — are counted
+apart and never satisfy `--require-service` or the empty-receipt check: they
+are usually the *harness* talking to the sandbox, not the code under test. The
+printed receipt lists them on their own line.
 
 Without both, "interception silently did not happen" and "everything worked"
 look identical.
@@ -370,8 +350,6 @@ This is not a detail. Google, Stripe and most large vendors serve HTTP/2, so a
 client that negotiates h2 in production and HTTP/1.1 here is exercising a
 different transport than the one that ships — different multiplexing, different
 header handling, and a different set of code paths inside its own HTTP library.
-Both the CONNECT-tunnel tier and the transparent listeners are covered by tests
-that fail if the negotiation silently drops back.
 
 ## Two tiers of interception
 
@@ -386,10 +364,7 @@ whether you control the image:
   container:veris-proxy`) — the one to reach for. Every requirement lands on
   our container rather than yours: it is root, it has iptables, it drops
   itself. Yours needs no capability, no iptables, no entrypoint change and no
-  particular base image, so distroless and scratch work. It does not matter how
-  you built it. `run --image` starts it with `--cap-drop=ALL`; `--cap-add`
-  hands back exactly the capabilities you name, for an entrypoint that has to
-  switch users.
+  particular base image, so distroless and scratch work.
 - **One container, proxy inside.** Simpler to operate, and the trade is that
   those requirements move onto your image, which must also start as root.
   Missing any of them the entrypoint refuses rather than silently degrading.
@@ -397,16 +372,15 @@ whether you control the image:
 `serve --transparent` stands itself up when it starts as root on Linux: it
 installs the redirect, puts the CA in the system trust store, and drops to an
 unprivileged uid before serving. So an image can run the binary directly and
-needs no entrypoint script from us. It no-ops when already unprivileged, which
-is how it composes with the entrypoint that drops first.
-
-See `container/README.md` for both arrangements, and for composing with an
-entrypoint you already have.
+needs no entrypoint script from us.
 
 The proxy runs as a dedicated uid (14741) inside that container, because the
 redirect exempts its own upstream calls by uid and one rule cannot tell two
 processes with one uid apart. The entrypoint refuses to start if your command
 would share it.
+
+See [`container/README.md`](container/README.md) for both arrangements, and for
+composing with an entrypoint you already have.
 
 ### Explicit proxy, on the host — the fallback
 
@@ -420,7 +394,7 @@ any of them, so each runtime needs its own:
 | Go | env | `SSL_CERT_FILE` (Linux only) |
 | Node | needs `--use-env-proxy` | `NODE_EXTRA_CA_CERTS` |
 | .NET | env | `SSL_CERT_FILE` (Linux only) |
-| Java | `JAVA_TOOL_OPTIONS`, after `trust --java` | JKS truststore, not a PEM |
+| Java | `JAVA_TOOL_OPTIONS` | JKS truststore, not a PEM |
 
 Java deserves its own paragraph because it reads none of the usual variables
 and wants a JKS rather than a PEM. `run` builds one when it finds a JDK —
@@ -431,8 +405,7 @@ truststore flags, which every JVM including Gradle and Maven test forks picks
 up.
 
 An app that loads its own keystore from disk never consults the JVM default
-truststore. There is no built-in command for that any more; add the CA to its
-keystore yourself:
+truststore. Add the CA to its keystore yourself:
 
 ```sh
 keytool -importcert -noprompt -trustcacerts -alias veris-local-ca \
@@ -448,7 +421,6 @@ Python and Ruby SDKs ship their own CA bundle. The container tier covers the
 *routing* half of all four; for the Stripe case the *trust* half stays
 in-process, which is what `--patch-bundled-cas` and the trust-rejection
 diagnostics below exist for.
-
 
 ## Certificates
 
@@ -481,21 +453,14 @@ Three mechanisms close that gap, in the order to reach for them:
    patch fails the run loudly, and one line per overlay says what happened.
 3. **The diagnostics name the next action, whatever the SDK.** Detection is
    handshake-level and language-agnostic: any client in any runtime that
-   refuses the minted certificate is recorded per host — a certificate alert
-   at high confidence, an EOF after leaf selection as probable — and a
-   mapped host whose handshakes were all refused with zero completed
-   vendor-surface requests fails the run with exit 3. Every refusal message
-   ends in a prescription, not a pointer: without `--patch-bundled-cas`, it
-   says to re-run with it; with the flag on, the scan's report of
-   CA-bundle-shaped files it does *not* know (found in the same pass, never
-   patched) names the exact file to over-mount by hand — and when no such
-   file exists anywhere in the image or mounts, the message says this is
-   real certificate pinning and to stop, because no retry changes it. A host
-   that completed requests AND refused handshakes — one client trusts the
-   CA, another carries its own bundle — keeps the command's own exit code
-   but still prints the refusal with the same next step: mixed traffic must
-   never silence the diagnostic, and control-plane reads never count as the
-   host having been exercised.
+   refuses the minted certificate is recorded per host, and a mapped host
+   whose handshakes were all refused with zero completed vendor-surface
+   requests fails the run with exit 3. Every refusal message ends in a
+   prescription, not a pointer: without `--patch-bundled-cas`, it says to
+   re-run with it; with the flag on, the scan's report of CA-bundle-shaped
+   files it does *not* know names the exact file to over-mount by hand — and
+   when no such file exists anywhere in the image or mounts, the message says
+   this is real certificate pinning and to stop, because no retry changes it.
 
 What none of this covers is real pinning — an SDK comparing SPKI or
 certificate hashes after chain validation (OkHttp `CertificatePinner`, curl
@@ -503,12 +468,6 @@ certificate hashes after chain validation (OkHttp `CertificatePinner`, curl
 it is a boundary, not a configuration problem.
 
 ## Development
-
-This repository is the proxy's home: develop, test, and release here.
-[services-sandbox](https://github.com/veris-ai/services-sandbox) consumes it
-as a pinned submodule for the runner-image build and the vendor-routes drift
-check — bumping that pin is what ships a new runner image. The Makefile
-carries the targets:
 
 ```sh
 make test    # go test -race
@@ -518,17 +477,15 @@ make dist    # static binaries for 5 platforms
 make e2e     # against real curl, Python and Node clients
 ```
 
-The runner image is built and pushed by services-sandbox's CI from the
-submodule pin. Releasing the CLI: tag `vX.Y.Z` here; the release workflow
-attaches the `make dist` binaries, which is where `scripts/install.sh`
-downloads from. `internal/routes/vendor_routes.json` is generated by
-services-sandbox's `parity vendor-routes --write` from measured vendor
-backends — regenerate there, never edit by hand.
-
 The e2e script matters because the Go tests exercise the proxy through Go's own
 TLS stack, which is more forgiving than OpenSSL's. CI runs the unit tests, the
-race detector and every cross-build on any PR touching `proxy/**`; it never
-runs parity or anything that drives a real vendor.
+race detector and every cross-build on any PR.
+
+Releasing: tag `vX.Y.Z`; the release workflow attaches the `make dist` binaries,
+which is where the installer downloads from.
+
+`internal/routes/vendor_routes.json` is generated from measured vendor
+backends — never edit it by hand.
 
 ## Licence
 
