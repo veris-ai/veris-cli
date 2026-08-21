@@ -157,12 +157,16 @@ func TestInterceptsHTTPSAndRewritesToSandbox(t *testing.T) {
 // The property the whole product depends on: an unmapped host must fail, not
 // quietly reach the real internet. A green test run against real Stripe would
 // be worse than a red one.
+//
+// The status is part of that property. 421 is outside the retryable set every
+// HTTP client shares (408/429/5xx); the 502 this used to answer put a full
+// retry-and-backoff cycle in front of a failure that was never going to change.
 func TestStrictModeBlocksUnmappedHost(t *testing.T) {
 	h := newHarness(t, nil)
 
 	resp, body := h.get(t, "https://api.openai.com/v1/models")
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502; body = %s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("status = %d, want 421; body = %s", resp.StatusCode, body)
 	}
 
 	var e struct {
