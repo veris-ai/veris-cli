@@ -60,6 +60,48 @@
         "host": "sandbox.safaricom.co.ke"
       }
     ],
+    "dropbox": [
+      {
+        "host": "api.dropbox.com",
+        "paths": [
+          "/oauth2/token"
+        ]
+      },
+      {
+        "host": "api.dropboxapi.com"
+      },
+      {
+        "host": "content.dropboxapi.com",
+        "paths": [
+          "/2/files/download",
+          "/2/files/download_zip",
+          "/2/files/export",
+          "/2/files/get_preview",
+          "/2/files/get_thumbnail",
+          "/2/files/get_thumbnail_batch",
+          "/2/files/get_thumbnail_v2",
+          "/2/files/upload",
+          "/2/files/upload_session/append_batch",
+          "/2/files/upload_session/append_v2",
+          "/2/files/upload_session/finish",
+          "/2/files/upload_session/start",
+          "/2/sharing/get_shared_link_file",
+          "/apitul/1"
+        ]
+      },
+      {
+        "host": "notify.dropboxapi.com",
+        "paths": [
+          "/2/files/list_folder/longpoll"
+        ]
+      },
+      {
+        "host": "www.dropbox.com",
+        "paths": [
+          "/oauth2/authorize"
+        ]
+      }
+    ],
     "figma": [
       {
         "host": "api.figma.com"
