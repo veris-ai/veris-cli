@@ -369,8 +369,19 @@ var _ = exec.Command // keep the child-invocation idiom obvious to readers
 // widening access on the repository that holds sandbox-api and gateway in order
 // to let a client pull a proxy.
 func TestTheProxyImageDefaultsToItsOwnRepository(t *testing.T) {
-	if !strings.Contains(defaultProxyImage, "-proxy-") {
-		t.Errorf("default proxy image %q is not in the proxy repository", defaultProxyImage)
+	// Anonymously pullable, which is the point of the default: whoever runs
+	// this is on their own laptop or their own CI, and a registry that wants a
+	// login first is a wall in front of the one command the tool exists for.
+	// An Artifact Registry host is exactly that wall -- it is where this image
+	// used to live, and every client had to `gcloud auth configure-docker`
+	// before their first run.
+	if strings.Contains(defaultProxyImage, "pkg.dev") {
+		t.Errorf("default proxy image %q is in Artifact Registry, which cannot be pulled without a Google login", defaultProxyImage)
+	}
+	// Its own repository, never the one holding the images our cluster runs:
+	// a grant that makes this image public must not make those public too.
+	if !strings.Contains(defaultProxyImage, "veris-proxy") {
+		t.Errorf("default proxy image %q is not the proxy's own repository", defaultProxyImage)
 	}
 	if strings.Contains(defaultProxyImage, "-images-") {
 		t.Errorf("default proxy image %q sits in the cluster's image repo", defaultProxyImage)

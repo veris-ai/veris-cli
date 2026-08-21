@@ -1,0 +1,103 @@
+# Publish the runner image to GHCR.
+#
+# This is the image `veris-proxy run --image` starts beside the code under
+# test, and it is pulled by whoever is testing — a laptop, someone else's CI —
+# never by our cluster. That is the whole reason it lives here and is public:
+# a client should be able to run the proxy without a Google account, without
+# `gcloud auth configure-docker`, and without an account with us at all.
+#
+# It used to be published from veris-ai/services-sandbox into a private
+# Artifact Registry repository, which meant every client authenticated to GCP
+# before their first run. Anonymous pull could not be granted there: the
+# organization enforces constraints/iam.allowedPolicyMemberDomains against a
+# single customer id, so `allUsers` on any resource in it is refused, and the
+# narrowest exception available is an entire project. GHCR needs no exception,
+# no new vendor, and no credential beyond GITHUB_TOKEN.
+#
+# Published from THIS repository because this is where the proxy is developed,
+# tested and released. services-sandbox pins a commit; it does not own the
+# artifact.
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "container/**"
+      - "cmd/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/image.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # BOTH architectures, unlike an image that runs on a cluster we choose.
+      # This one runs on a developer's laptop, and an amd64-only image on
+      # Apple Silicon does not fail at the workload — it fails installing
+      # iptables inside the proxy ("Failed to initialize nft: Protocol not
+      # supported"), because emulation does not carry the netfilter syscalls.
+      # That reads as a broken proxy rather than as a missing architecture.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `runner` is the tag the CLI reaches for by default, so it moves on
+      # every publish or clients keep pulling an old proxy. The sha tag is
+      # what you pin to when bisecting one; the version tags only exist for
+      # a release.
+      - name: Tags
+        id: tags
+        run: |
+          set -euo pipefail
+          TAGS="$IMAGE:runner,$IMAGE:${GITHUB_SHA::12}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAGS="$TAGS,$IMAGE:${GITHUB_REF_NAME},$IMAGE:latest"
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${GITHUB_SHA::12}"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/Dockerfile
+          target: runner
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: VERSION=${{ steps.tags.outputs.version }}
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo '```'
+            echo "${{ steps.tags.outputs.tags }}" | tr ',' '\n'
+            echo '```'
+            echo "Anonymous pull: \`docker pull $IMAGE:runner\`"
+          } >> "$GITHUB_STEP_SUMMARY"
