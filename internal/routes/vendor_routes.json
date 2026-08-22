@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "parity vendor-routes",
-  "source": "services/*/parity/backend.yaml (measured, plus its deployment_hosts for self-hosted vendors), and each vendor's own spec for path prefixes",
+  "source": "services/*/parity/backend.yaml (measured, plus its deployment_hosts for self-hosted vendors and route_aliases for shared deployment variants), and each vendor's own spec for path prefixes",
   "services": {
     "acuity-scheduling": [
       {
@@ -118,6 +118,23 @@
     "frameio-v4": [
       {
         "host": "api.frame.io"
+      }
+    ],
+    "github": [
+      {
+        "host": "api.github.com"
+      },
+      {
+        "host": "github.com",
+        "paths": [
+          "/login"
+        ]
+      },
+      {
+        "host": "uploads.github.com",
+        "paths": [
+          "/repos"
+        ]
       }
     ],
     "google-calendar": [
@@ -255,6 +272,16 @@
           "/services/oauth2/authorize",
           "/services/oauth2/token"
         ]
+      }
+    ],
+    "slack": [
+      {
+        "host": "slack.com"
+      }
+    ],
+    "slack-user": [
+      {
+        "host": "slack.com"
       }
     ],
     "stripe": [
