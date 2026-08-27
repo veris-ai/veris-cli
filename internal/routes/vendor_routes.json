@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "parity vendor-routes",
-  "source": "services/*/parity/backend.yaml (measured, plus its deployment_hosts for self-hosted vendors), and each vendor's own spec for path prefixes",
+  "source": "services/*/parity/backend.yaml (measured, plus its deployment_hosts for self-hosted vendors and route_aliases for shared deployment variants), and each vendor's own spec for path prefixes",
   "services": {
     "acuity-scheduling": [
       {
@@ -120,6 +120,23 @@
         "host": "api.frame.io"
       }
     ],
+    "github": [
+      {
+        "host": "api.github.com"
+      },
+      {
+        "host": "github.com",
+        "paths": [
+          "/login"
+        ]
+      },
+      {
+        "host": "uploads.github.com",
+        "paths": [
+          "/repos"
+        ]
+      }
+    ],
     "google-calendar": [
       {
         "host": "www.googleapis.com",
@@ -203,10 +220,7 @@
     ],
     "microsoft-graph": [
       {
-        "host": "graph.microsoft.com",
-        "paths": [
-          "/v1.0"
-        ]
+        "host": "graph.microsoft.com"
       }
     ],
     "microsoft-identity": [
@@ -250,11 +264,28 @@
     ],
     "salesforce": [
       {
+        "host": "*.my.salesforce.com",
+        "paths": [
+          "/id",
+          "/services"
+        ]
+      },
+      {
         "host": "login.salesforce.com",
         "paths": [
           "/services/oauth2/authorize",
           "/services/oauth2/token"
         ]
+      }
+    ],
+    "slack": [
+      {
+        "host": "slack.com"
+      }
+    ],
+    "slack-user": [
+      {
+        "host": "slack.com"
       }
     ],
     "stripe": [
