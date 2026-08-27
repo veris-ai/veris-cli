@@ -220,10 +220,7 @@
     ],
     "microsoft-graph": [
       {
-        "host": "graph.microsoft.com",
-        "paths": [
-          "/v1.0"
-        ]
+        "host": "graph.microsoft.com"
       }
     ],
     "microsoft-identity": [
@@ -266,6 +263,13 @@
       }
     ],
     "salesforce": [
+      {
+        "host": "*.my.salesforce.com",
+        "paths": [
+          "/id",
+          "/services"
+        ]
+      },
       {
         "host": "login.salesforce.com",
         "paths": [
