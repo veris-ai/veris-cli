@@ -102,7 +102,7 @@ func root() *cli.Command {
 		},
 	}
 	r.Sub = append(r.Sub, loginCommands()...)
-	r.Sub = append(r.Sub, envCommand(), initCommand())
+	r.Sub = append(r.Sub, servicesCommand(), envCommand(), initCommand())
 	r.Sub = append(r.Sub, sandboxCommands()...)
 	r.Sub = append(r.Sub, snapshotCommand(), baselineCommand())
 	r.Sub = append(r.Sub, routingCommands()...)
