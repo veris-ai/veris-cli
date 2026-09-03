@@ -54,19 +54,27 @@ var (
 // verbs act on this folder's sandbox, the group takes an explicit --id.
 func sandboxBaseCommands() []*cli.Command {
 	var getID, deleteID, resetID, listEnv string
-	var downAll, listAll bool
+	var downAll, listAll, statusWatch, getWatch bool
 	return []*cli.Command{
 		upCommand(),
 		{
 			Name:    "status",
 			Summary: "This folder's sandbox and its twins",
-			Usage:   "veris status [--json]",
-			Help:    "status is sandbox get for this folder: the sandbox's state, boot source and expiry, then every twin's status, env hint, URL and table counts.",
+			Usage:   "veris status [--watch] [--json]",
+			Help: "status is sandbox get for this folder: the sandbox's state, boot source and expiry, then every twin's status, env hint, URL and table counts.\n" +
+				"--watch keeps a live panel of the sandbox and its twins' routability on stderr, redrawn every 2 s until Ctrl-C;\n" +
+				"off a terminal it prints the normal output and then one line per change.",
+			Flags: func(fs *flag.FlagSet) {
+				fs.BoolVar(&statusWatch, "watch", false, "keep a live panel until Ctrl-C")
+			},
 			Run: func(ctx *cli.Context, args []string) error {
 				if err := noPositionals(ctx, args); err != nil {
 					return err
 				}
-				return sandboxGet(ctx, "")
+				if err := noWatchJSON(ctx, statusWatch); err != nil {
+					return err
+				}
+				return sandboxGet(ctx, "", statusWatch)
 			},
 		},
 		{
@@ -93,15 +101,19 @@ func sandboxBaseCommands() []*cli.Command {
 				{
 					Name:    "get",
 					Summary: "One sandbox: status, boot source, expiry and its twins",
-					Usage:   "veris sandbox get [--id ID] [--json]",
+					Usage:   "veris sandbox get [--id ID] [--watch] [--json]",
 					Flags: func(fs *flag.FlagSet) {
 						fs.StringVar(&getID, "id", "", "sandbox id (default: this folder's)")
+						fs.BoolVar(&getWatch, "watch", false, "keep a live panel until Ctrl-C")
 					},
 					Run: func(ctx *cli.Context, args []string) error {
 						if err := noPositionals(ctx, args); err != nil {
 							return err
 						}
-						return sandboxGet(ctx, getID)
+						if err := noWatchJSON(ctx, getWatch); err != nil {
+							return err
+						}
+						return sandboxGet(ctx, getID, getWatch)
 					},
 				},
 				{
@@ -166,6 +178,24 @@ func noPositionals(ctx *cli.Context, args []string) error {
 	return fmt.Errorf("%s takes no arguments (got %q)", strings.Join(ctx.Path[1:], " "), strings.Join(args, " "))
 }
 
+// noWatchJSON refuses --watch beside --json on a command that would never
+// end: stdout carries one body, and a panel that runs until Ctrl-C has no
+// one body to carry. --quiet is refused with it for the mirror reason: the
+// panel and its state lines are the watch's whole output, and a watch with
+// nothing to say would sit silent until Ctrl-C.
+func noWatchJSON(ctx *cli.Context, watch bool) error {
+	if !watch || ctx.Globals == nil {
+		return nil
+	}
+	if ctx.Globals.JSON {
+		return fmt.Errorf("%s takes --watch or --json, not both", strings.Join(ctx.Path[1:], " "))
+	}
+	if ctx.Globals.Quiet {
+		return fmt.Errorf("%s takes --watch or --quiet, not both", strings.Join(ctx.Path[1:], " "))
+	}
+	return nil
+}
+
 // --- up ---------------------------------------------------------------------
 
 // upOptions are up's own flags; "" and 0 mean "not given", which lets the
@@ -177,6 +207,7 @@ type upOptions struct {
 	snapshot    string
 	callbackURL string
 	timeout     string
+	watch       bool
 }
 
 func upCommand() *cli.Command {
@@ -184,13 +215,15 @@ func upCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "up",
 		Summary: "Start a sandbox of the environment and wait for it",
-		Usage:   "veris up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--callback-url URL] [--timeout 300s] [--json]",
+		Usage:   "veris up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--callback-url URL] [--timeout 300s] [--watch] [--json]",
 		Help: "up deploys a sandbox of the environment (NAME, --env, the folder's `use`, or the project default),\n" +
 			"remembers its id for this folder at once, waits until the control plane reports it ready and\n" +
 			"every twin answers through the gateway, adds the environment config's data files, and prints\n" +
 			"the env-var hints the code under test needs. Settings come from the flag, then the environment\n" +
-			"config, then the defaults (ttl 120, boot bundle).",
+			"config, then the defaults (ttl 120, boot bundle). --watch shows the wait as a live panel of the\n" +
+			"sandbox and its twins on a terminal, redrawn every 2 s until every twin is routable.",
 		Flags: func(fs *flag.FlagSet) {
+			fs.BoolVar(&o.watch, "watch", false, "show the wait as a live panel (terminal only)")
 			fs.StringVar(&o.env, "env", "", "environment name or id (same as NAME)")
 			fs.IntVar(&o.ttl, "ttl", 0, "sandbox lifetime in minutes (config, then 120)")
 			fs.StringVar(&o.boot, "boot", "", "what the sandbox boots: bundle, baseline or snapshot (config, then bundle)")
@@ -334,13 +367,25 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 	}
 
 	deadline := time.Now().Add(timeout)
-	ready, err := waitReady(bg, s, c, sb.ID, deadline, timeout)
-	if err != nil {
-		return s, sb, err
-	}
-	sb = ready
-	if err := waitRoutable(bg, s, sb, deadline, timeout); err != nil {
-		return s, sb, err
+	// --watch is the panel when stderr is a terminal; anywhere else the
+	// spinner path already prints a line per state change, which is the
+	// degradation.
+	if o.watch && s.ui.OutTTY && !s.ui.Quiet {
+		s.ui.Info("")
+		ready, err := watchUntilRoutable(bg, s, c, sb.ID, watchEnvLine(env), deadline, timeout)
+		if err != nil {
+			return s, sb, err
+		}
+		sb = ready
+	} else {
+		ready, err := waitReady(bg, s, c, sb.ID, deadline, timeout)
+		if err != nil {
+			return s, sb, err
+		}
+		sb = ready
+		if err := waitRoutable(bg, s, sb, deadline, timeout); err != nil {
+			return s, sb, err
+		}
 	}
 	printHints(s.ui, sb.Services)
 	if conf != nil && len(conf.Data) > 0 {
@@ -796,8 +841,10 @@ func isHTTPURL(u string) bool {
 
 // sandboxGet is status and sandbox get: the sandbox as the control plane
 // sees it, then each twin as it answers itself. idFlag is --id, "" for this
-// folder's sandbox.
-func sandboxGet(ctx *cli.Context, idFlag string) error {
+// folder's sandbox. watch keeps going: on a terminal the panel replaces
+// the one-shot output and is redrawn until Ctrl-C; off one the one-shot
+// output prints and each change after it is a line.
+func sandboxGet(ctx *cli.Context, idFlag string, watch bool) error {
 	s, err := newSession(ctx, "", idFlag)
 	if err != nil {
 		return err
@@ -827,7 +874,6 @@ func sandboxGet(ctx *cli.Context, idFlag string) error {
 	}
 	env, envErr := c.GetEnvironment(bg, sb.EnvironmentID)
 
-	s.ui.Info("Sandbox %s", sb.ID)
 	envLine := sb.EnvironmentID
 	if env != nil && env.Name != "" {
 		envLine = fmt.Sprintf("%s (%s)", env.Name, sb.EnvironmentID)
@@ -835,10 +881,14 @@ func sandboxGet(ctx *cli.Context, idFlag string) error {
 	if name := projectEnvName(s, sb.EnvironmentID); name != "" {
 		envLine += " → " + name
 	}
-	s.ui.Info("Environment: %s", envLine)
 	if envErr != nil {
 		s.ui.Warn("could not read environment %s: %v", shortID(sb.EnvironmentID), envErr)
 	}
+	if watch && s.ui.OutTTY && !s.ui.Quiet {
+		return watchStatus(s, c, sb.ID, envLine)
+	}
+	s.ui.Info("Sandbox %s", sb.ID)
+	s.ui.Info("Environment: %s", envLine)
 	status := sb.Status
 	if sb.FailureReason != "" {
 		status += " — " + sb.FailureReason
@@ -857,6 +907,9 @@ func sandboxGet(ctx *cli.Context, idFlag string) error {
 	}
 	if len(rows) > 0 {
 		s.ui.Table([]string{"  Twin", "Status", "Env hint", "URL", "Tables"}, rows)
+	}
+	if watch {
+		return watchStatus(s, c, sb.ID, envLine)
 	}
 	return nil
 }

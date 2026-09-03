@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/veris-ai/veris-cli/internal/cfg"
@@ -28,10 +29,13 @@ reports. An unreachable plane changes nothing, and the exit is 0 either way.`,
 	}
 }
 
-// versionReport is --json's body. ControlPlane is null when no plane was
-// asked or none answered.
+// versionReport is --json's body. OS and Arch are the binary's, the first
+// two questions of any report this ends up pasted into; ControlPlane is
+// null when no plane was asked or none answered.
 type versionReport struct {
 	Version      string       `json:"version"`
+	OS           string       `json:"os"`
+	Arch         string       `json:"arch"`
 	ControlPlane *planeHealth `json:"control_plane"`
 }
 
@@ -49,7 +53,7 @@ func cmdVersion(ctx *cli.Context, _ []string) error {
 	}
 	plane := controlPlaneHealth(ctx)
 	if g.JSON {
-		return printJSON(ctx.Stdout, versionReport{Version: version, ControlPlane: plane})
+		return printJSON(ctx.Stdout, versionReport{Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, ControlPlane: plane})
 	}
 	fmt.Fprintln(ctx.Stdout, version)
 	if plane == nil || g.Quiet {

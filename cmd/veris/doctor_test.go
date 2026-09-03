@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/veris-ai/veris-cli/internal/ca"
 	"github.com/veris-ai/veris-cli/internal/cfg"
 	"github.com/veris-ai/veris-cli/internal/cli"
 )
@@ -31,6 +32,19 @@ type doctorPlane struct {
 	sandboxExpiresIn time.Duration // 0 is two hours
 	failureReason    string
 	twinStatus       int // 0 answers ok
+
+	// Milestone 3: the sandbox's clock and the callback registration the
+	// stripe twin holds. clockMode "" is live; clockStatus 0 answers 200.
+	// probeURL "" is no registration; probeState is its probe_state and
+	// probeDead adds a dead-tunnel signature to the last probe result;
+	// clientStatus != 0 fails the read.
+	clockMode    string
+	clockOffset  int64
+	clockStatus  int
+	probeURL     string
+	probeState   string
+	probeDead    bool
+	clientStatus int
 }
 
 func (p *doctorPlane) serve(t *testing.T) string {
@@ -58,6 +72,25 @@ func (p *doctorPlane) handle(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			reply(http.StatusOK, map[string]any{"status": "ok", "service": "stripe"})
+			return
+		}
+		if strings.HasSuffix(path, "/veris/data") && r.URL.Query().Get("entity_type") == "client" {
+			if p.clientStatus != 0 {
+				reply(p.clientStatus, map[string]any{"detail": "client table unavailable"})
+				return
+			}
+			rows := []map[string]any{}
+			if p.probeURL != "" {
+				var result any
+				if p.probeDead {
+					result = map[string]any{"status": 530, "dead_tunnel_signature": "cloudflare-1033"}
+				}
+				rows = append(rows, map[string]any{
+					"id": 1, "default_base_url": p.probeURL, "base_url_revision": 3,
+					"probe_state": p.probeState, "probed_revision": 3, "last_probe_result": result,
+				})
+			}
+			reply(http.StatusOK, map[string]any{"entity_type": "client", "rows": rows, "total": len(rows), "limit": 1, "offset": 0})
 			return
 		}
 		reply(http.StatusNotFound, map[string]any{"detail": "Not Found"})
@@ -92,6 +125,17 @@ func (p *doctorPlane) handle(w http.ResponseWriter, r *http.Request) {
 			"id": devID, "name": "checkout-svc", "services": []string{"stripe", "postgres"},
 			"created_at": "2026-03-01T09:00:00Z", "owner": "org1", "baseline": nil,
 		})
+	case "/v1/environments/" + devID + "/sandboxes/" + sbID + "/clock":
+		if p.clockStatus != 0 {
+			reply(p.clockStatus, map[string]any{"detail": "clock unavailable"})
+			return
+		}
+		clock := map[string]any{"id": 1, "mode": "live", "offset_seconds": p.clockOffset, "frozen_time": nil}
+		if p.clockMode == "frozen" {
+			clock["mode"] = "frozen"
+			clock["frozen_time"] = int64(1772355600) // 2026-03-01T09:00:00Z
+		}
+		reply(http.StatusOK, clock)
 	case "/v1/sandboxes/" + sbID:
 		if p.sandboxMissing {
 			reply(http.StatusNotFound, map[string]any{"detail": "sandbox " + sbID + " not found"})
@@ -138,9 +182,37 @@ func fakeDocker(t *testing.T, script string) {
 	t.Setenv("PATH", dir)
 }
 
+// fakeCloudflared appends a directory holding a cloudflared that does
+// nothing to PATH; doctor only looks for it. Call it after fakeDocker,
+// which replaces PATH.
+func fakeCloudflared(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("stands in for cloudflared with a shell script")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cloudflared"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", os.Getenv("PATH")+string(os.PathListSeparator)+dir)
+}
+
+// mintCA lays down the CA a first run would have, under the bench's HOME,
+// and returns the certificate's path.
+func mintCA(t *testing.T) string {
+	t.Helper()
+	dir := defaultCADir()
+	c, err := ca.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.CertPath()
+}
+
 // doctorBench lays out the happy machine: logged in against plane, a project
-// with dev as its default, this folder's sandbox pointer, and a docker whose
-// daemon answers. Tests break one thing each.
+// with dev as its default, this folder's sandbox pointer, a docker whose
+// daemon answers, cloudflared on PATH and a CA already minted. Tests break
+// one thing each.
 func doctorBench(t *testing.T, plane *doctorPlane) *bench {
 	t.Helper()
 	b := newBench(t)
@@ -151,6 +223,8 @@ func doctorBench(t *testing.T, plane *doctorPlane) *bench {
 	b.twoEnvs()
 	b.local(cfg.Local{Sandbox: &cfg.SandboxRef{ID: sbID, EnvironmentID: devID}})
 	fakeDocker(t, "#!/bin/sh\necho 27.1.1\n")
+	fakeCloudflared(t)
+	mintCA(t)
 	return b
 }
 
@@ -197,11 +271,15 @@ func TestDoctorHappyPath(t *testing.T) {
 		" reachable (status ok, checkout 3f9a1b2c)",
 		"✓ Gateway mode configured (canary gw.api.veris.ai)",
 		"✓ docker on PATH, daemon answers (server 27.1.1)",
+		"✓ cloudflared on PATH (",
+		"✓ CA "+filepath.Join(b.home, ".veris", "ca", "veris-ca.pem")+" (key 0600)",
 		"✓ Project file "+filepath.Join(b.project, ".veris", "twin.yaml")+" (2 environments, default 'dev')",
 		"✓ Environment dev (k3j2v0d8…) reachable; services: stripe, postgres",
 		"✓ Sandbox 7hqz4m2n… ready, expires in 2h 0m",
+		"✓ Clock live",
 		"  ✓ stripe  ok",
 		"  ✓ postgres  data plane (handed to the app, not proxied)",
+		"✓ No callback URL registered (run --expose PORT registers one)",
 	)
 	doctorRejects(t, stderr, "✗", "!", doctorKey)
 }
@@ -226,7 +304,7 @@ func TestDoctorJSONCarriesEveryCheck(t *testing.T) {
 	for _, c := range report.Checks {
 		names = append(names, c.Check+":"+c.Status)
 	}
-	want := "binary:ok login:ok plane:ok gateway:ok docker:ok project:ok environment:ok sandbox:ok twin:stripe:ok twin:postgres:ok"
+	want := "binary:ok login:ok plane:ok gateway:ok docker:ok tunnel:ok ca:ok project:ok environment:ok sandbox:ok clock:ok twin:stripe:ok twin:postgres:ok callback:ok"
 	if got := strings.Join(names, " "); got != want {
 		t.Errorf("checks = %q\nwant     %q", got, want)
 	}
@@ -288,6 +366,9 @@ func TestDoctorPlaneDown(t *testing.T) {
 		"✗ Login not verified: "+url+" answered",
 		"✗ Control plane "+url+" unreachable:",
 		"! docker not on PATH — host tier works; --image (container tier) will not",
+		"! cloudflared not on PATH — --expose (callbacks) needs it in the host tier",
+		"→ Next: brew install cloudflared, or see cloudflare.com/products/tunnel",
+		"! No CA at "+filepath.Join(b.home, ".veris", "ca")+" yet; the first run mints one",
 		"! No .veris/twin.yaml found (searched up from "+b.project+")",
 		"→ Next: veris env create",
 		"! No sandbox for this folder",
@@ -420,7 +501,325 @@ func TestDoctorQuietKeepsTheFindings(t *testing.T) {
 	doctorRejects(t, stderr, "✓")
 }
 
+// --- Milestone 3 lines ------------------------------------------------------
+
+// The tunnel prerequisite: cloudflared on PATH is ✓; missing, the line says
+// whether --image still delivers callbacks (the runner image bundles it) or
+// nothing does.
+func TestDoctorM3Tunnel(t *testing.T) {
+	doctorBench(t, &doctorPlane{gatewayAvailable: true})
+	_, stderr, code := runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("exit %d, want 0:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr, "✓ cloudflared on PATH (", "/cloudflared) — --expose can open a callback tunnel")
+
+	// docker up, cloudflared gone: the container tier still has one.
+	fakeDocker(t, "#!/bin/sh\necho 27.1.1\n")
+	_, stderr, code = runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("a missing cloudflared is a warning; exit %d:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr, "! cloudflared not on PATH — --expose works with --image (the runner image bundles it), not in the host tier")
+	doctorRejects(t, stderr, "brew install cloudflared")
+
+	// Neither: the install hint.
+	fakeDocker(t, "")
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorWants(t, stderr,
+		"! cloudflared not on PATH — --expose (callbacks) needs it in the host tier",
+		"→ Next: brew install cloudflared, or see cloudflare.com/products/tunnel")
+
+	// --json carries the same verdicts under "tunnel".
+	stdout, _, _ := runDoctor(t, cli.Globals{JSON: true})
+	var report doctorReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range report.Checks {
+		if c.Check == "tunnel" && c.Status != "warn" {
+			t.Errorf("tunnel = %+v, want warn", c)
+		}
+	}
+}
+
+// The CA: none yet is !, a key readable by others is ! with the chmod,
+// present and 0600 is ✓.
+func TestDoctorM3CA(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes")
+	}
+	b := doctorBench(t, &doctorPlane{gatewayAvailable: true})
+	dir := filepath.Join(b.home, ".veris", "ca")
+	cert, key := filepath.Join(dir, "veris-ca.pem"), filepath.Join(dir, "veris-ca-key.pem")
+
+	_, stderr, code := runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("exit %d, want 0:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr, "✓ CA "+cert+" (key 0600)")
+
+	if err := os.Chmod(key, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, code = runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("a loose key is a warning; exit %d:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr, "! CA key "+key+" is 0644, not 0600; it can mint a certificate for any host", "→ Next: chmod 600 "+key)
+
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorWants(t, stderr, "! CA "+cert+" has no key beside it; the next run mints a new CA")
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, _ := runDoctor(t, cli.Globals{JSON: true})
+	if stderr != "" {
+		t.Errorf("--json: stderr %q", stderr)
+	}
+	var report doctorReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range report.Checks {
+		if c.Check == "ca" {
+			found = true
+			if c.Status != "warn" || !strings.Contains(c.Message, "No CA at "+dir+" yet; the first run mints one") {
+				t.Errorf("ca = %+v", c)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no ca check in %s", stdout)
+	}
+	// doctor changes nothing: no CA was minted by looking for one.
+	if _, err := os.Stat(cert); err == nil {
+		t.Error("doctor minted a CA")
+	}
+}
+
+// The sandbox's clock: live is ✓ (with its offset), frozen is ! with the
+// verb that unfreezes it, and a clock that will not read is ! too.
+func TestDoctorM3Clock(t *testing.T) {
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, clockOffset: 7 * 24 * 3600})
+	_, stderr, code := runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("exit %d, want 0:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr, "✓ Clock live (+7d)")
+
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, clockMode: "frozen"})
+	_, stderr, code = runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("a frozen clock is a warning; exit %d:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr,
+		"! Clock frozen at 2026-03-01T09:00:00Z; outbound deliveries are paused while it is frozen",
+		"→ Next: veris sandbox clock set --live")
+
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, clockStatus: http.StatusBadGateway})
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorWants(t, stderr, "! Clock of sandbox 7hqz4m2n… not read: [502] clock unavailable")
+
+	// The clock is read once the sandbox is up, not while it is still on its
+	// way or once it is gone: there the sandbox line is the finding, and a
+	// clock route that cannot answer yet would only restate it.
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, sandboxStatus: "provisioning", clockStatus: http.StatusBadGateway})
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorWants(t, stderr, "! Sandbox 7hqz4m2n… still provisioning")
+	doctorRejects(t, stderr, "Clock live", "Clock frozen", "Clock of sandbox")
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, sandboxMissing: true})
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorRejects(t, stderr, "Clock live", "Clock frozen", "Clock of sandbox")
+}
+
+// The callback registration, as the stripe twin holds it: none is ✓, one
+// whose probe answered is ✓, one the sandbox could not reach is ! (a dead
+// tunnel named as such), and a twin that will not answer is ! not read.
+func TestDoctorM3Callback(t *testing.T) {
+	cases := []struct {
+		name  string
+		plane doctorPlane
+		want  []string
+		not   []string
+	}{
+		{"none", doctorPlane{}, []string{"✓ No callback URL registered (run --expose PORT registers one)"}, nil},
+		{"answered", doctorPlane{probeURL: "https://abc.trycloudflare.com", probeState: "answered"},
+			[]string{"✓ Callbacks registered at https://abc.trycloudflare.com (probe answered)"}, []string{"→ Next: veris run --expose"}},
+		{"unreachable", doctorPlane{probeURL: "https://abc.trycloudflare.com", probeState: "unreachable"},
+			[]string{"! Callbacks registered at https://abc.trycloudflare.com, but the sandbox could not reach it (probe_state unreachable)",
+				"→ Next: veris run --expose PORT … registers this run's own URL"}, nil},
+		{"dead tunnel", doctorPlane{probeURL: "https://old.trycloudflare.com", probeState: "unreachable", probeDead: true},
+			[]string{"! Callbacks registered at https://old.trycloudflare.com, but the tunnel behind it is gone (probe_state unreachable); an earlier run left it"}, nil},
+		{"not read", doctorPlane{clientStatus: http.StatusBadGateway},
+			[]string{"! Callback registration not read: [502] client table unavailable"}, nil},
+		{"not while provisioning", doctorPlane{sandboxStatus: "provisioning", probeURL: "https://abc.trycloudflare.com", probeState: "unreachable"},
+			nil, []string{"Callbacks registered", "Callback registration", "No callback URL"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plane := tc.plane
+			plane.gatewayAvailable = true
+			doctorBench(t, &plane)
+			_, stderr, code := runDoctor(t, cli.Globals{})
+			if code != 0 {
+				t.Errorf("the callback line never fails a run; exit %d:\n%s", code, stderr)
+			}
+			doctorWants(t, stderr, tc.want...)
+			doctorRejects(t, stderr, tc.not...)
+		})
+	}
+
+	// --json carries the registration itself.
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, probeURL: "https://abc.trycloudflare.com", probeState: "answered"})
+	stdout, _, _ := runDoctor(t, cli.Globals{JSON: true})
+	var report doctorReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	last := report.Checks[len(report.Checks)-1]
+	detail, _ := last.Detail.(map[string]any)
+	if last.Check != "callback" || last.Status != "ok" || detail["url"] != "https://abc.trycloudflare.com" || detail["probe_state"] != "answered" {
+		t.Errorf("last check = %+v", last)
+	}
+}
+
+// A shell key beside a profile with a login of its own: the shell's key is
+// what is sent, to the profile's plane, and the line says so; a refused
+// shell key is the shell's problem, in the words every command uses; and a
+// shell that names the plane as well has said what it means.
+func TestDoctorM3ShellKey(t *testing.T) {
+	plane := &doctorPlane{gatewayAvailable: true}
+	b := doctorBench(t, plane)
+	url := b.planeURL(t)
+	b.global(cfg.Global{ActiveProfile: "default", Profiles: map[string]cfg.Profile{
+		"default": {APIBase: url, APIKey: "vsk_profilekey0000"},
+	}})
+	t.Setenv(cfg.EnvAPIKey, doctorKey)
+
+	_, stderr, code := runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("an accepted shell key is a warning; exit %d:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr,
+		"✓ Logged in: Acme via env VERIS_API_KEY (vsk_testkey0…)",
+		"! VERIS_API_KEY from your shell (vsk_testkey0…) is sent to "+url+" instead of profile 'default''s own key (vsk_profilek…)",
+		"→ Next: unset VERIS_API_KEY to use the profile, or export VERIS_API_BASE for the plane the key belongs to",
+	)
+	doctorRejects(t, stderr, doctorKey, "vsk_profilekey0000")
+
+	// The shell also names the plane: coherent, nothing to say.
+	t.Setenv(cfg.EnvAPIBase, url)
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorRejects(t, stderr, "instead of profile")
+	t.Setenv(cfg.EnvAPIBase, "")
+
+	// The same key in both places is not an override.
+	b.global(cfg.Global{ActiveProfile: "default", Profiles: map[string]cfg.Profile{
+		"default": {APIBase: url, APIKey: doctorKey},
+	}})
+	_, stderr, _ = runDoctor(t, cli.Globals{})
+	doctorRejects(t, stderr, "instead of profile")
+
+	// A refused shell key: the shell's fault, not the login's.
+	t.Setenv(cfg.EnvAPIKey, "vsk_wrongplane00000")
+	_, stderr, code = runDoctor(t, cli.Globals{})
+	if code != 1 {
+		t.Errorf("exit %d, want 1:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr,
+		"✗ VERIS_API_KEY from your shell was rejected by "+url+": [401] invalid or missing API key",
+		"→ Next: unset VERIS_API_KEY to use profile 'default', or export a key for "+url,
+	)
+	// One problem, one remedy: the shell-key warning does not restate it.
+	doctorRejects(t, stderr, "Not logged in", "vsk_wrongplane00000", "instead of profile")
+	if n := strings.Count(stderr, "VERIS_API_KEY from your shell"); n != 1 {
+		t.Errorf("the refused shell key is blamed once, got %d:\n%s", n, stderr)
+	}
+
+	// --json names the check.
+	t.Setenv(cfg.EnvAPIKey, doctorKey)
+	b.global(cfg.Global{ActiveProfile: "default", Profiles: map[string]cfg.Profile{
+		"default": {APIBase: url, APIKey: "vsk_profilekey0000"},
+	}})
+	stdout, _, _ := runDoctor(t, cli.Globals{JSON: true})
+	var report doctorReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Checks) < 3 || report.Checks[2].Check != "shell_key" || report.Checks[2].Status != "warn" {
+		t.Errorf("checks = %+v", report.Checks)
+	}
+	if strings.Contains(stdout, doctorKey) || strings.Contains(stdout, "vsk_profilekey0000") {
+		t.Errorf("keys must be masked:\n%s", stdout)
+	}
+}
+
+// planeURL is the api base the bench's default profile points at.
+func (b *bench) planeURL(t *testing.T) string {
+	t.Helper()
+	g, err := cfg.LoadGlobal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g.Profiles["default"].APIBase
+}
+
 // --- version ----------------------------------------------------------------
+
+// version --json: the binary's version, os and arch, and the plane as null
+// when none answered -- valid JSON on stdout alone, in every case.
+func TestVersionJSON(t *testing.T) {
+	b := newBench(t)
+	stdout, stderr := runVersion(t, cli.Globals{JSON: true})
+	if stderr != "" {
+		t.Errorf("--json: stderr %q", stderr)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(stdout), &body); err != nil {
+		t.Fatalf("--json: %v\n%s", err, stdout)
+	}
+	if body["version"] != version || body["os"] != runtime.GOOS || body["arch"] != runtime.GOARCH {
+		t.Errorf("body = %v", body)
+	}
+	if plane, ok := body["control_plane"]; !ok || plane != nil {
+		t.Errorf("control_plane = %v, want null on a fresh machine", plane)
+	}
+
+	url := (&doctorPlane{}).serve(t)
+	b.global(cfg.Global{ActiveProfile: "default", Profiles: map[string]cfg.Profile{
+		"default": {APIBase: url, APIKey: doctorKey},
+	}})
+	stdout, stderr = runVersion(t, cli.Globals{JSON: true, Quiet: true})
+	if stderr != "" {
+		t.Errorf("--json -q: stderr %q", stderr)
+	}
+	var report versionReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("--json: %v\n%s", err, stdout)
+	}
+	if report.OS != runtime.GOOS || report.ControlPlane == nil || report.ControlPlane.APIBase != url || report.ControlPlane.Checkout != "3f9a1b2c" {
+		t.Errorf("report = %+v (plane %+v)", report, report.ControlPlane)
+	}
+	if strings.Contains(stdout, doctorKey) {
+		t.Errorf("the key has no place in version:\n%s", stdout)
+	}
+
+	// Through the tree, so --json is read from the globals as a script
+	// passes it.
+	var out, errOut bytes.Buffer
+	if err := cli.Execute(root(), &cli.Globals{}, []string{"version", "--json"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out.Bytes(), &body); err != nil || errOut.Len() != 0 {
+		t.Errorf("version --json: %v, stderr %q\n%s", err, errOut.String(), out.String())
+	}
+}
 
 func runVersion(t *testing.T, g cli.Globals) (stdout, stderr string) {
 	t.Helper()

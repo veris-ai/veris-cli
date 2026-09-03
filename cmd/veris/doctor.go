@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -15,15 +17,19 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/cfg"
 	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/tunnel"
+	"github.com/veris-ai/veris-cli/internal/twin"
 	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
 // doctor is the one screen that answers "why is my first run failing". Each
 // check is one line -- ✓ passed, ! worth knowing, ✗ will fail a run -- and
-// they are ordered the way a run depends on them: the login, the plane it
-// talks to, the gateway that plane offers, docker for the container tier,
-// then this folder's project file, environment and sandbox. Nothing here
-// changes anything; the → lines say what would.
+// they are ordered the way a run depends on them: the login (and a shell
+// key overriding it), the plane it talks to, the gateway that plane offers,
+// docker for the container tier, cloudflared for callbacks, the CA the
+// proxy mints with, then this folder's project file, environment and
+// sandbox with its clock and callback registration. Nothing here changes
+// anything; the → lines say what would.
 
 // doctorCallTimeout bounds every request doctor makes. A plane that takes
 // longer than this to answer a health check is the finding.
@@ -34,12 +40,15 @@ func doctorCommand() *cli.Command {
 	var env string
 	return &cli.Command{
 		Name:    "doctor",
-		Summary: "Check login, plane, docker, project, environment and sandbox",
+		Summary: "Check login, plane, docker, tunnel, CA, project, environment and sandbox",
 		Usage:   "veris doctor [--env NAME] [--json]",
 		Help: `Every check is one line: ✓ passed, ! worth knowing, ✗ will fail a run.
 Nothing is changed; the → lines name the command that would. Exits 1
 when any check failed, and --json puts the same checks on stdout. --env
-checks a particular environment rather than the one this folder uses.`,
+checks a particular environment rather than the one this folder uses.
+Besides the login, plane and project: docker for --image, cloudflared for
+--expose, the CA under ~/.veris/ca, and for a sandbox that is up its
+clock (frozen pauses deliveries) and the callback URL registered on it.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&env, "env", "", "environment `name` to check instead of the one in use")
 		},
@@ -71,6 +80,9 @@ type doctor struct {
 	s      *session
 	ui     *ui.UI
 	checks []doctorCheck
+	// shellKeyBlamed is set once the login line has laid a refused key at
+	// the shell's door, so shellKey says nothing more about the same key.
+	shellKeyBlamed bool
 }
 
 func cmdDoctor(ctx *cli.Context, args []string) error {
@@ -95,11 +107,14 @@ func doctorWith(ctx *cli.Context, args []string, env string) error {
 
 	d.binary()
 	loggedIn := d.login()
+	d.shellKey()
 	planeUp := d.plane()
 	if loggedIn && planeUp {
 		d.gateway()
 	}
-	d.docker()
+	dockerUp := d.docker()
+	d.tunnel(dockerUp)
+	d.ca()
 	d.project()
 	d.environment(loggedIn)
 	d.sandbox(loggedIn)
@@ -189,6 +204,16 @@ func (d *doctor) login() bool {
 	})
 	if err != nil {
 		if api.IsStatus(err, http.StatusUnauthorized) {
+			// A refused shell key is not a login problem, and (*session).fail
+			// says so in the same words: the profile may be fine, the shell is
+			// pointing every command at another plane's key.
+			if res.APIKeySource == cfg.SourceEnv {
+				d.fail("login", map[string]any{"key_source": string(res.APIKeySource), "key": ui.MaskKey(res.APIKey)},
+					"%s from your shell was rejected by %s: %v", cfg.EnvAPIKey, res.APIBase, err)
+				d.next(fmt.Sprintf("unset %s to use profile '%s', or export a key for %s", cfg.EnvAPIKey, profile, res.APIBase))
+				d.shellKeyBlamed = true
+				return false
+			}
 			_ = notLoggedIn(d.ui, profile, err.Error())
 			c := d.record("fail", "login", fmt.Sprintf("not logged in for profile '%s': %v", profile, err), nil)
 			c.Next = "veris login --profile " + profile
@@ -208,6 +233,33 @@ func (d *doctor) login() bool {
 		"organization_id": me.OrganizationID, "organization": org, "kind": me.Kind,
 	}, "Logged in: %s via %s (%s)", org, source, ui.MaskKey(res.APIKey))
 	return true
+}
+
+// shellKey is the warning for a VERIS_API_KEY that overrides a profile with
+// a login of its own. The shell's key wins the precedence, and unless the
+// shell also names the plane (VERIS_API_BASE or --api-base) it is sent to
+// the profile's plane -- where a key minted for another one is refused, or
+// worse, accepted by a plane the user did not mean. Nothing to say when the
+// profile has no key, when the two are the same key, or when the shell
+// chose the plane as well.
+func (d *doctor) shellKey() {
+	res := d.s.res
+	if d.shellKeyBlamed || res.APIKeySource != cfg.SourceEnv || res.Global == nil {
+		return
+	}
+	if res.APIBaseSource == cfg.SourceEnv || res.APIBaseSource == cfg.SourceFlag {
+		return
+	}
+	p, ok := res.Global.Profiles[res.ProfileName]
+	if !ok || p.APIKey == "" || p.APIKey == res.APIKey {
+		return
+	}
+	d.warn("shell_key", map[string]any{
+		"profile": res.ProfileName, "api_base": res.APIBase,
+		"shell_key": ui.MaskKey(res.APIKey), "profile_key": ui.MaskKey(p.APIKey),
+	}, "%s from your shell (%s) is sent to %s instead of profile '%s''s own key (%s)",
+		cfg.EnvAPIKey, ui.MaskKey(res.APIKey), res.APIBase, res.ProfileName, ui.MaskKey(p.APIKey))
+	d.next(fmt.Sprintf("unset %s to use the profile, or export %s for the plane the key belongs to", cfg.EnvAPIKey, cfg.EnvAPIBase))
 }
 
 // plane is GET /healthz, which needs no key: it tells "the plane is down"
@@ -261,12 +313,13 @@ func (d *doctor) gateway() {
 
 // docker is `docker info` with a deadline. Missing docker is ! rather than
 // ✗: the host tier runs a local child with no docker at all, and only
-// --image needs it.
-func (d *doctor) docker() {
+// --image needs it. It reports whether the container tier is usable, which
+// the tunnel line reads.
+func (d *doctor) docker() bool {
 	path, err := exec.LookPath("docker")
 	if err != nil {
 		d.warn("docker", nil, "docker not on PATH — host tier works; --image (container tier) will not")
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), doctorCallTimeout)
 	defer cancel()
@@ -275,18 +328,69 @@ func (d *doctor) docker() {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		d.warn("docker", map[string]any{"path": path},
 			"docker on PATH but `docker info` did not answer within %s — --image (container tier) will wait on it", doctorCallTimeout)
+		return false
 	case err != nil:
 		d.warn("docker", map[string]any{"path": path},
 			"docker on PATH but `docker info` failed: %s — --image (container tier) will not work until the daemon answers", firstLine(out))
+		return false
 	default:
 		server := strings.TrimSpace(string(out))
 		detail := map[string]any{"path": path, "server_version": server}
 		if server == "" {
 			d.ok("docker", detail, "docker on PATH, daemon answers")
-			return
+			return true
 		}
 		d.ok("docker", detail, "docker on PATH, daemon answers (server %s)", server)
+		return true
 	}
+}
+
+// tunnel is whether cloudflared, which --expose opens the callback path
+// with, can be found. Missing is !: every run without --expose works, and
+// the runner image bundles its own, so with docker up the container tier
+// still delivers callbacks.
+func (d *doctor) tunnel(dockerUp bool) {
+	path, err := exec.LookPath(tunnel.DefaultBinary)
+	if err == nil {
+		d.ok("tunnel", map[string]any{"path": path}, "%s on PATH (%s) — --expose can open a callback tunnel", tunnel.DefaultBinary, path)
+		return
+	}
+	if dockerUp {
+		d.warn("tunnel", map[string]any{"bundled": true},
+			"%s not on PATH — --expose works with --image (the runner image bundles it), not in the host tier", tunnel.DefaultBinary)
+		return
+	}
+	d.warn("tunnel", nil, "%s not on PATH — --expose (callbacks) needs it in the host tier", tunnel.DefaultBinary)
+	d.next("brew install cloudflared, or see cloudflare.com/products/tunnel")
+}
+
+// ca is the CA the proxy mints leaf certificates with, under ~/.veris/ca.
+// None yet is !: the first run mints one. Present, the key beside it is
+// held to 0600 -- it can mint a certificate for any host -- while the
+// certificate itself is public material the workload and docker read, and
+// is written wider on purpose.
+func (d *doctor) ca() {
+	dir := defaultCADir()
+	cert := filepath.Join(dir, "veris-ca.pem")
+	key := filepath.Join(dir, "veris-ca-key.pem")
+	if _, err := os.Stat(cert); err != nil {
+		d.warn("ca", map[string]any{"path": cert}, "No CA at %s yet; the first run mints one", dir)
+		return
+	}
+	detail := map[string]any{"path": cert}
+	info, err := os.Stat(key)
+	if err != nil {
+		d.warn("ca", detail, "CA %s has no key beside it; the next run mints a new CA, and whatever trusted this one must trust it again", cert)
+		return
+	}
+	perm := info.Mode().Perm()
+	detail["key_mode"] = fmt.Sprintf("%04o", perm)
+	if runtime.GOOS != "windows" && perm&0o077 != 0 {
+		d.warn("ca", detail, "CA key %s is %04o, not 0600; it can mint a certificate for any host", key, perm)
+		d.next("chmod 600 " + key)
+		return
+	}
+	d.ok("ca", detail, "CA %s (key 0600)", cert)
 }
 
 // project is whether a .veris/twin.yaml was found up from here. None is !
@@ -447,6 +551,12 @@ func (d *doctor) sandbox(loggedIn bool) {
 		d.warn("sandbox", detail, "Sandbox %s still %s%s", shortID(id), sb.Status, expiry)
 		d.next("veris status")
 	}
+	// The clock, like the callback probe below, is read once the sandbox is
+	// up: while it is still on its way the sandbox line is the finding, and
+	// a clock route that cannot answer yet would only restate it.
+	if sb.Status == api.StatusReady {
+		d.clock(sb)
+	}
 	for _, svc := range sb.Services {
 		check := "twin:" + svc.Name
 		if svc.ControlURL == "" {
@@ -484,6 +594,91 @@ func (d *doctor) sandbox(loggedIn bool) {
 			d.next("veris status")
 		}
 	}
+	if sb.Status == api.StatusReady {
+		d.callback(sb)
+	}
+}
+
+// clock is GET …/sandboxes/{id}/clock: a frozen clock pauses outbound
+// deliveries, so a webhook suite against it waits forever with nothing
+// said, and is !; live, with or without an offset, is ✓.
+func (d *doctor) clock(sb *api.Sandbox) {
+	var clock *api.SandboxClock
+	err := d.call(func(ctx context.Context) error {
+		var err error
+		clock, err = d.s.plane().GetSandboxClock(ctx, sb.EnvironmentID, sb.ID)
+		return err
+	})
+	if err != nil {
+		d.warn("clock", nil, "Clock of sandbox %s not read: %v", shortID(sb.ID), err)
+		return
+	}
+	detail := map[string]any{"mode": clock.Mode, "offset_seconds": clock.OffsetSeconds}
+	if clock.FrozenTime != nil {
+		detail["frozen_time"] = *clock.FrozenTime
+	}
+	if clock.Mode == api.ClockModeFrozen {
+		d.warn("clock", detail, "Clock %s; outbound deliveries are paused while it is frozen", clockLabel(clock))
+		d.next("veris sandbox clock set --live")
+		return
+	}
+	d.ok("clock", detail, "Clock %s", clockLabel(clock))
+}
+
+// callback is the sandbox's callback registration, read from the first
+// twin that serves /veris/data (the row is a sandbox-wide singleton, so one
+// twin answers for all). None registered is ✓ -- a run without --expose
+// needs none. One registered whose probe answered is ✓; one the sandbox
+// could not reach is !: a run started against it receives nothing, and the
+// stale URL of an earlier run is the usual reason.
+func (d *doctor) callback(sb *api.Sandbox) {
+	var control string
+	for _, svc := range sb.Services {
+		if svc.ControlURL != "" && isHTTPURL(svc.ControlURL) {
+			control = svc.ControlURL
+			break
+		}
+	}
+	if control == "" {
+		return
+	}
+	var rows *twin.Rows
+	err := d.call(func(ctx context.Context) error {
+		var err error
+		rows, err = d.s.twin(control).Rows(ctx, "client", 1, 0)
+		return err
+	})
+	if err != nil {
+		d.warn("callback", map[string]any{"control_url": control}, "Callback registration not read: %v", err)
+		return
+	}
+	if len(rows.Rows) == 0 {
+		d.ok("callback", map[string]any{"registered": false}, "No callback URL registered (run --expose PORT registers one)")
+		return
+	}
+	row := rows.Rows[0]
+	base, _ := row["default_base_url"].(string)
+	state, _ := row["probe_state"].(string)
+	if base == "" {
+		d.ok("callback", map[string]any{"registered": false}, "No callback URL registered (run --expose PORT registers one)")
+		return
+	}
+	detail := map[string]any{"registered": true, "url": base, "probe_state": state}
+	if state == "answered" {
+		d.ok("callback", detail, "Callbacks registered at %s (probe answered)", base)
+		return
+	}
+	dead := ""
+	if result, ok := row["last_probe_result"].(map[string]any); ok {
+		dead, _ = result["dead_tunnel_signature"].(string)
+	}
+	if dead != "" {
+		detail["dead_tunnel"] = dead
+		d.warn("callback", detail, "Callbacks registered at %s, but the tunnel behind it is gone (probe_state %s); an earlier run left it", base, state)
+	} else {
+		d.warn("callback", detail, "Callbacks registered at %s, but the sandbox could not reach it (probe_state %s)", base, state)
+	}
+	d.next("veris run --expose PORT … registers this run's own URL")
 }
 
 // durationText renders a remaining time the way the doc's transcript does:

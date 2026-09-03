@@ -16,6 +16,7 @@ func sandboxCommands() []*cli.Command {
 				sandboxTraceCommand(),
 				sandboxClockCommand(),
 			)
+			attachMilestoneThree(c)
 		}
 	}
 	return cmds

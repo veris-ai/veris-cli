@@ -29,6 +29,7 @@ type UI struct {
 	In        io.Reader // stdin; prompts read from it (tests feed key sequences)
 	Color     bool      // ANSI colour on Out
 	TTY       bool      // prompts allowed: In is a terminal
+	OutTTY    bool      // in-place redraws allowed: Out is a terminal (a pipe would keep every frame)
 	Quiet     bool      // -q: Success/Info/Detail/Link/Next are suppressed; Fail and Warn still print
 	AssumeYes bool      // --yes: Confirm returns true without prompting and echoes "question y"
 
@@ -39,15 +40,20 @@ type UI struct {
 }
 
 // New builds a UI for out and in, detecting what they are. TTY is whether in
-// is a terminal; Color is whether out is one, unless NO_COLOR is set or TERM
-// is dumb. Neither detection touches a writer that is not a file, so a buffer
-// in a test is simply "not a terminal".
+// is a terminal; OutTTY is whether out is one, and Color follows it unless
+// NO_COLOR is set or TERM is dumb. The two are kept apart because they come
+// apart in practice: `veris up --watch 2>&1 | tee` has a terminal on stdin
+// and a pipe on stderr, and `veris status --watch </dev/null` the reverse.
+// Neither detection touches a writer that is not a file, so a buffer in a
+// test is simply "not a terminal".
 func New(out io.Writer, in io.Reader) *UI {
+	outTTY := isTerminal(out)
 	return &UI{
-		Out:   out,
-		In:    in,
-		TTY:   isTerminal(in),
-		Color: colorEnabled(isTerminal(out), os.LookupEnv),
+		Out:    out,
+		In:     in,
+		TTY:    isTerminal(in),
+		OutTTY: outTTY,
+		Color:  colorEnabled(outTTY, os.LookupEnv),
 	}
 }
 

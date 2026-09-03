@@ -94,6 +94,7 @@ type sandboxTwins struct {
 	mu  sync.Mutex
 
 	healthFailures int            // stripe /veris/health answers 502 this many times first
+	healthDelay    time.Duration  // stripe /veris/health waits this long times the probe's number, so each answer is slower
 	healthCalls    int            // stripe health probes seen
 	addStatus      int            // stripe POST /veris/data status (0 → 200)
 	addBody        map[string]any // what the last POST /veris/data carried
@@ -108,9 +109,13 @@ func newSandboxTwins(t *testing.T) *sandboxTwins {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/s/"+sbID+"/stripe/veris/health", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		f.healthCalls++
-		if f.healthCalls <= f.healthFailures {
+		calls, failures, delay := f.healthCalls, f.healthFailures, f.healthDelay
+		f.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(time.Duration(calls) * delay)
+		}
+		if calls <= failures {
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte("<html>502 Bad Gateway</html>"))
 			return
@@ -1164,4 +1169,196 @@ func TestSandboxCommandsRefuseStrayWords(t *testing.T) {
 			t.Errorf("%v: exit %d:\n%s", argv, code, stderr)
 		}
 	}
+}
+
+// --- --json on every get and list ---------------------------------------------
+
+const jsonSnapID = "b7d4f1h8k2m5p9r3t6w0y4a8c"
+
+// newJSONPlane is one server that answers every route the get and list
+// leaves read -- the control plane's, and a stripe twin's /veris/* behind
+// it -- with dev's sandbox ready, so one machine can run each leaf under
+// --json. Nothing is scripted: the point is what lands on which stream.
+func newJSONPlane(t *testing.T) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	expires := time.Now().Add(3 * time.Hour)
+	services := func() []api.ServiceInfo {
+		stripe := srv.URL + "/s/" + sbID + "/stripe"
+		return []api.ServiceInfo{
+			{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE"},
+			{Name: "postgres", Status: "ready", URL: "postgresql://app:app@10.0.0.5:5432/sb?sslmode=require", EnvHint: "DATABASE_URL"},
+		}
+	}
+	sandbox := func() *api.Sandbox {
+		sb := readySandbox(services(), expires)
+		sb.EnvironmentID = devID
+		return sb
+	}
+	envs := map[string]api.Environment{
+		devID: {ID: devID, Name: "checkout-svc", Services: []string{"stripe", "postgres"}},
+		ciID:  {ID: ciID, Name: "checkout-ci", Services: []string{"stripe", "postgres"}},
+	}
+	snap := api.Snapshot{ID: jsonSnapID, EnvironmentID: devID, Name: "golden", RevisionID: "wrld-1", Image: "reg/img@sha256:abc",
+		CreatedAt: at(time.Now().Add(-time.Hour)), SourceSandbox: otherSbID, ClockRestore: api.ClockToday, SizeBytes: 2048}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, api.Me{Kind: "api_key", OrganizationID: "org_1",
+			Organizations: []api.Organization{{ID: "org_1", Name: "Acme", Slug: "acme", Kind: "team"}}})
+	})
+	mux.HandleFunc("GET /v1/environments", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, []api.Environment{envs[devID], envs[ciID]})
+	})
+	mux.HandleFunc("GET /v1/environments/{id}", func(w http.ResponseWriter, r *http.Request) {
+		env, ok := envs[r.PathValue("id")]
+		if !ok {
+			sbJSON(w, 404, map[string]string{"detail": "environment not found"})
+			return
+		}
+		sbJSON(w, 200, env)
+	})
+	mux.HandleFunc("GET /v1/environments/{id}/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, []api.Snapshot{snap})
+	})
+	mux.HandleFunc("GET /v1/environments/{id}/sandboxes", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("id") == devID {
+			sbJSON(w, 200, []api.Sandbox{*sandbox()})
+			return
+		}
+		sbJSON(w, 200, []api.Sandbox{})
+	})
+	mux.HandleFunc("POST /v1/environments/{id}/sandboxes", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 201, sandbox())
+	})
+	mux.HandleFunc("GET /v1/sandboxes", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+	})
+	mux.HandleFunc("GET /v1/sandboxes/{id}", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, sandbox())
+	})
+	mux.HandleFunc("GET /v1/sandboxes/{id}/services", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, services())
+	})
+	mux.HandleFunc("GET /v1/environments/{env}/sandboxes/{id}/clock", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, api.SandboxClock{ID: 1, Mode: "live"})
+	})
+
+	twin := "/s/" + sbID + "/stripe/veris/"
+	mux.HandleFunc("GET "+twin+"health", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, map[string]any{"status": "ok", "service": "stripe", "state_version": 3})
+	})
+	mux.HandleFunc("GET "+twin+"data", func(w http.ResponseWriter, r *http.Request) {
+		if entity := r.URL.Query().Get("entity_type"); entity != "" {
+			sbJSON(w, 200, map[string]any{"entity_type": entity, "total": 1, "limit": 20, "offset": 0,
+				"rows": []map[string]any{{"id": "cus_1", "email": "ada@example.com"}}})
+			return
+		}
+		sbJSON(w, 200, map[string]any{"counts": map[string]int{"customers": 1, "faults": 0, "clock": 1, "client": 1}, "state_version": 3})
+	})
+	mux.HandleFunc("GET "+twin+"schema", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(stripeSchemaJSON))
+	})
+	mux.HandleFunc("GET "+twin+"manual", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, map[string]any{"manual": "# stripe\n\nAny sk_test_ key works.\n"})
+	})
+	mux.HandleFunc("GET "+twin+"requests", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, map[string]any{"requests": []map[string]any{{"id": 1, "ts": 1772355600, "method": "GET",
+			"path": "/v1/customers/cus_1", "status": 200, "tier": "handler", "duration_ms": 6, "state_version": 3}}})
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestJSONEverywhere runs every get and list leaf with --json: stdout is
+// one valid JSON document and nothing else, and stderr -- whatever
+// progress or warnings it carries -- holds no JSON, so `veris … --json |
+// jq` reads the body and a person still sees the marks beside it.
+func TestJSONEverywhere(t *testing.T) {
+	plane := newJSONPlane(t)
+	b := sandboxBench(t, plane.URL)
+	b.twoEnvs()
+	b.local(cfg.Local{Sandbox: &cfg.SandboxRef{ID: sbID, EnvironmentID: devID}})
+
+	leaves := [][]string{
+		{"whoami"},
+		{"profile", "list"},
+		{"profile", "get"},
+		{"profile", "get", "default"},
+		{"env", "list"},
+		{"env", "get"},
+		{"env", "get", "ci"},
+		{"snapshot", "list"},
+		{"snapshot", "get", "golden"},
+		{"snapshot", "get", jsonSnapID},
+		{"baseline", "get"},
+		{"baseline", "list"},
+		{"status"},
+		{"sandbox", "get"},
+		{"sandbox", "get", "--id", sbID},
+		{"sandbox", "list"},
+		{"sandbox", "list", "--all"},
+		{"sandbox", "services", "list"},
+		{"sandbox", "services", "get", "stripe"},
+		{"sandbox", "services", "get", "postgres"},
+		{"sandbox", "services", "manual", "stripe"},
+		{"sandbox", "services", "manual", "postgres"},
+		{"sandbox", "data", "schema"},
+		{"sandbox", "data", "schema", "stripe"},
+		{"sandbox", "data", "schema", "stripe", "--table", "customers"},
+		{"sandbox", "data", "get"},
+		{"sandbox", "data", "get", "stripe"},
+		{"sandbox", "data", "get", "stripe", "customers"},
+		{"sandbox", "trace"},
+		{"sandbox", "trace", "--service", "stripe", "--limit", "1"},
+		{"sandbox", "clock"},
+		{"up"},
+		{"up", "--watch"},
+	}
+	for _, leaf := range leaves {
+		name := strings.Join(leaf, " ")
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runSandboxCLI(t, append(leaf, "--json")...)
+			if code != 0 {
+				t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+			}
+			if !json.Valid([]byte(stdout)) {
+				t.Errorf("stdout is not one JSON document: %q", stdout)
+			}
+			var doc any
+			if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+				t.Errorf("stdout: %v", err)
+			}
+			for _, line := range strings.Split(stderr, "\n") {
+				l := strings.TrimSpace(line)
+				if strings.HasPrefix(l, "{") || strings.HasPrefix(l, "[") {
+					t.Errorf("JSON on stderr: %q\n%s", line, stderr)
+				}
+			}
+		})
+	}
+
+	// The document the leaf prints is the body, not a wrapper around it.
+	t.Run("bodies", func(t *testing.T) {
+		_, stdout, _ := runSandboxCLI(t, "sandbox", "services", "manual", "postgres", "--json")
+		if strings.TrimSpace(stdout) != "{\n  \"manual\": null,\n  \"service\": \"postgres\"\n}" {
+			t.Errorf("a data-plane twin's manual is null under --json, got %q", stdout)
+		}
+		_, stdout, _ = runSandboxCLI(t, "sandbox", "clock", "--json")
+		var clock api.SandboxClock
+		if json.Unmarshal([]byte(stdout), &clock) != nil || clock.Mode != "live" {
+			t.Errorf("clock --json = %q", stdout)
+		}
+		_, stdout, _ = runSandboxCLI(t, "snapshot", "get", "golden", "--json")
+		var sn api.Snapshot
+		if json.Unmarshal([]byte(stdout), &sn) != nil || sn.ID != jsonSnapID {
+			t.Errorf("snapshot get --json = %q", stdout)
+		}
+	})
 }
