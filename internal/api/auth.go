@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 )
 
@@ -25,6 +26,17 @@ func (c *Client) DeviceToken(ctx context.Context, deviceCode string) (*DeviceTok
 		return nil, err
 	}
 	return &out, nil
+}
+
+// MeRaw is GET /v1/me exactly as the control plane sent it, for --json: a
+// field this package does not model still reaches stdout, and an empty
+// list stays an empty list rather than becoming null.
+func (c *Client) MeRaw(ctx context.Context) (json.RawMessage, error) {
+	var out json.RawMessage
+	if err := c.do(ctx, http.MethodGet, "/v1/me", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Me answers who the presented credential is (GET /v1/me).

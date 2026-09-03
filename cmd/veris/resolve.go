@@ -26,6 +26,13 @@ type configSources struct {
 	APIBase string
 	APIKey  string
 
+	// Local is the sandbox this folder's .veris/twin.local.yaml points at,
+	// set by run only when every explicit source above is silent. It is the
+	// last resort, not a merge: a --sandbox, a --config, or either of their
+	// environment variables hides it entirely, and run says on stderr when
+	// the pointer is what routes.
+	Local string
+
 	// Overrides is --route, accumulated per service. For a service it names,
 	// the entries REPLACE whatever the control plane or the embedded table
 	// would have derived: an override that merged could never say "only this
@@ -97,7 +104,14 @@ func parseRouteFlag(value string) (service string, entry routes.Entry, err error
 // a config that silently absorbed state from elsewhere could not be reasoned
 // about from its own contents. Precedence runs most-explicit first:
 //
-//	--config  >  --sandbox  >  $VERIS_PROXY_CONFIG  >  $VERIS_SANDBOX_ID
+//	--config  >  --sandbox  >  $VERIS_PROXY_CONFIG  >  $VERIS_SANDBOX_ID  >  the folder's pointer
+//
+// The pointer (src.Local) is the one exception to "no stored selection", and
+// it is a different kind of state: `veris up` wrote it into this checkout's
+// .veris/twin.local.yaml, not into a home directory, so two checkouts route
+// at two sandboxes and a CI job that names its sandbox is never touched by
+// it. It is consulted only when src.Local is set, which run does after
+// checking every explicit source itself.
 func resolveConfig(src configSources) (*config.Config, string, error) {
 	if src.File != "" {
 		cfg, err := config.Load(src.File)
@@ -118,6 +132,9 @@ func resolveConfig(src configSources) (*config.Config, string, error) {
 	// and so a CI job can set it once for a whole pipeline.
 	if fromEnv := os.Getenv(discovery.EnvSandboxID); fromEnv != "" {
 		return configFromSandbox(src, fromEnv, "$"+discovery.EnvSandboxID)
+	}
+	if src.Local != "" {
+		return configFromSandbox(src, src.Local, "this folder's .veris/twin.local.yaml")
 	}
 
 	return nil, "", fmt.Errorf(

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/veris-ai/veris-proxy/internal/ca"
+	"github.com/veris-ai/veris-proxy/internal/cli"
 	"github.com/veris-ai/veris-proxy/internal/config"
 	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/procgroup"
@@ -81,6 +82,9 @@ func cmdRun(args []string) error {
 			"instead of attaching to an existing --sandbox")
 	ttlMinutes := fs.Int("ttl-minutes", 0,
 		"how long a sandbox created by --environment may live if teardown never runs")
+	env := fs.String("env", "",
+		"environment `name` in .veris/twin.yaml whose run.command and proxy "+
+			"settings fill in what this command line leaves out")
 	fs.Func("require-callback",
 		"fail unless your app received a callback on this path[:count] (* for any path)",
 		func(v string) error {
@@ -146,12 +150,49 @@ func cmdRun(args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	// The project answers for what the command line left out, so the daily
+	// form is a bare `veris run`: the environment config's run.command and
+	// proxy block, the folder's sandbox pointer, and the login's key and
+	// plane. Every one of them yields to a flag or an environment variable
+	// that says otherwise; the engine below sees the merged result and
+	// nothing else changes.
+	// A profiles or project file that will not parse is fatal only when the
+	// run would read from it: a command line that names its own target and
+	// no --env never consulted those files before they existed, and a stray
+	// file must not take that away. The warning explains a later "no API
+	// key", which the broken profile would otherwise have supplied.
+	s, err := runSession(sources, *env)
+	if err != nil {
+		if *env != "" || !explicitTarget(sources, *environment) {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "veris: warning: %v; the project file and login are not consulted for this run\n", err)
+	}
+	d := projectDefaults{argv: fs.Args(), reqs: reqs, callbackReqs: callbackReqs,
+		expose: *expose, image: *image, strict: *strict}
+	var envName, pointer string
+	if s != nil {
+		if envName, err = d.fill(s, *env, flagsGiven(fs)); err != nil {
+			return err
+		}
+		if pointer, err = pointerSandbox(s, sources, *environment); err != nil {
+			return err
+		}
+		sources.Local = pointer
+		sources.APIBase = firstNonEmpty(sources.APIBase, s.res.APIBase)
+		sources.APIKey = firstNonEmpty(sources.APIKey, s.res.APIKey)
+	}
+	argv, reqs, callbackReqs := d.argv, d.reqs, d.callbackReqs
+	*expose, *image, *strict = d.expose, d.image, d.strict
 	// An empty argv is only a mistake WITHOUT --image. With one, it is the
 	// ordinary case: docker runs the image's own ENTRYPOINT and CMD, which is
 	// what an application image is built to do and what its author tested. A
 	// command supplied here overrides them, exactly as `docker run` does.
-	argv := fs.Args()
 	if len(argv) == 0 && *image == "" {
+		if envName != "" {
+			return fmt.Errorf("run needs a command (none configured for '%s'): "+
+				"pass one after --, or set run.command in %s", envName, s.res.Project.Path)
+		}
 		return errors.New("run needs a command: veris run [--sandbox <id>] -- <cmd> [args...]\n" +
 			"or name an image and let its own entrypoint run: veris run --image <image>")
 	}
@@ -172,9 +213,9 @@ func cmdRun(args []string) error {
 			set  bool
 			why  string
 		}{
-			{"--expose", *expose > 0, callbackWhy("--expose")},
+			{d.label("--expose"), *expose > 0, callbackWhy("--expose")},
 			{"--environment", *environment != "", callbackWhy("--environment")},
-			{"--require-callback", len(callbackReqs) > 0, callbackWhy("--require-callback")},
+			{d.label("--require-callback"), len(callbackReqs) > 0, callbackWhy("--require-callback")},
 			{"--ttl-minutes", *ttlMinutes > 0, callbackWhy("--ttl-minutes")},
 			{"--expose-token", *exposeToken != "", callbackWhy("--expose-token")},
 			{"--expose-hostname", *exposeHostname != "", callbackWhy("--expose-hostname")},
@@ -194,9 +235,9 @@ func cmdRun(args []string) error {
 	}
 
 	if len(callbackReqs) > 0 && *expose <= 0 {
-		return errors.New(
-			"--require-callback asserts what your app received, and nothing can " +
-				"arrive without --expose <port>. Add it, or drop the requirement")
+		return fmt.Errorf(
+			"%s asserts what your app received, and nothing can "+
+				"arrive without --expose <port>. Add it, or drop the requirement", d.label("--require-callback"))
 	}
 
 	// The container receives one routing target. An inherited VERIS_SANDBOX_ID
@@ -230,10 +271,15 @@ func cmdRun(args []string) error {
 			"--java-truststore": *javaStore != "",
 		} {
 			if set {
+				if d.fromFile["--image"] != "" {
+					return fmt.Errorf("%s applies to a local proxy, and %s puts "+
+						"the proxy in its own container. Drop it, or pass --image '' to run locally", name, d.label("--image"))
+				}
 				return fmt.Errorf("%s applies to a local proxy, and --image puts "+
 					"the proxy in its own container. Drop it, or drop --image", name)
 			}
 		}
+		announcePointer(pointer)
 		return runContainerised(dockerRun{
 			Image:      *image,
 			ProxyImage: *proxyImage,
@@ -267,6 +313,7 @@ func cmdRun(args []string) error {
 		})
 	}
 
+	announcePointer(pointer)
 	cfg, source, err := resolveConfig(sources)
 	if err != nil {
 		return err
@@ -786,7 +833,183 @@ func sandboxForContainer(src configSources) string {
 	if src.File != "" {
 		return ""
 	}
-	return firstNonEmpty(src.Sandbox, os.Getenv(discovery.EnvSandboxID))
+	return firstNonEmpty(src.Sandbox, os.Getenv(discovery.EnvSandboxID), src.Local)
+}
+
+// runSession resolves the project, the login and the folder for run, which
+// parses its own flags and so never receives the tree's Context: the one it
+// builds carries --api-base, the only global with a bearing on resolution,
+// and the --env and --sandbox it parsed.
+func runSession(src configSources, envFlag string) (*session, error) {
+	ctx := &cli.Context{
+		Globals: &cli.Globals{APIBase: src.APIBase},
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
+		Path:    []string{"veris", "run"},
+	}
+	return newSession(ctx, envFlag, src.Sandbox)
+}
+
+// projectDefaults are the settings an environment config may answer for when
+// the command line did not: the command after --, the requirements, what to
+// expose, which image, and strict mode. They are loaded with what the flags
+// said and filled in around it.
+type projectDefaults struct {
+	argv               []string
+	reqs, callbackReqs []requirement
+	expose             int
+	image              string
+	strict             bool
+	// fromFile names, per flag, the file setting that answered for it
+	// ("proxy.expose in .veris/twin.yaml"), so a refusal names something
+	// the user can find rather than a flag they never typed.
+	fromFile map[string]string
+}
+
+// label is how a refusal names flag: the file setting when that is where
+// the value came from, the flag itself otherwise.
+func (d *projectDefaults) label(flag string) string {
+	if from := d.fromFile[flag]; from != "" {
+		return from
+	}
+	return flag
+}
+
+// fill takes from the environment config every setting the command line
+// left out and returns the environment's name, "" when no config applied.
+// given is the set of flag names on the command line: absence is what lets
+// the file answer, not emptiness, so `--expose 0` still wins over the file's
+// proxy.expose. The config is the --env one when that was passed -- a name
+// the project file does not know is refused as requireEnv does -- else
+// whatever the session resolved: VERIS_ENV, the folder's `use`, the project
+// default. A bare id names no config and fills nothing.
+func (d *projectDefaults) fill(s *session, envFlag string, given map[string]bool) (string, error) {
+	conf, name := s.res.Env, s.res.EnvName
+	if envFlag != "" {
+		// --env names a config, and without a project file there is none:
+		// saying so beats a run that quietly ignores the flag.
+		if s.res.Project == nil {
+			_, err := s.requireProject()
+			return "", err
+		}
+		var err error
+		if name, _, conf, err = s.requireEnv(); err != nil {
+			return "", err
+		}
+	}
+	if conf == nil {
+		return "", nil
+	}
+	d.fromFile = map[string]string{}
+	inFile := func(setting string) string {
+		return "proxy." + setting + " in " + s.res.Project.Path
+	}
+	if len(d.argv) == 0 {
+		d.argv = conf.Run.Command
+	}
+	// The file's entries are parsed exactly as the flags are, so a count
+	// works the same in both; an entry that would not parse as a flag names
+	// the file, since the user never typed it.
+	fromFile := func(kind string, raw []string, into *[]requirement) error {
+		for _, v := range raw {
+			r, err := parseRequirement(kind, v)
+			if err != nil {
+				return fmt.Errorf("%s: environments.%s.proxy.require_%s: %w",
+					s.res.Project.Path, name, kind, err)
+			}
+			*into = append(*into, r)
+		}
+		return nil
+	}
+	if !given["require-service"] {
+		if err := fromFile("service", conf.Proxy.RequireService, &d.reqs); err != nil {
+			return "", err
+		}
+	}
+	if !given["require-callback"] {
+		if err := fromFile("callback", conf.Proxy.RequireCallback, &d.callbackReqs); err != nil {
+			return "", err
+		}
+		if len(conf.Proxy.RequireCallback) > 0 {
+			d.fromFile["--require-callback"] = inFile("require_callback")
+		}
+	}
+	if !given["expose"] && conf.Proxy.Expose > 0 {
+		d.expose = conf.Proxy.Expose
+		d.fromFile["--expose"] = inFile("expose")
+	}
+	if !given["image"] && conf.Proxy.Image != "" {
+		d.image = conf.Proxy.Image
+		d.fromFile["--image"] = inFile("image")
+	}
+	if !given["strict"] && conf.Proxy.Strict {
+		d.strict = true
+	}
+	return name, nil
+}
+
+// flagsGiven is the set of flags that appeared on the command line, by name.
+func flagsGiven(fs *flag.FlagSet) map[string]bool {
+	given := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	return given
+}
+
+// explicitTarget is whether the command line or the environment names what
+// this run routes at: --config, --sandbox, --environment (which deploys its
+// own), $VERIS_PROXY_CONFIG or $VERIS_SANDBOX_ID.
+func explicitTarget(src configSources, environment string) bool {
+	return src.File != "" || src.Sandbox != "" || environment != "" ||
+		os.Getenv(discovery.EnvConfig) != "" || os.Getenv(discovery.EnvSandboxID) != ""
+}
+
+// pointerSandbox is the folder's sandbox when it is what this run routes at:
+// every explicit target is silent, and .veris/twin.local.yaml holds a
+// pointer. Without a project file there is no local file, and so no pointer.
+//
+// The pointer records which environment its sandbox came from, and a run
+// whose environment is a different one is refused: `veris run --env ci` at
+// dev's sandbox would take ci's command and proxy settings to a world of
+// dev's services, and nothing downstream could tell.
+func pointerSandbox(s *session, src configSources, environment string) (string, error) {
+	if explicitTarget(src, environment) {
+		return "", nil
+	}
+	if s.res.Local == nil || s.res.Local.Sandbox == nil {
+		return "", nil
+	}
+	ptr := s.res.Local.Sandbox
+	envID := s.res.EnvName
+	if s.res.Env != nil {
+		envID = s.res.Env.ID
+	} else if !looksLikeID(envID) {
+		envID = ""
+	}
+	if envID != "" && ptr.EnvironmentID != "" && ptr.EnvironmentID != envID {
+		return "", fmt.Errorf("this folder's sandbox %s belongs to environment %s, not '%s'. "+
+			"Run veris up %s for one of its own, or pass --sandbox",
+			ptr.ID, ownerLabel(s, ptr.EnvironmentID), s.res.EnvName, s.res.EnvName)
+	}
+	return ptr.ID, nil
+}
+
+// ownerLabel is envLabel with the id beside the name, "dev (k3j2v0d8…)",
+// since the line it lands on is about two ids that differ.
+func ownerLabel(s *session, id string) string {
+	if name := projectEnvName(s, id); name != "" {
+		return name + " (" + shortID(id) + ")"
+	}
+	return shortID(id)
+}
+
+// announcePointer says on stderr that the folder's pointer is what routes
+// this run. It is printed only once every usage check has passed, so a
+// refused command line never announces a routing decision that did not
+// happen.
+func announcePointer(id string) {
+	if id != "" {
+		fmt.Fprintf(os.Stderr, "veris: using sandbox %s (this folder)\n", id)
+	}
 }
 
 func firstNonEmpty(vals ...string) string {

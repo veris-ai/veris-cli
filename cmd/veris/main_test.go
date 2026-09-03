@@ -27,7 +27,7 @@ func TestTheCommandTreeAnswersLikeTheDispatcherDid(t *testing.T) {
 			name: "no command is a usage error on stderr",
 			argv: nil,
 			code: 1,
-			stderrHas: []string{"Usage:\n  veris serve", "veris run", "Commands:\n  run",
+			stderrHas: []string{"Usage:\n  veris login", "veris run", "Commands:\n  login",
 				"Exit codes:", "veris: no command given\n"},
 			stdoutNone: true,
 		},
@@ -151,18 +151,13 @@ func TestTheCommandTreeAnswersLikeTheDispatcherDid(t *testing.T) {
 // row of the table as an unknown command.
 func TestAnAmbiguousPrefixNamesItsCandidates(t *testing.T) {
 	r := root()
-	r.Sub = append(r.Sub, &cli.Command{
-		Name:    "sandbox",
-		Summary: "Running deployments",
-		Run:     func(*cli.Context, []string) error { return nil },
-	})
 	var stdout, stderr bytes.Buffer
 	err := cli.Execute(r, &cli.Globals{}, []string{"s"}, &stdout, &stderr)
 	var ambiguous *cli.AmbiguousError
 	if !errors.As(err, &ambiguous) {
 		t.Fatalf("`veris s` returned %v, want *cli.AmbiguousError", err)
 	}
-	if want := "'s' is ambiguous — did you mean: sandbox, serve?"; err.Error() != want {
+	if want := "'s' is ambiguous — did you mean: sandbox, serve, status?"; err.Error() != want {
 		t.Errorf("message %q, want %q", err.Error(), want)
 	}
 	if stdout.Len() != 0 {
@@ -204,6 +199,91 @@ func TestExitStatusFollowsTheTable(t *testing.T) {
 			}
 			if stderr.String() != tc.stderr {
 				t.Errorf("stderr %q, want %q", stderr.String(), tc.stderr)
+			}
+		})
+	}
+}
+
+// The groups Milestone 1 added, as a script sees them: help of a leaf and of
+// a group on stdout, a group word with no verb refused with its usage, and a
+// prefix chain (`e li`) resolving to env list and failing as env list fails,
+// not as the tree does. The child runs on an empty HOME with every VERIS_*
+// variable cleared and a project-less working directory, so the machine
+// running the tests cannot lend it a login or a project file.
+func TestTheNewGroupsAnswerAsAScriptSeesThem(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, v := range []string{"VERIS_API_KEY", "VERIS_API_BASE", "VERIS_PROFILE", "VERIS_ENV",
+		"VERIS_SANDBOX_ID", "VERIS_PROXY_CONFIG", "VERIS_ENVIRONMENT_ID"} {
+		t.Setenv(v, "")
+	}
+	dir := t.TempDir()
+	cases := []struct {
+		name       string
+		argv       []string
+		code       int
+		stdoutHas  []string
+		stderrHas  []string
+		stderrNot  []string
+		stdoutNone bool
+		stderrNone bool
+	}{
+		{
+			name:       "login --help is the leaf's help on stdout",
+			argv:       []string{"login", "--help"},
+			code:       0,
+			stdoutHas:  []string{"veris login - Pair this machine", "Usage:\n  veris login [KEY] [--profile NAME]", "--key-stdin"},
+			stderrNone: true,
+		},
+		{
+			name:       "env --help lists the verbs",
+			argv:       []string{"env", "--help"},
+			code:       0,
+			stdoutHas:  []string{"veris env - Named environments", "Commands:\n  create", "  list ", "  get ", "  use ", "  delete "},
+			stderrNone: true,
+		},
+		{
+			name:       "sandbox with no verb is a usage error on stderr",
+			argv:       []string{"sandbox"},
+			code:       1,
+			stderrHas:  []string{"Usage:\n  veris sandbox <command>", "Commands:\n  get", "veris: no command given\n"},
+			stdoutNone: true,
+		},
+		{
+			name: "a prefix chain reaches env list, which fails as env list does",
+			argv: []string{"e", "li"},
+			code: 1,
+			stderrHas: []string{"✗ Not logged in for profile 'default' (no API key)\n",
+				"→ Next: veris login --profile default\n"},
+			stderrNot:  []string{"panic", "Usage:", "unknown command", "ambiguous"},
+			stdoutNone: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, code := invokeIn(t, dir, tc.argv...)
+			if code != tc.code {
+				t.Errorf("%v exited %d, want %d (stderr: %q)", tc.argv, code, tc.code, stderr)
+			}
+			for _, want := range tc.stdoutHas {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("%v: stdout lacks %q:\n%s", tc.argv, want, stdout)
+				}
+			}
+			for _, want := range tc.stderrHas {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("%v: stderr lacks %q:\n%s", tc.argv, want, stderr)
+				}
+			}
+			for _, bad := range tc.stderrNot {
+				if strings.Contains(stderr, bad) {
+					t.Errorf("%v: stderr must not carry %q:\n%s", tc.argv, bad, stderr)
+				}
+			}
+			if tc.stdoutNone && stdout != "" {
+				t.Errorf("%v: nothing belongs on stdout, got %q", tc.argv, stdout)
+			}
+			if tc.stderrNone && stderr != "" {
+				t.Errorf("%v: nothing belongs on stderr, got %q", tc.argv, stderr)
 			}
 		})
 	}

@@ -20,6 +20,10 @@ type Profile struct {
 	KeyID          string `yaml:"key_id,omitempty"`
 	KeyName        string `yaml:"key_name,omitempty"`
 	OrganizationID string `yaml:"organization_id,omitempty"`
+	// OrganizationName is what /v1/me called the organisation at login,
+	// kept so `profile list` can tell two logins apart by a name rather
+	// than an id. Decoration only: the id is what the plane goes by.
+	OrganizationName string `yaml:"organization_name,omitempty"`
 	// DefaultEnvironment is the environment name or id used in a folder that
 	// has no project file of its own.
 	DefaultEnvironment string `yaml:"default_environment,omitempty"`

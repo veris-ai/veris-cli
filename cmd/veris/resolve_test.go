@@ -273,3 +273,47 @@ func TestFileConfigOverrideForAnUnknownServiceIsAnError(t *testing.T) {
 		t.Fatalf("err = %v, want a refusal naming the service", err)
 	}
 }
+
+// The folder's sandbox pointer (configSources.Local, which run sets from
+// .veris/twin.local.yaml) is consulted after every explicit source, and the
+// resolved source names the file so a surprise can be traced to it.
+func TestRunDefaultsPointerIsTheLastResort(t *testing.T) {
+	isolateHome(t)
+	for _, id := range []string{"sbx_local", "sbx_env", "sbx_flag"} {
+		cacheSandbox(t, id, "stripe")
+	}
+
+	cfg, source, err := resolveConfig(configSources{Local: "sbx_local"})
+	if err != nil {
+		t.Fatalf("pointer alone: %v", err)
+	}
+	if cfg.SandboxID != "sbx_local" || !strings.Contains(source, ".veris/twin.local.yaml") {
+		t.Errorf("pointer alone: sandbox %q from %q", cfg.SandboxID, source)
+	}
+	if got := sandboxForContainer(configSources{Local: "sbx_local"}); got != "sbx_local" {
+		t.Errorf("container tier ignores the pointer: %q", got)
+	}
+
+	cfg, _, err = resolveConfig(configSources{Sandbox: "sbx_flag", Local: "sbx_local"})
+	if err != nil || cfg.SandboxID != "sbx_flag" {
+		t.Errorf("--sandbox beats the pointer: %v %+v", err, cfg)
+	}
+
+	t.Setenv(discovery.EnvSandboxID, "sbx_env")
+	cfg, _, err = resolveConfig(configSources{Local: "sbx_local"})
+	if err != nil || cfg.SandboxID != "sbx_env" {
+		t.Errorf("$VERIS_SANDBOX_ID beats the pointer: %v %+v", err, cfg)
+	}
+	if got := sandboxForContainer(configSources{Local: "sbx_local"}); got != "sbx_env" {
+		t.Errorf("container tier: $VERIS_SANDBOX_ID beats the pointer, got %q", got)
+	}
+
+	file := writeConfig(t, "http://upstream.test")
+	cfg, _, err = resolveConfig(configSources{File: file, Local: "sbx_local"})
+	if err != nil || cfg.SandboxID != "sbx_run" {
+		t.Errorf("--config beats the pointer: %v %+v", err, cfg)
+	}
+	if got := sandboxForContainer(configSources{File: file, Local: "sbx_local"}); got != "" {
+		t.Errorf("container tier: --config leaves no sandbox to name, got %q", got)
+	}
+}

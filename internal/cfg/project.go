@@ -11,35 +11,39 @@ import (
 
 // ProxyConfig is how an environment wants the proxy run: what the run must
 // have reached, what to expose for callbacks, which image to test in.
+//
+// The json tags spell the keys as the yaml does, so `env list --json` and
+// `env get --json` show a config under the same names the file uses and
+// that `env create --json` prints.
 type ProxyConfig struct {
-	RequireService  []string `yaml:"require_service,omitempty"`
-	RequireCallback []string `yaml:"require_callback,omitempty"`
-	Expose          int      `yaml:"expose,omitempty"`
-	Image           string   `yaml:"image,omitempty"`
-	Strict          bool     `yaml:"strict,omitempty"`
+	RequireService  []string `yaml:"require_service,omitempty" json:"require_service"`
+	RequireCallback []string `yaml:"require_callback,omitempty" json:"require_callback"`
+	Expose          int      `yaml:"expose,omitempty" json:"expose"`
+	Image           string   `yaml:"image,omitempty" json:"image"`
+	Strict          bool     `yaml:"strict,omitempty" json:"strict"`
 }
 
 // RunConfig is the command `veris run` launches when none is given.
 type RunConfig struct {
-	Command []string `yaml:"command,omitempty"`
+	Command []string `yaml:"command,omitempty" json:"command"`
 }
 
 // EnvConfig is one named environment as the project describes it.
 type EnvConfig struct {
-	ID string `yaml:"id,omitempty"`
+	ID string `yaml:"id,omitempty" json:"id"`
 	// Profile names the login this environment lives on, for a project whose
 	// environments are split across control planes. Empty means whichever
 	// profile is otherwise selected.
-	Profile    string `yaml:"profile,omitempty"`
-	TTLMinutes int    `yaml:"ttl_minutes,omitempty"`
+	Profile    string `yaml:"profile,omitempty" json:"profile,omitempty"`
+	TTLMinutes int    `yaml:"ttl_minutes,omitempty" json:"ttl_minutes"`
 	// Boot is bundle, baseline or snapshot; Snapshot names which when it is
 	// snapshot.
-	Boot        string      `yaml:"boot,omitempty"`
-	Snapshot    string      `yaml:"snapshot,omitempty"`
-	Data        []string    `yaml:"data,omitempty"`
-	CallbackURL string      `yaml:"callback_url,omitempty"`
-	Proxy       ProxyConfig `yaml:"proxy,omitempty"`
-	Run         RunConfig   `yaml:"run,omitempty"`
+	Boot        string      `yaml:"boot,omitempty" json:"boot"`
+	Snapshot    string      `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
+	Data        []string    `yaml:"data,omitempty" json:"data"`
+	CallbackURL string      `yaml:"callback_url,omitempty" json:"callback_url"`
+	Proxy       ProxyConfig `yaml:"proxy,omitempty" json:"proxy"`
+	Run         RunConfig   `yaml:"run,omitempty" json:"run"`
 }
 
 // Project is .veris/twin.yaml, the committed file.

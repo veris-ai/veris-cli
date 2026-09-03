@@ -245,6 +245,10 @@ type Me struct {
 	User           *MeUser        `json:"user"`
 	OrganizationID string         `json:"organization_id"`
 	Organizations  []Organization `json:"organizations"`
+	// Key describes the presented key -- the same row GET /v1/api-keys shows
+	// for it -- on a control plane that sends it; older ones omit the field
+	// and the CLI falls back to what it stored at login or the list route.
+	Key *APIKey `json:"key,omitempty"`
 }
 
 // MeUser is the person behind a session.
