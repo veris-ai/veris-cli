@@ -5,13 +5,13 @@ PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64
 .PHONY: build test e2e lint dist image clean
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/veris-proxy ./cmd/veris-proxy
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/veris ./cmd/veris
 
 test:
 	go test -race ./...
 
 e2e: build
-	bash testdata/e2e.sh $(PWD)/bin/veris-proxy
+	bash testdata/e2e.sh $(PWD)/bin/veris
 
 lint:
 	gofmt -l . | tee /dev/stderr | (! read)
@@ -26,7 +26,7 @@ dist:
 		[ "$$os" = "windows" ] && ext=".exe"; \
 		echo "  $$os/$$arch"; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -trimpath \
-			-ldflags="$(LDFLAGS)" -o dist/veris-proxy-$$os-$$arch$$ext ./cmd/veris-proxy || exit 1; \
+			-ldflags="$(LDFLAGS)" -o dist/veris-$$os-$$arch$$ext ./cmd/veris || exit 1; \
 	done
 	@ls -lh dist/
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/veris-ai/veris-proxy/internal/cfg"
+	"github.com/veris-ai/veris-proxy/internal/cli"
+	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/proxy"
 	"github.com/veris-ai/veris-proxy/internal/trust"
 )
@@ -108,13 +112,21 @@ func child(t *testing.T, role string) []string {
 	return []string{os.Args[0], "-test.run=TestMain"}
 }
 
-// cli runs `veris-proxy args...` as a separate process and reports what a
+// cli runs `veris args...` as a separate process and reports what a
 // script would see: the two streams apart, and the exit code.
-func cli(t *testing.T, args ...string) (stdout, stderr string, code int) {
+func invoke(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	return invokeIn(t, "", args...)
+}
+
+// invokeIn is invoke with the child's working directory pinned; "" inherits
+// the test's, which is fine for a command that looks at no project file.
+func invokeIn(t *testing.T, dir string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	argv := child(t, "cli")
 	t.Setenv("VERIS_TEST_CLI_ARGS", strings.Join(args, " "))
 	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = dir
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err := cmd.Run()
@@ -218,7 +230,7 @@ func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
 	for _, argv := range [][]string{
 		{"run", "--help"}, {"run", "-h"}, {"serve", "--help"}, {"check", "-h"},
 	} {
-		stdout, stderr, code := cli(t, argv...)
+		stdout, stderr, code := invoke(t, argv...)
 		if code != 0 {
 			t.Errorf("%v exited %d, want 0 (stderr: %q)", argv, code, stderr)
 		}
@@ -230,7 +242,7 @@ func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
 		}
 	}
 
-	stdout, stderr, code := cli(t, "run", "--no-such-flag")
+	stdout, stderr, code := invoke(t, "run", "--no-such-flag")
 	if code != 1 {
 		t.Errorf("a bad flag exited %d, want 1", code)
 	}
@@ -243,7 +255,7 @@ func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
 		}
 	}
 	// The top-level help was already right and stays so.
-	if stdout, _, code := cli(t, "--help"); code != 0 || !strings.Contains(stdout, "Usage:") {
+	if stdout, _, code := invoke(t, "--help"); code != 0 || !strings.Contains(stdout, "Usage:") {
 		t.Errorf("top-level --help: exit %d, stdout %q", code, stdout)
 	}
 }
@@ -641,5 +653,454 @@ func TestAnEnvironmentRunThatSentNothingFailsByDefault(t *testing.T) {
 	// receipt is printed, the exit code stays the command's own.
 	if got := environmentReceiptUnmet("", nil, proxy.Receipt{}); got != nil {
 		t.Fatalf("--sandbox runs must not gain an implicit assertion, got %v", got)
+	}
+}
+
+// --- run defaults -------------------------------------------------------------
+
+// The project file answers for what the command line left out: the command,
+// the requirements, what to expose, which image, strict mode, and which
+// sandbox. A flag or an environment variable always wins, and "given" is what
+// counts -- a flag set to its zero value still beats the file.
+
+// captureStderr runs f with os.Stderr redirected and returns what was
+// written there: run reports on stderr directly, as the engine always has.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	f()
+	os.Stderr = old
+	_ = w.Close()
+	out := <-done
+	_ = r.Close()
+	return out
+}
+
+// runProject writes a project whose default environment dev carries conf,
+// and this folder's sandbox pointer at sb when it is not empty.
+func runProject(b *bench, dev cfg.EnvConfig, sb string) {
+	b.t.Helper()
+	dev.ID = devID
+	b.projectFile(cfg.Project{Project: "proj", Default: "dev", Environments: map[string]cfg.EnvConfig{
+		"dev": dev, "ci": {ID: ciID},
+	}})
+	if sb != "" {
+		b.local(cfg.Local{Sandbox: &cfg.SandboxRef{ID: sb, EnvironmentID: devID}})
+	}
+}
+
+func TestRunDefaultsCommandComesFromTheProject(t *testing.T) {
+	b := newBench(t)
+	cfgPath := writeConfig(t, sandbox(t))
+	argv := child(t, "fail")
+	runProject(b, cfg.EnvConfig{Run: cfg.RunConfig{Command: argv}}, "")
+
+	err := cmdRun([]string{"--config", cfgPath, "--quiet"})
+	var code exitCode
+	if !errors.As(err, &code) || code != 7 {
+		t.Fatalf("the configured command should have run and exited 7, got %v", err)
+	}
+
+	// A command on the line beats the file's.
+	err = cmdRun(append([]string{"--config", cfgPath, "--quiet", "--"}, child(t, "silent")...))
+	if err != nil {
+		t.Fatalf("the command after -- should replace the file's: %v", err)
+	}
+}
+
+func TestRunDefaultsNeedsACommandNamesTheEnvironment(t *testing.T) {
+	b := newBench(t)
+	cfgPath := writeConfig(t, sandbox(t))
+	runProject(b, cfg.EnvConfig{}, "")
+	err := cmdRun([]string{"--config", cfgPath})
+	if err == nil || !strings.Contains(err.Error(), "run needs a command (none configured for 'dev')") {
+		t.Fatalf("an environment without run.command should be named, got %v", err)
+	}
+	if !strings.Contains(err.Error(), filepath.Join(b.project, ".veris", "twin.yaml")) {
+		t.Errorf("the error should say which file to set run.command in, got %v", err)
+	}
+}
+
+func TestRunDefaultsRequireServiceComesFromTheProject(t *testing.T) {
+	b := newBench(t)
+	cfgPath := writeConfig(t, sandbox(t))
+	argv := child(t, "call")
+	runProject(b, cfg.EnvConfig{Proxy: cfg.ProxyConfig{RequireService: []string{"github"}}}, "")
+
+	err := cmdRun(append([]string{"--config", cfgPath, "--quiet", "--"}, argv...))
+	var code exitCode
+	if !errors.As(err, &code) || code != exitRequirementUnmet {
+		t.Fatalf("the file's require_service github is unmet by a call to stripe (exit 3), got %v", err)
+	}
+
+	// The flag replaces the file's list rather than adding to it.
+	err = cmdRun(append([]string{"--config", cfgPath, "--quiet", "--require-service", "stripe", "--"}, argv...))
+	if err != nil {
+		t.Fatalf("--require-service stripe should beat the file's github: %v", err)
+	}
+}
+
+func TestRunDefaultsFillOnlyWhatTheLineLeftOut(t *testing.T) {
+	b := newBench(t)
+	runProject(b, cfg.EnvConfig{
+		Run: cfg.RunConfig{Command: []string{"pytest", "-q"}},
+		Proxy: cfg.ProxyConfig{
+			RequireService: []string{"stripe:2"}, RequireCallback: []string{"/hooks/stripe"},
+			Expose: 3000, Image: "app:test", Strict: true,
+		},
+	}, "")
+	s, stderr := open(t, cli.Globals{}, "", "")
+
+	var d projectDefaults
+	name, err := d.fill(s, "", map[string]bool{})
+	if err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	if name != "dev" {
+		t.Errorf("name = %q, want dev", name)
+	}
+	if !slices.Equal(d.argv, []string{"pytest", "-q"}) {
+		t.Errorf("argv = %q", d.argv)
+	}
+	if !slices.Equal(d.reqs, []requirement{{kind: "service", name: "stripe", count: 2}}) {
+		t.Errorf("reqs = %+v", d.reqs)
+	}
+	if !slices.Equal(d.callbackReqs, []requirement{{kind: "callback", name: "/hooks/stripe", count: 1}}) {
+		t.Errorf("callbackReqs = %+v", d.callbackReqs)
+	}
+	if d.expose != 3000 || d.image != "app:test" || !d.strict {
+		t.Errorf("expose %d image %q strict %v", d.expose, d.image, d.strict)
+	}
+
+	// Every flag on the line keeps its value, a zero one included.
+	d = projectDefaults{argv: []string{"go", "test"}, reqs: []requirement{{kind: "service", name: "github", count: 1}}}
+	given := map[string]bool{"require-service": true, "require-callback": true, "expose": true, "image": true, "strict": true}
+	if _, err := d.fill(s, "", given); err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	if !slices.Equal(d.argv, []string{"go", "test"}) || len(d.reqs) != 1 || d.reqs[0].name != "github" ||
+		d.callbackReqs != nil || d.expose != 0 || d.image != "" || d.strict {
+		t.Errorf("flags on the line were overridden: %+v", d)
+	}
+
+	// --env picks the config; ci configures none of this.
+	s, _ = open(t, cli.Globals{}, "ci", "")
+	d = projectDefaults{}
+	if name, err := d.fill(s, "ci", nil); err != nil || name != "ci" || d.argv != nil || d.reqs != nil || d.expose != 0 {
+		t.Errorf("--env ci: name %q err %v defaults %+v", name, err, d)
+	}
+
+	// A name the file does not know is refused as every command refuses it.
+	s, stderr = open(t, cli.Globals{}, "stagin", "")
+	var already printedError
+	if _, err := d.fill(s, "stagin", nil); !errors.As(err, &already) {
+		t.Errorf("--env stagin: err %v, want the printed refusal", err)
+	}
+	if !strings.Contains(stderr.String(), "✗ No environment 'stagin' in") {
+		t.Errorf("stderr %q", stderr.String())
+	}
+
+	// A pasted id the file does not carry names no config and fills nothing
+	// (one it does carry resolves to that entry, as --env ci would).
+	const pasted = "z9y8x7w6v5u4t3s2r1q0p9o8n"
+	s, _ = open(t, cli.Globals{}, pasted, "")
+	d = projectDefaults{}
+	if name, err := d.fill(s, pasted, nil); err != nil || name != "" || d.argv != nil {
+		t.Errorf("--env <id>: name %q err %v defaults %+v", name, err, d)
+	}
+
+	// A file entry that would not parse as a flag names the file.
+	runProject(b, cfg.EnvConfig{Proxy: cfg.ProxyConfig{RequireService: []string{"stripe:zero"}}}, "")
+	s, _ = open(t, cli.Globals{}, "", "")
+	d = projectDefaults{}
+	_, err = d.fill(s, "", nil)
+	for _, want := range []string{filepath.Join(b.project, ".veris", "twin.yaml"), "environments.dev.proxy.require_service", "not a positive count"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("bad file entry: err %v lacks %q", err, want)
+		}
+	}
+}
+
+func TestRunDefaultsPointerYieldsToEveryExplicitSource(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	runProject(b, cfg.EnvConfig{}, sbID)
+	s, _ := open(t, cli.Globals{}, "", "")
+	if got, err := pointerSandbox(s, configSources{}, ""); err != nil || got != sbID {
+		t.Fatalf("with nothing explicit the pointer routes; got %q, %v", got, err)
+	}
+	cases := map[string]struct {
+		src         configSources
+		environment string
+		env         map[string]string
+	}{
+		"--config":            {src: configSources{File: "proxy.json"}},
+		"--sandbox":           {src: configSources{Sandbox: "sbx_flag"}},
+		"--environment":       {environment: devID},
+		"$VERIS_PROXY_CONFIG": {env: map[string]string{discovery.EnvConfig: "/x/proxy.json"}},
+		"$VERIS_SANDBOX_ID":   {env: map[string]string{discovery.EnvSandboxID: "sbx_env"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if got, err := pointerSandbox(s, tc.src, tc.environment); err != nil || got != "" {
+				t.Errorf("%s should hide the pointer, got %q, %v", name, got, err)
+			}
+		})
+	}
+	// No project file, no local file, no pointer.
+	if got, err := pointerSandbox(&session{res: &cfg.Resolved{}}, configSources{}, ""); err != nil || got != "" {
+		t.Errorf("without a local file: %q, %v", got, err)
+	}
+
+	// The pointer belongs to dev; a run for ci must not route at it with
+	// ci's settings, and the refusal names both and the way out.
+	t.Run("another environment's pointer is refused", func(t *testing.T) {
+		s, _ := open(t, cli.Globals{}, "ci", "")
+		_, err := pointerSandbox(s, configSources{}, "")
+		want := "this folder's sandbox " + sbID + " belongs to environment dev (k3j2v0d8…), not 'ci'. Run veris up ci for one of its own, or pass --sandbox"
+		if err == nil || err.Error() != want {
+			t.Errorf("err = %v\nwant %s", err, want)
+		}
+		// A pasted id is held to the same rule; dev's own id is dev.
+		s, _ = open(t, cli.Globals{}, "z9y8x7w6v5u4t3s2r1q0p9o8n", "")
+		if _, err := pointerSandbox(s, configSources{}, ""); err == nil || !strings.Contains(err.Error(), "not 'z9y8x7w6v5u4t3s2r1q0p9o8n'") {
+			t.Errorf("a pasted id of another environment: %v", err)
+		}
+		s, _ = open(t, cli.Globals{}, devID, "")
+		if got, err := pointerSandbox(s, configSources{}, ""); err != nil || got != sbID {
+			t.Errorf("dev by id: %q, %v", got, err)
+		}
+		// End to end the refusal is the run's error, before anything routes.
+		var runErr error
+		stderr := captureStderr(t, func() {
+			runErr = cmdRun(append([]string{"--env", "ci", "--quiet", "--"}, child(t, "silent")...))
+		})
+		if runErr == nil || !strings.Contains(runErr.Error(), "belongs to environment dev") {
+			t.Errorf("run --env ci: %v", runErr)
+		}
+		if strings.Contains(stderr, "using sandbox") {
+			t.Errorf("a refused run must not announce a routing decision:\n%s", stderr)
+		}
+	})
+}
+
+func TestRunDefaultsAnnounceThePointerOnlyOnceTheLineIsAccepted(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	runProject(b, cfg.EnvConfig{}, sbID)
+	var err error
+	stderr := captureStderr(t, func() { err = cmdRun([]string{"--cap-add", "NET_ADMIN", "--", "true"}) })
+	if err == nil || !strings.Contains(err.Error(), "--cap-add needs --image") {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(stderr, "using sandbox") {
+		t.Errorf("the pointer was announced on a refused line:\n%s", stderr)
+	}
+}
+
+func TestRunDefaultsEnvNeedsAProjectFile(t *testing.T) {
+	b := newBench(t)
+	cfgPath := writeConfig(t, sandbox(t))
+	var err error
+	stderr := captureStderr(t, func() { err = cmdRun([]string{"--config", cfgPath, "--env", "dev", "--", "true"}) })
+	var already printedError
+	if !errors.As(err, &already) {
+		t.Fatalf("err = %v, want the printed refusal", err)
+	}
+	if !strings.Contains(stderr, "✗ No .veris/twin.yaml found (searched up from "+b.project+")") || !strings.Contains(stderr, "→ Next: veris env create") {
+		t.Errorf("stderr:\n%s", stderr)
+	}
+}
+
+func TestRunDefaultsRefusalsNameTheFileSetting(t *testing.T) {
+	b := newBench(t)
+	cfgPath := writeConfig(t, sandbox(t))
+	projPath := filepath.Join(b.project, ".veris", "twin.yaml")
+	cases := []struct {
+		name string
+		conf cfg.EnvConfig
+		line []string
+		want string
+	}{
+		{"expose without image", cfg.EnvConfig{Proxy: cfg.ProxyConfig{Expose: 3000}}, nil,
+			"proxy.expose in " + projPath + " needs --image"},
+		{"require_callback without expose", cfg.EnvConfig{Proxy: cfg.ProxyConfig{RequireCallback: []string{"/hooks"}, Image: "app"}}, nil,
+			"proxy.require_callback in " + projPath + " asserts what your app received"},
+		{"image against --listen", cfg.EnvConfig{Proxy: cfg.ProxyConfig{Image: "app"}}, []string{"--listen", ":0"},
+			"--listen applies to a local proxy, and proxy.image in " + projPath + " puts the proxy in its own container. Drop it, or pass --image '' to run locally"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runProject(b, tc.conf, "")
+			line := append([]string{"--config", cfgPath}, tc.line...)
+			err := cmdRun(append(line, "--", "true"))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v\nwant %s", err, tc.want)
+			}
+		})
+	}
+	// A flag typed on the line is still named as the flag.
+	runProject(b, cfg.EnvConfig{}, "")
+	if err := cmdRun([]string{"--config", cfgPath, "--expose", "3000", "--", "true"}); err == nil || !strings.HasPrefix(err.Error(), "--expose needs --image") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestRunDefaultsABrokenProfilesFileYieldsToAnExplicitTarget(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	cfgPath := writeConfig(t, sandbox(t))
+	if err := os.MkdirAll(filepath.Join(b.home, ".veris"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.home, ".veris", "twin.yaml"), []byte("profiles: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	argv := child(t, "silent")
+
+	// --config means exactly that file, as it always has.
+	var err error
+	stderr := captureStderr(t, func() { err = cmdRun(append([]string{"--config", cfgPath, "--quiet", "--"}, argv...)) })
+	if err != nil {
+		t.Fatalf("--config with a broken profiles file: %v\n%s", err, stderr)
+	}
+	if !strings.Contains(stderr, "veris: warning: ") || !strings.Contains(stderr, "twin.yaml is unreadable") {
+		t.Errorf("the parse failure should be a warning, got:\n%s", stderr)
+	}
+
+	// Without an explicit target the files are what the run reads: fatal.
+	err = cmdRun(append([]string{"--quiet", "--"}, argv...))
+	if err == nil || !strings.Contains(err.Error(), "twin.yaml is unreadable") {
+		t.Errorf("a bare run must fail on the broken file, got %v", err)
+	}
+	// --env reads the project file through the same session: fatal too.
+	err = cmdRun(append([]string{"--config", cfgPath, "--env", "dev", "--"}, argv...))
+	if err == nil || !strings.Contains(err.Error(), "twin.yaml is unreadable") {
+		t.Errorf("--env with the broken file, got %v", err)
+	}
+}
+
+// runPlane is a control plane for run's discovery client: it serves one
+// ready sandbox under any path that names it and records the key on every
+// request, so a test can tell whose key the engine sent.
+type runPlane struct {
+	srv  *httptest.Server
+	keys chan string
+}
+
+func newRunPlane(t *testing.T, id string) *runPlane {
+	t.Helper()
+	p := &runPlane{keys: make(chan string, 16)}
+	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.keys <- r.Header.Get("X-API-Key")
+		if !strings.HasSuffix(r.URL.Path, "/v1/sandboxes/"+id) {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": id, "environment_id": devID, "status": "ready",
+			"services": []map[string]any{{"name": "stripe", "url": "http://sandbox.test/s/" + id + "/stripe", "status": "ready"}},
+		})
+	}))
+	t.Cleanup(p.srv.Close)
+	return p
+}
+
+func (p *runPlane) sawKey(t *testing.T) string {
+	t.Helper()
+	select {
+	case k := <-p.keys:
+		return k
+	default:
+		t.Fatal("the control plane was never asked")
+		return ""
+	}
+}
+
+func TestRunDefaultsTheProfilesKeyAndPlaneServeDiscovery(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	plane := newRunPlane(t, "sbx_prof")
+	b.global(cfg.Global{ActiveProfile: "default", Profiles: map[string]cfg.Profile{
+		"default": {APIBase: plane.srv.URL, APIKey: "vsk_profile_key"},
+	}})
+	runProject(b, cfg.EnvConfig{}, "sbx_prof")
+	argv := child(t, "silent")
+	line := append([]string{"--refresh", "--quiet", "--listen", "127.0.0.1:0", "--"}, argv...)
+
+	var err error
+	stderr := captureStderr(t, func() { err = cmdRun(line) })
+	if err != nil {
+		t.Fatalf("a run with only the profile's login: %v\n%s", err, stderr)
+	}
+	if got := plane.sawKey(t); got != "vsk_profile_key" {
+		t.Errorf("the plane saw key %q, want the profile's", got)
+	}
+
+	// --api-key on the line beats the profile's key.
+	stderr = captureStderr(t, func() { err = cmdRun(append([]string{"--api-key", "vsk_line_key"}, line...)) })
+	if err != nil {
+		t.Fatalf("--api-key: %v\n%s", err, stderr)
+	}
+	if got := plane.sawKey(t); got != "vsk_line_key" {
+		t.Errorf("the plane saw key %q, want the flag's", got)
+	}
+
+	// --api-base on the line beats the profile's plane.
+	other := newRunPlane(t, "sbx_prof")
+	stderr = captureStderr(t, func() { err = cmdRun(append([]string{"--api-base", other.srv.URL}, line...)) })
+	if err != nil {
+		t.Fatalf("--api-base: %v\n%s", err, stderr)
+	}
+	if got := other.sawKey(t); got != "vsk_profile_key" {
+		t.Errorf("the other plane saw key %q, want the profile's", got)
+	}
+	select {
+	case k := <-plane.keys:
+		t.Errorf("the profile's plane was asked (key %q) although --api-base named another", k)
+	default:
+	}
+}
+
+func TestRunDefaultsRoutesAtTheFoldersSandbox(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	cacheSandbox(t, "sbx_local", "stripe")
+	runProject(b, cfg.EnvConfig{}, "sbx_local")
+	argv := child(t, "silent")
+	line := append([]string{"--quiet", "--listen", "127.0.0.1:0", "--"}, argv...)
+
+	var err error
+	stderr := captureStderr(t, func() { err = cmdRun(line) })
+	if err != nil {
+		t.Fatalf("a bare run with only the folder's pointer: %v\n%s", err, stderr)
+	}
+	if !strings.Contains(stderr, "veris: using sandbox sbx_local (this folder)\n") {
+		t.Errorf("the pointer should be announced on stderr, got %q", stderr)
+	}
+
+	// $VERIS_SANDBOX_ID names another sandbox and the pointer is not mentioned.
+	cacheSandbox(t, "sbx_env", "stripe")
+	t.Setenv(discovery.EnvSandboxID, "sbx_env")
+	stderr = captureStderr(t, func() { err = cmdRun(line) })
+	if err != nil {
+		t.Fatalf("run under $VERIS_SANDBOX_ID: %v\n%s", err, stderr)
+	}
+	if strings.Contains(stderr, "this folder") {
+		t.Errorf("the pointer must yield to $VERIS_SANDBOX_ID, got %q", stderr)
 	}
 }

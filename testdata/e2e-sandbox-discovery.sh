@@ -25,8 +25,8 @@ say() { printf '\n==> %s\n' "$*"; }
 jqp() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
 
 say "build"
-( cd "$(dirname "$0")/.." && go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
-PROXY="$WORK/veris-proxy"
+( cd "$(dirname "$0")/.." && go build -o "$WORK/veris" ./cmd/veris )
+PROXY="$WORK/veris"
 
 # Only now, and only after every tool that reads a real home directory has run:
 # `go build` would rebuild its entire module cache here as read-only files.
@@ -108,10 +108,10 @@ VERIS_TOKEN="$TOKEN" "$PROXY" run --sandbox "$sbx" --require-service google-cale
 status=$?
 set -e
 code=$(cat "$WORK/code" 2>/dev/null || echo none)
-echo "    HTTP $code, veris-proxy exit $status"
+echo "    HTTP $code, veris exit $status"
 head -c 400 "$WORK/body.json" 2>/dev/null; echo
 
-[ "$status" = 0 ] || { echo "FAIL: veris-proxy run exited $status"; exit 1; }
+[ "$status" = 0 ] || { echo "FAIL: veris run exited $status"; exit 1; }
 [ "$code" = 200 ] || { echo "FAIL: expected 200 from the simulated Calendar"; exit 1; }
 grep -q 'calendar#calendarList' "$WORK/body.json" \
   || { echo "FAIL: response is not a Calendar payload"; exit 1; }

@@ -52,7 +52,7 @@ func writeEnvFile(path, format string, material trust.Material, trustOnly bool, 
 	var buf []byte
 	switch format {
 	case "docker":
-		buf = append(buf, "# Written by veris-proxy serve --write-env --env-format docker.\n"...)
+		buf = append(buf, "# Written by veris serve --write-env --env-format docker.\n"...)
 		buf = append(buf, "# Pass to `docker run --env-file`. Values are literal: no quoting.\n"...)
 		for _, v := range vars {
 			// No append form here. --env-file cannot reference an existing
@@ -62,7 +62,7 @@ func writeEnvFile(path, format string, material trust.Material, trustOnly bool, 
 			buf = append(buf, fmt.Sprintf("%s=%s\n", v.Name, v.Value)...)
 		}
 	case "", "posix":
-		buf = append(buf, "# Written by veris-proxy serve --write-env. Source, do not edit.\n"...)
+		buf = append(buf, "# Written by veris serve --write-env. Source, do not edit.\n"...)
 		for _, v := range vars {
 			if v.Append {
 				// NODE_OPTIONS is the case that matters: replacing it would

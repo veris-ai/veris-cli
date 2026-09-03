@@ -128,7 +128,7 @@ func runContainerised(spec dockerRun) error {
 			removeScanContainers(name)
 			if spec.KeepProxy {
 				fmt.Fprintf(os.Stderr,
-					"veris-proxy: leaving %s running, env file at %s (--keep-proxy)\n",
+					"veris: leaving %s running, env file at %s (--keep-proxy)\n",
 					name, filepath.Join(share, "veris.env"))
 				return
 			}
@@ -206,7 +206,7 @@ func runContainerised(spec dockerRun) error {
 		envSandboxID = routed
 	}
 	if !spec.Quiet {
-		fmt.Fprintf(os.Stderr, "veris-proxy: interception live in %s\n", name)
+		fmt.Fprintf(os.Stderr, "veris: interception live in %s\n", name)
 		announceSandbox(os.Stderr, newLogger(spec.LogLevel, spec.LogFormat),
 			firstNonEmpty(routed, spec.Sandbox))
 	}
@@ -229,7 +229,7 @@ func runContainerised(spec dockerRun) error {
 	receipt, rErr := fetchReceipt(statusURL)
 	if rErr != nil {
 		fmt.Fprintf(os.Stderr,
-			"veris-proxy: could not read the receipt (%v), so what the sandbox "+
+			"veris: could not read the receipt (%v), so what the sandbox "+
 				"received is unknown\n", rErr)
 		if status == 0 {
 			return exitCode(exitIndeterminate)
@@ -249,7 +249,7 @@ func runContainerised(spec dockerRun) error {
 		inbound, ierr := fetchInboundReceipt(statusURL)
 		if ierr != nil {
 			fmt.Fprintf(os.Stderr,
-				"veris-proxy: could not read what your app received (%v)\n", ierr)
+				"veris: could not read what your app received (%v)\n", ierr)
 			// A workload that already failed keeps its own status; only an
 			// otherwise-successful run becomes indeterminate.
 			if status != 0 {
@@ -286,7 +286,7 @@ func ensureProxyImage(image string, quiet bool) error {
 		return nil
 	}
 	if !quiet {
-		fmt.Fprintf(os.Stderr, "veris-proxy: pulling %s (first run)\n", image)
+		fmt.Fprintf(os.Stderr, "veris: pulling %s (first run)\n", image)
 	}
 	cmd := exec.Command("docker", "pull", image)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
@@ -338,7 +338,7 @@ func announceSandbox(w io.Writer, log *slog.Logger, sandboxID string) {
 		log.Info("sandbox id unknown (status endpoint did not report one)")
 		return
 	}
-	fmt.Fprintf(w, "veris-proxy: sandbox ready sandbox_id=%s\n", sandboxID)
+	fmt.Fprintf(w, "veris: sandbox ready sandbox_id=%s\n", sandboxID)
 }
 
 // capabilityName is the shape of a Linux capability as docker names it:
@@ -387,7 +387,7 @@ func deleteDeployedSandbox(spec dockerRun, sandboxID string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr,
-		"veris-proxy: could not delete sandbox %s; it will expire on its TTL (%v)\n",
+		"veris: could not delete sandbox %s; it will expire on its TTL (%v)\n",
 		sandboxID, err)
 }
 

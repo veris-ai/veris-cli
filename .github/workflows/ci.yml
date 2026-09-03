@@ -28,6 +28,6 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: make dist
-      - run: file dist/veris-proxy-linux-amd64 | grep -q 'statically linked'
+      - run: file dist/veris-linux-amd64 | grep -q 'statically linked'
       - uses: actions/upload-artifact@v4
         with: { name: binaries, path: dist/ }

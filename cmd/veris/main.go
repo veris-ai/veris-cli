@@ -1,4 +1,4 @@
-// Command veris-proxy intercepts outbound HTTP(S) from code under test and
+// Command veris intercepts outbound HTTP(S) from code under test and
 // routes it to simulated services in a Veris dependency sandbox.
 //
 // It is normally started by the Veris CLI rather than invoked directly.
@@ -23,21 +23,24 @@ import (
 	"time"
 
 	"github.com/veris-ai/veris-proxy/internal/ca"
+	"github.com/veris-ai/veris-proxy/internal/cli"
 	"github.com/veris-ai/veris-proxy/internal/config"
 	"github.com/veris-ai/veris-proxy/internal/discovery"
 	"github.com/veris-ai/veris-proxy/internal/proxy"
+	"github.com/veris-ai/veris-proxy/internal/ui"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = `veris-proxy - route code under test at a Veris dependency sandbox
-
-Usage:
-  veris-proxy serve   [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]
-  veris-proxy run     [--sandbox <id>] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>
-  veris-proxy check   [--expect-canary <token>] [--any-run] [--proxy <url>]
-  veris-proxy version
+// rootHelp is the prose of the root help, after the command list: what the
+// tool is, what every routing command accepts, and the exit table that
+// exitStatus is held to.
+const rootHelp = `veris logs in to a Veris control plane, defines the environments a project
+tests against (.veris/twin.yaml, committed), starts sandboxes of them, and
+routes the code under test at a sandbox from outside the process: the code
+keeps its production hostnames, credentials and client libraries, and every
+run ends with a receipt of what the sandbox received.
 
 What to route (run and serve both accept these, most explicit first):
   --sandbox <id>    derive the routing from this sandbox
@@ -49,26 +52,6 @@ What to route (run and serve both accept these, most explicit first):
   --route <service>=<host>[/prefix]   replace one service's derived routes
                                       for this run (repeatable)
 
-Commands:
-  serve   Run the proxy. This is what the container image runs, and what a
-          long-lived local session runs. Add --transparent for the kernel
-          redirect, which is the only tier that covers every runtime.
-  run     Run a command against a sandbox and report what it sent.
-          --image runs it in a container, with the proxy in its own container
-          beside it -- the image needs no capability, no iptables and no
-          change, and no docker commands are yours to write. That container
-          runs with every capability dropped; --cap-add <CAP> hands back
-          exactly the named ones (an entrypoint that switches users with
-          su/gosu/service needs SETUID and SETGID, or build the image to run
-          as that USER). Once live it prints "sandbox ready sandbox_id=<id>".
-          Without --image the command runs LOCALLY with proxy and CA
-          environment variables set, which covers only libraries that honour
-          them; it builds the JVM truststore itself when a JDK is present.
-
-  check   Assert that a live proxy belongs to THIS run, and exit 2 if not.
-          A proxy left running from an earlier run against a different
-          sandbox would otherwise let a suite pass against the wrong data.
-
 Exit codes:
   0  success
   1  usage or configuration error
@@ -78,6 +61,135 @@ Exit codes:
   n  otherwise, whatever the command under "run" exited with
 `
 
+// root is the command tree. Each group lives in its own file and is
+// registered here in the order the help lists them: login · logout · whoami ·
+// profile · env · up · status · down · sandbox · run · serve · check · doctor ·
+// version. run, serve and check parse their own flags and answer --help
+// themselves, so they take their arguments untouched; the tree only finds
+// them -- by exact name or a unique prefix -- and prints the help that lists
+// them.
+func root() *cli.Command {
+	var showVersion bool
+	r := &cli.Command{
+		Name:    "veris",
+		Summary: "route code under test at a Veris sandbox, from login to run",
+		Usage: "veris login   [KEY] [--profile NAME] [--api-base URL] [--key-stdin]\n" +
+			"  veris env     create|list|get|use|delete\n" +
+			"  veris up      [NAME] [--ttl N] [--boot bundle|baseline|snapshot]\n" +
+			"  veris run     [--sandbox <id>] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>\n" +
+			"  veris serve   [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]\n" +
+			"  veris check   [--expect-canary <token>] [--any-run] [--proxy <url>]\n" +
+			"  veris doctor",
+		Help: rootHelp,
+		Flags: func(fs *flag.FlagSet) {
+			fs.BoolVar(&showVersion, "version", false, "print the version and exit")
+			fs.BoolVar(&showVersion, "v", false, "print the version and exit")
+		},
+	}
+	r.Sub = append(r.Sub, loginCommands()...)
+	r.Sub = append(r.Sub, envCommand(), initCommand())
+	r.Sub = append(r.Sub, sandboxCommands()...)
+	r.Sub = append(r.Sub, routingCommands()...)
+	r.Sub = append(r.Sub, doctorCommand(), versionCommand())
+	// `veris` alone is a mistake, not a request for help: the usage goes to
+	// stderr and the exit is 1, so a script that forgot its command notices.
+	// --version is the one flag that makes a bare `veris` an answer.
+	r.Run = func(ctx *cli.Context, _ []string) error {
+		if showVersion {
+			fmt.Fprintln(ctx.Stdout, version)
+			return nil
+		}
+		fmt.Fprint(ctx.Stderr, cli.Help(ctx.Path, r, ctx.Globals))
+		return &cli.UsageError{Msg: "no command given", Cmd: r}
+	}
+	return r
+}
+
+// routingCommands are the proxy's own: run, serve and check.
+func routingCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:    "run",
+			Summary: "Run a command against a sandbox and report what it sent",
+			Usage:   "veris run [--sandbox <id>] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>",
+			Help: `--image runs it in a container, with the proxy in its own container
+beside it -- the image needs no capability, no iptables and no change, and
+no docker commands are yours to write. That container runs with every
+capability dropped; --cap-add <CAP> hands back exactly the named ones (an
+entrypoint that switches users with su/gosu/service needs SETUID and
+SETGID, or build the image to run as that USER). Once live it prints
+"sandbox ready sandbox_id=<id>".
+Without --image the command runs LOCALLY with proxy and CA environment
+variables set, which covers only libraries that honour them; it builds the
+JVM truststore itself when a JDK is present.
+
+Run with --help for the flags.`,
+			RawArgs: true,
+			Run:     rawLeaf(cmdRun),
+		},
+		{
+			Name:    "serve",
+			Summary: "Run the proxy, as the container image and a long-lived session do",
+			Usage:   "veris serve [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]",
+			Help: `This is what the container image runs, and what a long-lived local
+session runs. Add --transparent for the kernel redirect, which is the only
+tier that covers every runtime.
+
+Run with --help for the flags.`,
+			RawArgs: true,
+			Run:     rawLeaf(cmdServe),
+		},
+		{
+			Name:    "check",
+			Summary: "Assert that a live proxy belongs to THIS run, and exit 2 if not",
+			Usage:   "veris check [--expect-canary <token>] [--any-run] [--proxy <url>]",
+			Help: `A proxy left running from an earlier run against a different sandbox
+would otherwise let a suite pass against the wrong data.
+
+Run with --help for the flags.`,
+			RawArgs: true,
+			Run:     rawLeaf(cmdCheck),
+		},
+	}
+}
+
+// rawLeaf adapts run, serve and check to the tree. They parse their own
+// flags and read none of the globals, so a global placed before the command
+// word (`veris -q run …`) would be accepted by the root and then do nothing;
+// the old dispatcher refused it, and so does this, naming the flag, until
+// those commands read the globals themselves. The globals start zero on
+// every invocation, so any value set is one the user typed.
+func rawLeaf(cmd func(args []string) error) func(*cli.Context, []string) error {
+	return func(ctx *cli.Context, args []string) error {
+		if name := setGlobal(ctx.Globals); name != "" {
+			word := ctx.Path[len(ctx.Path)-1]
+			return &cli.UsageError{Msg: fmt.Sprintf(
+				"%s before the command is not read by %s, which takes its own flags after it (veris %s --help lists them)",
+				name, word, word)}
+		}
+		return cmd(args)
+	}
+}
+
+// setGlobal names the first global flag that carries a value, "" when none.
+func setGlobal(g *cli.Globals) string {
+	switch {
+	case g == nil:
+		return ""
+	case g.Quiet:
+		return "--quiet"
+	case g.JSON:
+		return "--json"
+	case g.Yes:
+		return "--yes"
+	case g.Profile != "":
+		return "--profile"
+	case g.APIBase != "":
+		return "--api-base"
+	}
+	return ""
+}
+
 func main() {
 	os.Exit(exitStatus(run(os.Args[1:])))
 }
@@ -86,12 +198,16 @@ func main() {
 // the usage text -- and prints the message where one is owed. Split from main
 // so a test can hold it to that table.
 func exitStatus(err error) int {
+	return exitStatusTo(os.Stderr, err)
+}
+
+func exitStatusTo(stderr io.Writer, err error) int {
 	if err == nil {
 		return 0
 	}
-	// Usage that was asked for is the answer, not a failure: parseFlags has
-	// already printed it to stdout, and a script probing `run --help` reads
-	// the exit code.
+	// Usage that was asked for is the answer, not a failure: parseFlags or
+	// the tree has already printed it to stdout, and a script probing
+	// `run --help` reads the exit code.
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
@@ -101,7 +217,24 @@ func exitStatus(err error) int {
 	if errors.As(err, &code) {
 		return int(code)
 	}
-	fmt.Fprintf(os.Stderr, "veris-proxy: %v\n", err)
+	// A failure already reported in the ✗ grammar (see output.go) needs only
+	// its status; and a prompt the user left with Ctrl-C is their choice, not
+	// a failure to explain.
+	var reported printedError
+	if errors.As(err, &reported) {
+		return reported.code
+	}
+	if errors.Is(err, ui.ErrInterrupted) {
+		return 1
+	}
+	fmt.Fprintf(stderr, "veris: %v\n", err)
+	// A command line the tree could not understand. Its help is already on
+	// stderr; the line above names what was wrong with it.
+	var usage *cli.UsageError
+	var ambiguous *cli.AmbiguousError
+	if errors.As(err, &usage) || errors.As(err, &ambiguous) {
+		return 1
+	}
 	var ce checkFailure
 	if errors.As(err, &ce) {
 		return 2
@@ -129,29 +262,11 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 	return err
 }
 
+// run resolves the command line against the tree and runs what it names.
+// The globals are parsed and carried so a command that reads them can be
+// added without touching this; none of run, serve or check does yet.
 func run(args []string) error {
-	if len(args) == 0 {
-		fmt.Fprint(os.Stderr, usage)
-		return errors.New("no command given")
-	}
-
-	switch args[0] {
-	case "run":
-		return cmdRun(args[1:])
-	case "serve":
-		return cmdServe(args[1:])
-	case "check":
-		return cmdCheck(args[1:])
-	case "version", "--version", "-v":
-		fmt.Println(version)
-		return nil
-	case "help", "--help", "-h":
-		fmt.Print(usage)
-		return nil
-	default:
-		fmt.Fprint(os.Stderr, usage)
-		return fmt.Errorf("unknown command %q", args[0])
-	}
+	return cli.Execute(root(), &cli.Globals{}, args, os.Stdout, os.Stderr)
 }
 
 func cmdServe(args []string) error {
@@ -471,7 +586,7 @@ func cmdServe(args []string) error {
 		printInbound(os.Stderr, receipt)
 		unmet := unmetCallbacks(requireCallback, receipt)
 		for _, u := range unmet {
-			fmt.Fprintf(os.Stderr, "veris-proxy: %s\n", u)
+			fmt.Fprintf(os.Stderr, "veris: %s\n", u)
 		}
 		if err == nil && len(unmet) > 0 {
 			return exitCode(exitRequirementUnmet)
@@ -507,7 +622,7 @@ func writableDirs(cfg *config.Config, files ...string) []string {
 const shutdownGrace = 5 * time.Second
 
 func announce(log *slog.Logger, running *proxy.Running, cfg *config.Config, authority *ca.CA) {
-	log.Info("veris-proxy listening",
+	log.Info("proxy listening",
 		"addr", running.Addr("proxy"),
 		"mode", string(cfg.Mode),
 		"sandbox_id", cfg.SandboxID,

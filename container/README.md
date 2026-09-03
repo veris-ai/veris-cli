@@ -41,7 +41,7 @@ docker run --rm --network container:veris-proxy --cap-drop=ALL \
   your-image pytest -q
 ```
 
-`--cap-drop=ALL` in step 2 is the same hardened default `veris-proxy run
+`--cap-drop=ALL` in step 2 is the same hardened default `veris run
 --image` uses. An entrypoint that switches users (`su`, `gosu`, `service`)
 needs `--cap-add=SETUID --cap-add=SETGID` after it — `run --image` takes the
 same as `--cap-add SETUID --cap-add SETGID` — or build the image to run as
@@ -178,7 +178,7 @@ Or with no image rebuild at all, since the binary is static:
 
 ```sh
 docker run --cap-add=NET_ADMIN \
-  -v ./veris-proxy:/veris-bin/veris-proxy:ro \
+  -v ./veris:/veris-bin/veris:ro \
   -v ./veris-entrypoint:/veris-bin/veris-entrypoint:ro \
   --entrypoint /veris-bin/veris-entrypoint \
   your-image  /app/your-entrypoint.sh  pytest -q
@@ -196,11 +196,11 @@ and only then serves. So an image can run the binary directly.
 ```dockerfile
 FROM alpine:3.22
 RUN apk add --no-cache iptables ca-certificates
-COPY veris-proxy /usr/local/bin/veris-proxy
+COPY veris /usr/local/bin/veris
 ```
 
 ```sh
-docker run -d --cap-add=NET_ADMIN your-image veris-proxy serve --transparent
+docker run -d --cap-add=NET_ADMIN your-image veris serve --transparent
 ```
 
 It refuses if it cannot install the redirect — including when started

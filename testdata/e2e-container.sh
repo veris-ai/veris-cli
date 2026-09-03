@@ -106,7 +106,7 @@ say "the proxy must not share a uid with the command under test"
 # source text.
 uids=$(docker run --rm --network "$NET" --cap-add=NET_ADMIN \
   -v "$WORK/config.json":/veris/config.json:ro "$IMAGE" \
-  sh -c 'echo "VERISUID workload=$(id -u) proxy=$(stat -c %u /proc/$(pgrep -n veris-proxy))"' 2>&1 \
+  sh -c 'echo "VERISUID workload=$(id -u) proxy=$(stat -c %u /proc/$(pgrep -nx veris))"' 2>&1 \
   | grep -o 'VERISUID workload=[0-9][0-9]* proxy=[0-9][0-9]*' | tail -1)
 echo "    $uids"
 workload=${uids#*workload=}; workload=${workload%% *}

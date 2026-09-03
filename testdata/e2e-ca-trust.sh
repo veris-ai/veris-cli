@@ -27,11 +27,11 @@ say() { printf '\n==> %s\n' "$*"; }
 
 say "build and start the proxy in its own container"
 ( cd "$HERE" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
-    go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
+    go build -o "$WORK/veris" ./cmd/veris )
 cat > "$WORK/Dockerfile" <<'DOCKER'
 FROM alpine:3.22
 RUN apk add --no-cache iptables ca-certificates
-COPY veris-proxy /usr/local/bin/veris-proxy
+COPY veris /usr/local/bin/veris
 DOCKER
 docker build -q -t veris-ct:local "$WORK" >/dev/null
 
@@ -51,7 +51,7 @@ JSON
 docker run -d --name ct-proxy --network "$NET" --cap-add=NET_ADMIN \
   -v "$WORK/config.json":/veris/config.json:ro -v "$WORK":/out \
   veris-ct:local \
-  veris-proxy serve --config /veris/config.json --ca-dir /veris/ca \
+  veris serve --config /veris/config.json --ca-dir /veris/ca \
     --transparent --write-env /out/veris.env --env-format docker \
     --log-level info >/dev/null
 for _ in $(seq 1 40); do

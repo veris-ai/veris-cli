@@ -26,7 +26,7 @@ say() { printf '\n==> %s\n' "$*"; }
 
 say "build the veris binary for the container"
 ( cd "$HERE" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
-    go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
+    go build -o "$WORK/veris" ./cmd/veris )
 cp "$HERE/container/entrypoint.sh" "$WORK/veris-entrypoint"
 chmod +x "$WORK/veris-entrypoint"
 
@@ -78,7 +78,7 @@ JSON
 say "run their image, their entrypoint, with the wrapper in front"
 set +e
 out=$(docker run --rm --network "$NET" --cap-add=NET_ADMIN \
-  -v "$WORK/veris-proxy":/veris-bin/veris-proxy:ro \
+  -v "$WORK/veris":/veris-bin/veris:ro \
   -v "$WORK/veris-entrypoint":/veris-bin/veris-entrypoint:ro \
   -v "$WORK/config.json":/veris/config.json:ro \
   -e PATH=/veris-bin:/usr/local/bin:/usr/bin:/bin \
@@ -108,7 +108,7 @@ echo "    an unmodified curl, --noproxy '*', was intercepted anyway"
 say "an image WITHOUT iptables must refuse rather than degrade"
 set +e
 bare=$(docker run --rm --network "$NET" --cap-add=NET_ADMIN \
-  -v "$WORK/veris-proxy":/veris-bin/veris-proxy:ro \
+  -v "$WORK/veris":/veris-bin/veris:ro \
   -v "$WORK/veris-entrypoint":/veris-bin/veris-entrypoint:ro \
   -v "$WORK/config.json":/veris/config.json:ro \
   -e PATH=/veris-bin:/usr/local/bin:/usr/bin:/bin \

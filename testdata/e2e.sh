@@ -7,7 +7,7 @@
 # are the stacks that actually reject a bare leaf.
 set -uo pipefail
 
-BIN="${1:?usage: e2e.sh /path/to/veris-proxy}"
+BIN="${1:?usage: e2e.sh /path/to/veris}"
 WORK="$(mktemp -d)"
 PIDS=()
 cleanup() {
@@ -84,7 +84,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-echo "veris-proxy e2e"
+echo "veris e2e"
 
 # --- curl / OpenSSL -----------------------------------------------------------
 out=$(curl -sS --proxy "$PROXY" --cacert "$CA" https://api.stripe.com/v1/charges)

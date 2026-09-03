@@ -55,17 +55,17 @@ func bundledCAOverlays(spec dockerRun, share, scanLabel string) ([]bundlescan.Ov
 		// indistinguishable from nothing having been found.
 		for _, c := range skipped {
 			fmt.Fprintf(os.Stderr,
-				"veris-proxy: %s: bundled CA at %s already carries the Veris CA\n",
+				"veris: %s: bundled CA at %s already carries the Veris CA\n",
 				c.SDK, c.ContainerPath)
 		}
 		for _, o := range overlays {
 			fmt.Fprintf(os.Stderr,
-				"veris-proxy: %s: bundled CA at %s -- over-mounted with the Veris CA appended\n",
+				"veris: %s: bundled CA at %s -- over-mounted with the Veris CA appended\n",
 				o.SDK, o.ContainerPath)
 		}
 		if len(overlays) > 0 {
 			fmt.Fprintf(os.Stderr,
-				"veris-proxy: %d bundled CA file(s) over-mounted\n", len(overlays))
+				"veris: %d bundled CA file(s) over-mounted\n", len(overlays))
 		}
 	}
 	return overlays, unknown, nil
