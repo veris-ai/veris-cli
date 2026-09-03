@@ -42,6 +42,12 @@ routes the code under test at a sandbox from outside the process: the code
 keeps its production hostnames, credentials and client libraries, and every
 run ends with a receipt of what the sandbox received.
 
+A running sandbox is inspected and seeded in place (veris sandbox services,
+data, trace, clock); a world worth keeping is captured as a snapshot or
+pinned as what every new sandbox of the environment boots (veris snapshot,
+veris baseline); and run reads the sandbox's own request log after the
+command exits, beside the proxy's receipt, so the two ledgers are compared.
+
 What to route (run and serve both accept these, most explicit first):
   --sandbox <id>    derive the routing from this sandbox
   --config <file>   or an explicit config file, used exactly as written
@@ -63,8 +69,9 @@ Exit codes:
 
 // root is the command tree. Each group lives in its own file and is
 // registered here in the order the help lists them: login · logout · whoami ·
-// profile · env · up · status · down · sandbox · run · serve · check · doctor ·
-// version. run, serve and check parse their own flags and answer --help
+// profile · env · init · up · status · down · sandbox · snapshot · baseline ·
+// run · serve · check · doctor · version. run, serve and check parse their
+// own flags and answer --help
 // themselves, so they take their arguments untouched; the tree only finds
 // them -- by exact name or a unique prefix -- and prints the help that lists
 // them.
@@ -73,12 +80,15 @@ func root() *cli.Command {
 	r := &cli.Command{
 		Name:    "veris",
 		Summary: "route code under test at a Veris sandbox, from login to run",
-		Usage: "veris login   [KEY] [--profile NAME] [--api-base URL] [--key-stdin]\n" +
-			"  veris env     create|list|get|use|delete\n" +
-			"  veris up      [NAME] [--ttl N] [--boot bundle|baseline|snapshot]\n" +
-			"  veris run     [--sandbox <id>] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>\n" +
-			"  veris serve   [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]\n" +
-			"  veris check   [--expect-canary <token>] [--any-run] [--proxy <url>]\n" +
+		Usage: "veris login     [KEY] [--profile NAME] [--api-base URL] [--key-stdin]\n" +
+			"  veris env       create|list|get|use|delete\n" +
+			"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot]\n" +
+			"  veris sandbox   get|list|delete|reset|services|data|trace|clock [--id ID]\n" +
+			"  veris snapshot  create|list|get|delete\n" +
+			"  veris baseline  get|promote|set|clear|list\n" +
+			"  veris run       [--sandbox <id>] [--fresh] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] [--receipt PATH] -- <cmd>\n" +
+			"  veris serve     [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]\n" +
+			"  veris check     [--expect-canary <token>] [--any-run] [--proxy <url>]\n" +
 			"  veris doctor",
 		Help: rootHelp,
 		Flags: func(fs *flag.FlagSet) {
@@ -89,6 +99,7 @@ func root() *cli.Command {
 	r.Sub = append(r.Sub, loginCommands()...)
 	r.Sub = append(r.Sub, envCommand(), initCommand())
 	r.Sub = append(r.Sub, sandboxCommands()...)
+	r.Sub = append(r.Sub, snapshotCommand(), baselineCommand())
 	r.Sub = append(r.Sub, routingCommands()...)
 	r.Sub = append(r.Sub, doctorCommand(), versionCommand())
 	// `veris` alone is a mistake, not a request for help: the usage goes to
@@ -111,7 +122,7 @@ func routingCommands() []*cli.Command {
 		{
 			Name:    "run",
 			Summary: "Run a command against a sandbox and report what it sent",
-			Usage:   "veris run [--sandbox <id>] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>",
+			Usage:   "veris run [--sandbox <id>] [--fresh] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] [--receipt PATH] -- <cmd>",
 			Help: `--image runs it in a container, with the proxy in its own container
 beside it -- the image needs no capability, no iptables and no change, and
 no docker commands are yours to write. That container runs with every
@@ -122,6 +133,14 @@ SETGID, or build the image to run as that USER). Once live it prints
 Without --image the command runs LOCALLY with proxy and CA environment
 variables set, which covers only libraries that honour them; it builds the
 JVM truststore itself when a JDK is present.
+
+--fresh deploys a sandbox of the folder's environment first, as veris up
+does (data files included), and deletes it afterwards; --keep leaves it
+running as this folder's, --ttl N bounds its life if teardown never runs.
+After the command exits the sandbox's own request log is read from a
+watermark taken before it started and compared with the proxy's receipt;
+--require-service and --require-callback are held against both, and
+--receipt PATH writes the two ledgers and the verdict as JSON to PATH.
 
 Run with --help for the flags.`,
 			RawArgs: true,

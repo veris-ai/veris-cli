@@ -1020,14 +1020,23 @@ func newRunPlane(t *testing.T, id string) *runPlane {
 	return p
 }
 
+// sawKey is the key the last request carried, the earlier ones drained: a
+// run asks the plane more than once (discovery, then the ledger's read of
+// the sandbox), all with the one key it resolved.
 func (p *runPlane) sawKey(t *testing.T) string {
 	t.Helper()
-	select {
-	case k := <-p.keys:
-		return k
-	default:
-		t.Fatal("the control plane was never asked")
-		return ""
+	var last string
+	seen := false
+	for {
+		select {
+		case k := <-p.keys:
+			last, seen = k, true
+		default:
+			if !seen {
+				t.Fatal("the control plane was never asked")
+			}
+			return last
+		}
 	}
 }
 
