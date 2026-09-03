@@ -204,29 +204,75 @@ func TestExitStatusFollowsTheTable(t *testing.T) {
 	}
 }
 
-// The groups Milestone 1 added, as a script sees them: help of a leaf and of
-// a group on stdout, a group word with no verb refused with its usage, and a
-// prefix chain (`e li`) resolving to env list and failing as env list fails,
-// not as the tree does. The child runs on an empty HOME with every VERIS_*
-// variable cleared and a project-less working directory, so the machine
-// running the tests cannot lend it a login or a project file.
-func TestTheNewGroupsAnswerAsAScriptSeesThem(t *testing.T) {
+// scriptCase is one command line as a script sees it: the argv, the exit
+// code, and what each stream must carry, must not carry, or must lack
+// entirely.
+type scriptCase struct {
+	name       string
+	argv       []string
+	code       int
+	stdoutHas  []string
+	stderrHas  []string
+	stderrNot  []string
+	stdoutNone bool
+	stderrNone bool
+}
+
+// bareMachine runs the rest of the test on an empty HOME with every VERIS_*
+// variable cleared, and returns a project-less working directory, so the
+// machine running the tests cannot lend a child a login or a project file.
+func bareMachine(t *testing.T) (dir string) {
+	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	for _, v := range []string{"VERIS_API_KEY", "VERIS_API_BASE", "VERIS_PROFILE", "VERIS_ENV",
 		"VERIS_SANDBOX_ID", "VERIS_PROXY_CONFIG", "VERIS_ENVIRONMENT_ID"} {
 		t.Setenv(v, "")
 	}
-	dir := t.TempDir()
-	cases := []struct {
-		name       string
-		argv       []string
-		code       int
-		stdoutHas  []string
-		stderrHas  []string
-		stderrNot  []string
-		stdoutNone bool
-		stderrNone bool
-	}{
+	return t.TempDir()
+}
+
+// runScriptCases re-invokes the binary in dir for every case and holds its
+// streams and exit code to the case.
+func runScriptCases(t *testing.T, dir string, cases []scriptCase) {
+	t.Helper()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, code := invokeIn(t, dir, tc.argv...)
+			if code != tc.code {
+				t.Errorf("%v exited %d, want %d (stderr: %q)", tc.argv, code, tc.code, stderr)
+			}
+			for _, want := range tc.stdoutHas {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("%v: stdout lacks %q:\n%s", tc.argv, want, stdout)
+				}
+			}
+			for _, want := range tc.stderrHas {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("%v: stderr lacks %q:\n%s", tc.argv, want, stderr)
+				}
+			}
+			for _, bad := range tc.stderrNot {
+				if strings.Contains(stderr, bad) {
+					t.Errorf("%v: stderr must not carry %q:\n%s", tc.argv, bad, stderr)
+				}
+			}
+			if tc.stdoutNone && stdout != "" {
+				t.Errorf("%v: nothing belongs on stdout, got %q", tc.argv, stdout)
+			}
+			if tc.stderrNone && stderr != "" {
+				t.Errorf("%v: nothing belongs on stderr, got %q", tc.argv, stderr)
+			}
+		})
+	}
+}
+
+// The groups Milestone 1 added, as a script sees them: help of a leaf and of
+// a group on stdout, a group word with no verb refused with its usage, and a
+// prefix chain (`e li`) resolving to env list and failing as env list fails,
+// not as the tree does.
+func TestTheNewGroupsAnswerAsAScriptSeesThem(t *testing.T) {
+	dir := bareMachine(t)
+	runScriptCases(t, dir, []scriptCase{
 		{
 			name:       "login --help is the leaf's help on stdout",
 			argv:       []string{"login", "--help"},
@@ -257,34 +303,149 @@ func TestTheNewGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			stderrNot:  []string{"panic", "Usage:", "unknown command", "ambiguous"},
 			stdoutNone: true,
 		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			stdout, stderr, code := invokeIn(t, dir, tc.argv...)
-			if code != tc.code {
-				t.Errorf("%v exited %d, want %d (stderr: %q)", tc.argv, code, tc.code, stderr)
-			}
-			for _, want := range tc.stdoutHas {
-				if !strings.Contains(stdout, want) {
-					t.Errorf("%v: stdout lacks %q:\n%s", tc.argv, want, stdout)
-				}
-			}
-			for _, want := range tc.stderrHas {
-				if !strings.Contains(stderr, want) {
-					t.Errorf("%v: stderr lacks %q:\n%s", tc.argv, want, stderr)
-				}
-			}
-			for _, bad := range tc.stderrNot {
-				if strings.Contains(stderr, bad) {
-					t.Errorf("%v: stderr must not carry %q:\n%s", tc.argv, bad, stderr)
-				}
-			}
-			if tc.stdoutNone && stdout != "" {
-				t.Errorf("%v: nothing belongs on stdout, got %q", tc.argv, stdout)
-			}
-			if tc.stderrNone && stderr != "" {
-				t.Errorf("%v: nothing belongs on stderr, got %q", tc.argv, stderr)
-			}
-		})
-	}
+	})
+}
+
+// The groups Milestone 2 added -- snapshot and baseline at the root, and
+// services, data, trace and clock under sandbox -- as a script sees them:
+// the root help names them, each group's help lists its verbs on stdout,
+// a leaf's help carries its own flags, a group word with no verb is refused
+// with its usage, and a prefix chain (`sn li`, `ba g`) reaches the leaf and
+// fails as that leaf fails on a machine with no login and no project, not
+// as the tree does. run's own usage lists the flags the proof added.
+func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
+	dir := bareMachine(t)
+	runScriptCases(t, dir, []scriptCase{
+		{
+			name: "the root help lists the new groups",
+			argv: []string{"--help"},
+			code: 0,
+			stdoutHas: []string{
+				"  veris sandbox   get|list|delete|reset|services|data|trace|clock [--id ID]\n",
+				"  veris snapshot  create|list|get|delete\n",
+				"  veris baseline  get|promote|set|clear|list\n",
+				"  veris run       [--sandbox <id>] [--fresh]",
+				"  snapshot   Recorded worlds: create, list, get, delete\n",
+				"  baseline   What every new sandbox boots: get, promote, set, clear, list\n",
+				"veris snapshot,\nveris baseline",
+			},
+			stderrNone: true,
+		},
+		{
+			name: "snapshot --help lists the verbs",
+			argv: []string{"snapshot", "--help"},
+			code: 0,
+			stdoutHas: []string{"veris snapshot - Recorded worlds", "Usage:\n  veris snapshot <command>",
+				"Commands:\n  create", "  list ", "  get ", "  delete ", "veris up --snapshot"},
+			stderrNone: true,
+		},
+		{
+			name: "baseline --help lists the verbs",
+			argv: []string{"baseline", "--help"},
+			code: 0,
+			stdoutHas: []string{"veris baseline - What every new sandbox boots", "Usage:\n  veris baseline <command>",
+				"Commands:\n  get", "  promote ", "  set ", "  clear ", "  list "},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox --help lists the four new verbs after the lifecycle ones",
+			argv: []string{"sandbox", "--help"},
+			code: 0,
+			stdoutHas: []string{"Commands:\n  get", "  reset ", "  services ", "  data ", "  trace ", "  clock ",
+				"Usage:\n  veris sandbox <command> [--id ID]"},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox services --help lists its verbs",
+			argv: []string{"sandbox", "services", "--help"},
+			code: 0,
+			stdoutHas: []string{"veris sandbox services - The twins of a sandbox", "Usage:\n  veris sandbox services <command> [--id ID]",
+				"Commands:\n  list", "  get ", "  manual "},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox data --help lists its verbs",
+			argv: []string{"sandbox", "data", "--help"},
+			code: 0,
+			stdoutHas: []string{"veris sandbox data - A sandbox's data", "Usage:\n  veris sandbox data <command> [--id ID]",
+				"Commands:\n  schema", "  get ", "  add ", "GET /veris/schema"},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox data add --help is the leaf's help with the file shape",
+			argv: []string{"sandbox", "data", "add", "--help"},
+			code: 0,
+			stdoutHas: []string{"Usage:\n  veris sandbox data add FILE", "{twin: {table: [rows]}}",
+				"Flags:\n  --id "},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox trace --help is a leaf with its own flags",
+			argv: []string{"sandbox", "trace", "--help"},
+			code: 0,
+			stdoutHas: []string{"veris sandbox trace - What the sandbox received, newest first",
+				"Usage:\n  veris sandbox trace [--id ID] [--service NAME] [--tier handler|fault|control|delivery]",
+				"  --body ", "  --follow ", "  --since ", "  --tier ", "  --limit "},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox clock --help lists set and reads without a verb",
+			argv: []string{"sandbox", "clock", "--help"},
+			code: 0,
+			stdoutHas: []string{"veris sandbox clock - The sandbox's shared virtual clock", "Usage:\n  veris sandbox clock [--id ID]",
+				"Commands:\n  set "},
+			stderrNone: true,
+		},
+		{
+			name:       "sandbox clock set --help names the three ways to move time",
+			argv:       []string{"sandbox", "clock", "set", "--help"},
+			code:       0,
+			stdoutHas:  []string{"Usage:\n  veris sandbox clock set (--freeze-at", "  --freeze-at ", "  --offset ", "  --live "},
+			stderrNone: true,
+		},
+		{
+			name:       "run --help carries the proof's flags",
+			argv:       []string{"run", "--help"},
+			code:       0,
+			stdoutHas:  []string{"Usage of run:", "-fresh\n", "-keep\n", "-ttl minutes", "-receipt file", "-require-callback"},
+			stderrNone: true,
+		},
+		{
+			name:       "help run describes --fresh and the sandbox ledger",
+			argv:       []string{"help", "run"},
+			code:       0,
+			stdoutHas:  []string{"Usage:\n  veris run [--sandbox <id>] [--fresh]", "--fresh deploys a sandbox", "--receipt PATH writes"},
+			stderrNone: true,
+		},
+		{
+			name:       "snapshot with no verb is a usage error on stderr",
+			argv:       []string{"snapshot"},
+			code:       1,
+			stderrHas:  []string{"Usage:\n  veris snapshot <command>", "Commands:\n  create", "veris: no command given\n"},
+			stdoutNone: true,
+		},
+		{
+			name:       "sandbox data with no verb is a usage error on stderr",
+			argv:       []string{"sandbox", "data"},
+			code:       1,
+			stderrHas:  []string{"Usage:\n  veris sandbox data <command>", "Commands:\n  schema", "veris: no command given\n"},
+			stdoutNone: true,
+		},
+		{
+			name:       "a prefix chain reaches snapshot list, which fails as snapshot list does",
+			argv:       []string{"sn", "li"},
+			code:       1,
+			stderrHas:  []string{"✗ No environment selected\n", "→ Next: veris env use NAME, or pass --env\n"},
+			stderrNot:  []string{"panic", "Usage:", "unknown command", "ambiguous"},
+			stdoutNone: true,
+		},
+		{
+			name:       "a prefix chain reaches baseline get, which fails as baseline get does",
+			argv:       []string{"ba", "g"},
+			code:       1,
+			stderrHas:  []string{"✗ No environment selected\n", "→ Next: veris env use NAME, or pass --env\n"},
+			stderrNot:  []string{"panic", "Usage:", "unknown command", "ambiguous"},
+			stdoutNone: true,
+		},
+	})
 }

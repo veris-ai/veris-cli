@@ -218,25 +218,50 @@ func upCommand() *cli.Command {
 // print. Every failure after the create leaves the sandbox and its pointer
 // in place, since a sandbox that exists is worth more than a clean folder.
 func up(ctx *cli.Context, name string, o upOptions) error {
-	timeout, err := parseUpTimeout(o.timeout)
+	s, sb, err := upSandbox(ctx, name, o, true)
 	if err != nil {
 		return err
+	}
+	if s.res.Local != nil {
+		s.ui.Success("Up: %s is this folder's sandbox (expires %s)", sb.ID, clockOf(sb.ExpiresAt))
+	} else {
+		s.ui.Success("Up: %s is ready (expires %s)", sb.ID, clockOf(sb.ExpiresAt))
+	}
+	studioLink(s.ui, s.consoleURL(), "sandboxes", sb.ID)
+	s.ui.Next("veris run")
+	if s.ctx.Globals.JSON {
+		return printJSON(s.ctx.Stdout, sb)
+	}
+	return nil
+}
+
+// upSandbox is up without its closing lines: resolve, create, wait, probe
+// and seed, returning the session and the ready sandbox. remember is
+// whether the folder's pointer is written, as up does at once so `veris
+// down` finds what was created; run --fresh passes false, since the sandbox
+// is its own and deleted before it returns. The sandbox is returned beside
+// the error of any step after the create, so a caller that made it for
+// itself can still delete it.
+func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*session, *api.Sandbox, error) {
+	timeout, err := parseUpTimeout(o.timeout)
+	if err != nil {
+		return nil, nil, err
 	}
 	s, err := newSession(ctx, name, "")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if o.boot != "" && !upBootKnown(o.boot) {
 		s.ui.Fail("--boot must be bundle, baseline or snapshot (got '%s')", o.boot)
-		return printed(1)
+		return s, nil, printed(1)
 	}
 	envName, envID, conf, err := s.requireEnv()
 	if err != nil {
-		return err
+		return s, nil, err
 	}
 	c, err := s.client()
 	if err != nil {
-		return err
+		return s, nil, err
 	}
 	// Ctrl-C ends the waits, not the sandbox: the pointer is written before
 	// any wait starts, so `veris down` finds what was created.
@@ -247,17 +272,17 @@ func up(ctx *cli.Context, name string, o upOptions) error {
 	if !upBootKnown(boot) {
 		s.ui.Fail("Environment '%s' has boot '%s' in %s; it must be bundle, baseline or snapshot",
 			envName, boot, s.res.Project.Path)
-		return printed(1)
+		return s, nil, printed(1)
 	}
 	// A --snapshot beside --boot baseline or bundle would be dropped without
 	// a word; the user who named it gets a baseline world and no warning.
 	if o.snapshot != "" && boot != bootSnapshot {
 		s.ui.Fail("--snapshot only applies with --boot snapshot (got --boot %s)", boot)
-		return printed(1)
+		return s, nil, printed(1)
 	}
 	env, err := c.GetEnvironment(bg, envID)
 	if err != nil {
-		return s.fail("read", "environment "+envID, err)
+		return s, nil, s.fail("read", "environment "+envID, err)
 	}
 
 	req := api.CreateSandboxRequest{TTLMinutes: &ttl, Metadata: map[string]string{"project": upProjectName(s, envName)}}
@@ -272,11 +297,11 @@ func up(ctx *cli.Context, name string, o upOptions) error {
 	case bootSnapshot:
 		if snapshot == "" {
 			s.ui.Fail("--boot snapshot needs --snapshot ID|NAME (or `snapshot:` in the environment config)")
-			return printed(1)
+			return s, nil, printed(1)
 		}
 		id, err := resolveSnapshot(bg, s, c, envID, snapshot)
 		if err != nil {
-			return err
+			return s, nil, err
 		}
 		req.SnapshotID = &id
 		bootLabel = "snapshot " + shortID(id)
@@ -294,42 +319,36 @@ func up(ctx *cli.Context, name string, o upOptions) error {
 	// The pointer is about to be replaced: a sandbox it still names keeps
 	// running until its TTL and is reachable afterwards only by id, so the
 	// orphan is announced with the command that deletes it.
-	if old := priorSandbox(s); old != "" {
+	if old := priorSandbox(s); remember && old != "" {
 		s.ui.Warn("This folder already pointed at sandbox %s; it keeps running until its TTL (veris sandbox delete --id %s)", old, old)
 	}
 	sb, err := c.CreateSandbox(bg, envID, req)
 	if err != nil {
-		return s.fail("create", "sandbox", err)
+		return s, nil, s.fail("create", "sandbox", err)
 	}
 	s.ui.Success("Sandbox created: %s", sb.ID)
-	if err := s.rememberSandbox(sb); err != nil {
-		return err
+	if remember {
+		if err := s.rememberSandbox(sb); err != nil {
+			return s, sb, err
+		}
 	}
 
 	deadline := time.Now().Add(timeout)
-	if sb, err = waitReady(bg, s, c, sb.ID, deadline, timeout); err != nil {
-		return err
+	ready, err := waitReady(bg, s, c, sb.ID, deadline, timeout)
+	if err != nil {
+		return s, sb, err
 	}
+	sb = ready
 	if err := waitRoutable(bg, s, sb, deadline, timeout); err != nil {
-		return err
+		return s, sb, err
 	}
 	printHints(s.ui, sb.Services)
 	if conf != nil && len(conf.Data) > 0 {
 		if err := addDataFiles(bg, s, sb, conf.Data); err != nil {
-			return err
+			return s, sb, err
 		}
 	}
-	if s.res.Local != nil {
-		s.ui.Success("Up: %s is this folder's sandbox (expires %s)", sb.ID, clockOf(sb.ExpiresAt))
-	} else {
-		s.ui.Success("Up: %s is ready (expires %s)", sb.ID, clockOf(sb.ExpiresAt))
-	}
-	studioLink(s.ui, s.consoleURL(), "sandboxes", sb.ID)
-	s.ui.Next("veris run")
-	if s.ctx.Globals.JSON {
-		return printJSON(s.ctx.Stdout, sb)
-	}
-	return nil
+	return s, sb, nil
 }
 
 // priorSandbox is the id the local file points at when that sandbox may
@@ -643,15 +662,10 @@ func addDataFiles(ctx context.Context, s *session, sb *api.Sandbox, files []stri
 		if err != nil {
 			return s.fail("read", file, err)
 		}
-		var byTwin map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &byTwin); err != nil {
-			return s.fail("parse", file, fmt.Errorf("not a JSON object keyed by twin name: %w", err))
+		names, byTwin, err := parseDataFile(raw)
+		if err != nil {
+			return s.fail("parse", file, err)
 		}
-		names := make([]string, 0, len(byTwin))
-		for n := range byTwin {
-			names = append(names, n)
-		}
-		sort.Strings(names)
 		var parts []string
 		for _, name := range names {
 			svc := findService(sb.Services, name)
@@ -664,11 +678,7 @@ func addDataFiles(ctx context.Context, s *session, sb *api.Sandbox, files []stri
 				s.ui.Fail("%s: twin '%s' has no control URL to add data through", file, name)
 				return printed(1)
 			}
-			var data map[string]any
-			if err := json.Unmarshal(byTwin[name], &data); err != nil {
-				s.ui.Fail("%s: '%s' must be an object of tables to rows", file, name)
-				return printed(1)
-			}
+			data := byTwin[name]
 			tw := s.twin(svc.ControlURL)
 			if sqlRef, ok := data["sql"].(string); ok {
 				sql, err := os.ReadFile(projectPath(dir, sqlRef))
@@ -693,6 +703,29 @@ func addDataFiles(ctx context.Context, s *session, sb *api.Sandbox, files []stri
 		s.ui.Success("Added %s: %s", file, strings.Join(parts, " · "))
 	}
 	return nil
+}
+
+// parseDataFile reads a data file's bytes: a JSON object keyed by twin name
+// whose values are objects of tables to rows, or {"sql": PATH} for a
+// postgres twin. The names come back sorted so two runs seed in the same
+// order. It is shared by up (the environment config's files) and by
+// `sandbox data add` (files named on the command line).
+func parseDataFile(raw []byte) (names []string, byTwin map[string]map[string]any, err error) {
+	var blocks map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, nil, fmt.Errorf("not a JSON object keyed by twin name: %w", err)
+	}
+	byTwin = make(map[string]map[string]any, len(blocks))
+	for name, block := range blocks {
+		var data map[string]any
+		if err := json.Unmarshal(block, &data); err != nil {
+			return nil, nil, fmt.Errorf("'%s' must be an object of tables to rows", name)
+		}
+		byTwin[name] = data
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, byTwin, nil
 }
 
 // projectPath resolves a config path against the project directory.

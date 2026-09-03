@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/ca"
 	"github.com/veris-ai/veris-cli/internal/cli"
 	"github.com/veris-ai/veris-cli/internal/config"
@@ -82,6 +83,17 @@ func cmdRun(args []string) error {
 			"instead of attaching to an existing --sandbox")
 	ttlMinutes := fs.Int("ttl-minutes", 0,
 		"how long a sandbox created by --environment may live if teardown never runs")
+	fresh := fs.Bool("fresh", false,
+		"deploy a sandbox of the environment on this machine (as veris up does, "+
+			"data files included), run, and delete it afterwards: up, run and "+
+			"down in one process, for CI")
+	keep := fs.Bool("keep", false,
+		"leave a --fresh sandbox running afterwards, as this folder's")
+	freshTTL := fs.Int("ttl", 0,
+		"lifetime in `minutes` of a --fresh sandbox if teardown never runs (config, then 120)")
+	receiptPath := fs.String("receipt", "",
+		"write the run's receipt as JSON to this `file`: both ledgers and the "+
+			"verdict, never on stdout")
 	env := fs.String("env", "",
 		"environment `name` in .veris/twin.yaml whose run.command and proxy "+
 			"settings fill in what this command line leaves out")
@@ -163,7 +175,7 @@ func cmdRun(args []string) error {
 	// key", which the broken profile would otherwise have supplied.
 	s, err := runSession(sources, *env)
 	if err != nil {
-		if *env != "" || !explicitTarget(sources, *environment) {
+		if *env != "" || *fresh || !explicitTarget(sources, *environment) {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "veris: warning: %v; the project file and login are not consulted for this run\n", err)
@@ -175,8 +187,12 @@ func cmdRun(args []string) error {
 		if envName, err = d.fill(s, *env, flagsGiven(fs)); err != nil {
 			return err
 		}
-		if pointer, err = pointerSandbox(s, sources, *environment); err != nil {
-			return err
+		// A fresh run routes at the sandbox it is about to make, never at
+		// the folder's.
+		if !*fresh {
+			if pointer, err = pointerSandbox(s, sources, *environment); err != nil {
+				return err
+			}
 		}
 		sources.Local = pointer
 		sources.APIBase = firstNonEmpty(sources.APIBase, s.res.APIBase)
@@ -196,6 +212,37 @@ func cmdRun(args []string) error {
 		return errors.New("run needs a command: veris run [--sandbox <id>] -- <cmd> [args...]\n" +
 			"or name an image and let its own entrypoint run: veris run --image <image>")
 	}
+	// --fresh deploys the sandbox the run routes at, so nothing else may name
+	// one: the same one-target rule --environment states below, from the
+	// other side. It is checked first because --environment alone is an
+	// image-only flag, and "needs --image" would hide the real conflict.
+	if *fresh {
+		switch {
+		case sources.File != "":
+			return errors.New(
+				"--fresh deploys a sandbox and --config routes at whatever the " +
+					"file names. Pick one")
+		case sources.Sandbox != "":
+			return errors.New(
+				"--fresh deploys a sandbox of its own and --sandbox attaches to " +
+					"one that exists. Pick one")
+		case *environment != "":
+			return errors.New(
+				"--fresh and --environment both deploy a sandbox: --fresh does it " +
+					"here, for either tier, and reads the sandbox's own ledger. " +
+					"Drop --environment")
+		}
+	} else {
+		for _, f := range []struct {
+			flag string
+			set  bool
+		}{{"--keep", *keep}, {"--ttl", *freshTTL > 0}} {
+			if f.set {
+				return fmt.Errorf("%s only applies to a sandbox --fresh deploys", f.flag)
+			}
+		}
+	}
+
 	// Ingress lives in the proxy, and without --image the proxy is this
 	// process -- which does not open one. Refusing beats accepting a callback
 	// assertion that would never be evaluated.
@@ -256,7 +303,6 @@ func cmdRun(args []string) error {
 					"to one that exists. Pick one")
 		}
 	}
-
 	// --image hands the whole arrangement to docker: the proxy runs in its own
 	// container and the command in another sharing its network namespace, so
 	// the image under test needs no capability, no iptables and no change.
@@ -279,8 +325,25 @@ func cmdRun(args []string) error {
 					"the proxy in its own container. Drop it, or drop --image", name)
 			}
 		}
+	}
+
+	// Every refusal is behind us: a fresh sandbox is deployed only for a
+	// command line that will run. From here every return passes through
+	// finishFresh, which deletes it.
+	var fr *freshRun
+	if *fresh {
+		if fr, err = startFresh(context.Background(), s, *env, *freshTTL, *keep, os.Stderr); err != nil {
+			return err
+		}
+		sources.Sandbox, sources.Refresh, sources.Local = fr.sb.ID, true, ""
+		sources.APIBase = firstNonEmpty(sources.APIBase, fr.c.Base)
+		sources.APIKey = firstNonEmpty(sources.APIKey, fr.c.Key)
+	}
+	ledgerAPI := ledgerClient(s, sources)
+
+	if *image != "" {
 		announcePointer(pointer)
-		return runContainerised(dockerRun{
+		return finishFresh(fr, runContainerisedProved(dockerRun{
 			Image:      *image,
 			ProxyImage: *proxyImage,
 			// Precedence has to hold here too: an explicit --config must not
@@ -310,22 +373,65 @@ func cmdRun(args []string) error {
 			Strict:          *strict,
 			LogLevel:        *logLevel,
 			LogFormat:       *logFormat,
-		})
+		}, ledgerAPI, callbackReqs, *fresh, *quiet, *receiptPath))
 	}
 
 	announcePointer(pointer)
-	cfg, source, err := resolveConfig(sources)
+	return finishFresh(fr, runLocal(localRun{
+		sources:      sources,
+		listen:       *listen,
+		caDir:        *caDir,
+		strict:       *strict,
+		logLevel:     *logLevel,
+		logFormat:    *logFormat,
+		java:         javaOptions{store: *javaStore, pass: *javaPass},
+		argv:         argv,
+		reqs:         reqs,
+		callbackReqs: callbackReqs,
+		quiet:        *quiet,
+		receipt:      *receiptPath,
+		client:       ledgerAPI,
+		fresh:        *fresh,
+	}))
+}
+
+// localRun is the host tier's settings once the command line, the project
+// and the login have been merged: what runLocal needs and nothing it does
+// not.
+type localRun struct {
+	sources            configSources
+	listen, caDir      string
+	strict             bool
+	logLevel           string
+	logFormat          string
+	java               javaOptions
+	argv               []string
+	reqs, callbackReqs []requirement
+	quiet              bool
+	// receipt is --receipt PATH, "" for none.
+	receipt string
+	// client reads the sandbox for the ledger; nil when nothing supplied a
+	// key, which the ledger then says.
+	client *api.Client
+	// fresh is a sandbox this run deployed: an empty ledger fails it.
+	fresh bool
+}
+
+// runLocal is the host tier: the proxy in this process, the command as a
+// local child, the engine's receipt and the sandbox's ledger afterwards.
+func runLocal(o localRun) error {
+	cfg, source, err := resolveConfig(o.sources)
 	if err != nil {
 		return err
 	}
-	if *listen != "" {
-		cfg.Listen = *listen
+	if o.listen != "" {
+		cfg.Listen = o.listen
 	}
-	if *strict {
+	if o.strict {
 		cfg.Mode = config.ModeStrict
 	}
-	if *caDir != "" {
-		cfg.CADir = *caDir
+	if o.caDir != "" {
+		cfg.CADir = o.caDir
 	}
 	// Port 0 is how a caller asks for a free port; the real one is read back
 	// from the bound listener below.
@@ -333,7 +439,7 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	log := newLogger(*logLevel, *logFormat)
+	log := newLogger(o.logLevel, o.logFormat)
 	log.Debug("configuration resolved", "from", source)
 	authority, err := ca.Load(expand(cfg.CADir))
 	if err != nil {
@@ -353,12 +459,24 @@ func cmdRun(args []string) error {
 	}
 	announce(log, running, cfg, authority)
 
-	status, runErr := supervise(running, cfg, authority, argv, javaOptions{
-		store: *javaStore,
-		pass:  *javaPass,
-	})
+	// The sandbox side: the watermark once the engine is live and before the
+	// child starts, so nothing the child sends lands below it.
+	bg := context.Background()
+	p := newProof(bg, ledgerSandbox(o.sources), o.client)
+	p.watermark(bg, os.Stderr, o.quiet)
+	started := time.Now()
 
-	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	status, runErr := supervise(running, cfg, authority, o.argv, o.java)
+	finished := time.Now()
+	// The child is gone; what is left is the after-read and, for a --fresh
+	// sandbox, the teardown. A second Ctrl-C in between would take the
+	// default action and leave that sandbox alive until its TTL, so signals
+	// are held from here until the run returns (teardown holds them again).
+	if o.fresh {
+		defer holdSignals()()
+	}
+
+	shutCtx, cancel := context.WithTimeout(bg, shutdownGrace)
 	defer cancel()
 	shutErr := running.Shutdown(shutCtx)
 
@@ -370,7 +488,7 @@ func cmdRun(args []string) error {
 	}
 
 	receipt := running.Receipt()
-	if !*quiet {
+	if !o.quiet {
 		printReceipt(os.Stderr, receipt)
 	}
 
@@ -383,10 +501,12 @@ func cmdRun(args []string) error {
 	// handshake error) -- so today this can fire only via the containerised
 	// path, and is wired here so both tiers share one verdict when that gap
 	// closes.
-	unmet := unmetRequirements(reqs, receipt)
+	unmet := unmetRequirements(o.reqs, receipt)
 	// The host tier cannot patch bundles (no image to scan), so the advice
 	// points at the container tier.
 	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt, trustAdvice{})
+	// Then the sandbox's own account, judged with the same requirements.
+	l, v := p.finish(bg, os.Stderr, &receipt, o.reqs, o.callbackReqs, o.fresh, o.quiet)
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -394,17 +514,75 @@ func cmdRun(args []string) error {
 	}
 
 	// A failing command is the command's own verdict and keeps its exit code: a
-	// harness reading it should see what it always saw.
-	if status != 0 {
-		return exitCode(status)
+	// harness reading it should see what it always saw. Unmet outranks
+	// indeterminate: a requirement the ledger refuted is a finding, whatever
+	// else it could not decide.
+	code := 0
+	switch {
+	case status != 0:
+		code = status
+	case fatal || v.Fatal:
+		code = exitRequirementUnmet
+	case shutErr != nil || v.Indeterminate:
+		code = exitIndeterminate
 	}
-	if fatal {
-		return exitCode(exitRequirementUnmet)
-	}
-	if shutErr != nil {
-		return exitCode(exitIndeterminate)
+	writeReceipt(os.Stderr, o.receipt, p, l, &receipt, v.Assertions, started, finished, code)
+	if code != 0 {
+		return exitCode(code)
 	}
 	return nil
+}
+
+// runContainerisedProved is the container tier with the sandbox's ledger
+// read around it: the watermark before the containers start, the after-read
+// once they are gone. The engine's receipt is printed inside the container
+// run and is not held here numerically, so the two-ledger comparison and
+// the receipt file's engine half are the host tier's alone; the assertions
+// are judged on the ledger all the same.
+func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []requirement,
+	fresh, quiet bool, receiptPath string,
+) error {
+	bg := context.Background()
+	p := newProof(bg, spec.Sandbox, client)
+	p.watermark(bg, os.Stderr, quiet)
+	started := time.Now()
+	err := runContainerised(spec)
+	finished := time.Now()
+	if fresh {
+		// As in runLocal: nothing must interrupt the after-read and the
+		// teardown of a sandbox this run deployed.
+		defer holdSignals()()
+	}
+	var status exitCode
+	if err != nil && !errors.As(err, &status) {
+		// The containers never ran: nothing to read after.
+		return err
+	}
+	l, v := p.finish(bg, os.Stderr, nil, spec.Requirements, callbackReqs, fresh, quiet)
+	code := int(status)
+	switch {
+	case code != 0:
+	case v.Fatal:
+		code = exitRequirementUnmet
+	case v.Indeterminate:
+		code = exitIndeterminate
+	}
+	writeReceipt(os.Stderr, receiptPath, p, l, nil, v.Assertions, started, finished, code)
+	if code != 0 {
+		return exitCode(code)
+	}
+	return nil
+}
+
+// finishFresh tears down the sandbox a --fresh run made, whatever the run
+// returned, and hands the run's own error back: the exit code is the run's,
+// and the teardown lines land after its receipt.
+func finishFresh(fr *freshRun, err error) error {
+	if fr == nil {
+		return err
+	}
+	fr.teardown(context.Background(), os.Stderr, exitFrom(err))
+	return err
 }
 
 type javaOptions struct{ store, pass string }
