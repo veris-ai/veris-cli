@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/cfg"
-	"github.com/veris-ai/veris-proxy/internal/cli"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/proxy"
-	"github.com/veris-ai/veris-proxy/internal/trust"
+	"github.com/veris-ai/veris-cli/internal/cfg"
+	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
 // The child is this test binary re-invoked, which keeps the end-to-end test
@@ -221,8 +221,8 @@ func TestRunNeedsACommand(t *testing.T) {
 	}
 }
 
-// `veris-proxy run --help 2>&1` exited 1 with the usage followed by
-// "veris-proxy: flag: help requested": flag.ContinueOnError reports -h the
+// `veris run --help 2>&1` exited 1 with the usage followed by
+// "veris: flag: help requested": flag.ContinueOnError reports -h the
 // same way it reports a bad flag, and main treated both as a failure. Help that
 // was asked for is the answer -- on stdout, exit 0 -- on every subcommand; a
 // genuine flag error keeps usage on stderr and a non-zero exit.
@@ -392,7 +392,7 @@ func TestTheProxyImageDefaultsToItsOwnRepository(t *testing.T) {
 	}
 	// Its own repository, never the one holding the images our cluster runs:
 	// a grant that makes this image public must not make those public too.
-	if !strings.Contains(defaultProxyImage, "veris-proxy") {
+	if !strings.Contains(defaultProxyImage, "veris-cli") {
 		t.Errorf("default proxy image %q is not the proxy's own repository", defaultProxyImage)
 	}
 	if strings.Contains(defaultProxyImage, "-images-") {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/veris-ai/veris-proxy/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/cli"
 )
 
 // The dispatcher, as a script sees it: the binary re-invoked on an argv, its

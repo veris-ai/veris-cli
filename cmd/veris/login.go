@@ -17,10 +17,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/api"
-	"github.com/veris-ai/veris-proxy/internal/cfg"
-	"github.com/veris-ai/veris-proxy/internal/cli"
-	"github.com/veris-ai/veris-proxy/internal/ui"
+	"github.com/veris-ai/veris-cli/internal/api"
+	"github.com/veris-ai/veris-cli/internal/cfg"
+	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
 // loginCommands is the identity group: login, logout, whoami and profile.

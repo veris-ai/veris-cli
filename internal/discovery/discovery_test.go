@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // A Calendar sandbox always contains google-identity too: Calendar issues no

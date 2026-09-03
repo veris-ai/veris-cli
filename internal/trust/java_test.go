@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/veris-ai/veris-proxy/internal/ca"
+	"github.com/veris-ai/veris-cli/internal/ca"
 )
 
 // These tests shell out to a real keytool, because the point of the feature

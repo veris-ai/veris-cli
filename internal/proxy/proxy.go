@@ -22,9 +22,9 @@ import (
 
 	"github.com/elazarl/goproxy"
 
-	"github.com/veris-ai/veris-proxy/internal/ca"
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/hostport"
+	"github.com/veris-ai/veris-cli/internal/ca"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/hostport"
 )
 
 // Control-plane paths served by the proxy itself, on any host. They are

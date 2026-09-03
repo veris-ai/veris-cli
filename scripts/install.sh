@@ -1,7 +1,7 @@
 #!/bin/sh
 # veris installer.
 #
-#   curl -LsSf https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.sh | sh
+#   curl -LsSf https://raw.githubusercontent.com/veris-ai/veris-cli/main/scripts/install.sh | sh
 #
 # Fetches the release binary for this OS/arch and installs it to
 # $VERIS_INSTALL_DIR (default ~/.local/bin). No root, no package manager:
@@ -20,7 +20,7 @@
 # limit on a shared CI runner.
 set -eu
 
-REPO="veris-ai/veris-proxy"
+REPO="veris-ai/veris-cli"
 INSTALL_DIR="${VERIS_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${VERIS_PROXY_VERSION:-latest}"
 

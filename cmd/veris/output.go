@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/veris-ai/veris-proxy/internal/api"
-	"github.com/veris-ai/veris-proxy/internal/twin"
-	"github.com/veris-ai/veris-proxy/internal/ui"
+	"github.com/veris-ai/veris-cli/internal/api"
+	"github.com/veris-ai/veris-cli/internal/twin"
+	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
 // printedError is an error whose message is already on stderr, in the ✗

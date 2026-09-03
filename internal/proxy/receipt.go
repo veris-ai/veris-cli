@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/veris-ai/veris-proxy/internal/config"
+	"github.com/veris-ai/veris-cli/internal/config"
 )
 
 // receipt records what a run actually sent to the sandbox.

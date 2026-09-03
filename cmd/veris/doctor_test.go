@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/cfg"
-	"github.com/veris-ai/veris-proxy/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/cfg"
+	"github.com/veris-ai/veris-cli/internal/cli"
 )
 
 const doctorKey = "vsk_testkey0000000"

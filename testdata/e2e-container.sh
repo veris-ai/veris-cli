@@ -14,7 +14,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
-IMAGE=veris-proxy-e2e:local
+IMAGE=veris-cli-e2e:local
 NET=veris-e2e-$$
 trap 'docker rm -f sandbox-e2e >/dev/null 2>&1 || true;
       docker network rm "$NET" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT

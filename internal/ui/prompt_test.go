@@ -109,7 +109,7 @@ func TestInput(t *testing.T) {
 		output        string
 	}{
 		{"checkout-svc\n", "", "checkout-svc", nil, "? Project name: "},
-		{"\n", "veris-proxy", "veris-proxy", nil, "? Project name (veris-proxy): "},
+		{"\n", "veris-cli", "veris-cli", nil, "? Project name (veris-cli): "},
 		{"  spaced  \n", "", "spaced", nil, "? Project name: "},
 		{"typed", "def", "typed", nil, "? Project name (def): "},
 		{"", "def", "", ErrInterrupted, "? Project name (def): "},

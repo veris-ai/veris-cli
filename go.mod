@@ -1,4 +1,4 @@
-module github.com/veris-ai/veris-proxy
+module github.com/veris-ai/veris-cli
 
 go 1.25.0
 

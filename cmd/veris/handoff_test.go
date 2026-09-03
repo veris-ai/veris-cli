@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/trust"
+	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
 // The entrypoint's contract with `serve`: an environment file it can source and

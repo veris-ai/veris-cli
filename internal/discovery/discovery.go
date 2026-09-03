@@ -21,8 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // DefaultAPIBase is the control plane this binary talks to unless told

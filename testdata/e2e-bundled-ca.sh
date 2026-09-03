@@ -46,7 +46,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 STUB=bca-stub-$$
 APP=veris-bca-app:local
-RUNNER=veris-proxy-bca:local
+RUNNER=veris-cli-bca:local
 trap 'docker rm -f "$STUB" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 say() { printf '\n==> %s\n' "$*"; }

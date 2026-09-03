@@ -6,10 +6,10 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/veris-ai/veris-proxy/internal/ca"
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/proxy"
-	"github.com/veris-ai/veris-proxy/internal/trust"
+	"github.com/veris-ai/veris-cli/internal/ca"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
 // Startup artifacts a supervisor reads: the environment the command under test

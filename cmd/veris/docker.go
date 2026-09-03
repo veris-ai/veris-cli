@@ -18,9 +18,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/bundlescan"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/bundlescan"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/proxy"
 )
 
 // runContainerised is `run --image`: the whole two-container arrangement,
