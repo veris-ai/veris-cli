@@ -52,7 +52,7 @@ var (
 
 // sandboxCommands is up, status, down and the sandbox group: the everyday
 // verbs act on this folder's sandbox, the group takes an explicit --id.
-func sandboxCommands() []*cli.Command {
+func sandboxBaseCommands() []*cli.Command {
 	var getID, deleteID, resetID, listEnv string
 	var downAll, listAll bool
 	return []*cli.Command{

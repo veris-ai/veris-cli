@@ -157,7 +157,7 @@ func TestAnAmbiguousPrefixNamesItsCandidates(t *testing.T) {
 	if !errors.As(err, &ambiguous) {
 		t.Fatalf("`veris s` returned %v, want *cli.AmbiguousError", err)
 	}
-	if want := "'s' is ambiguous — did you mean: sandbox, serve, status?"; err.Error() != want {
+	if want := "'s' is ambiguous — did you mean: sandbox, serve, snapshot, status?"; err.Error() != want {
 		t.Errorf("message %q, want %q", err.Error(), want)
 	}
 	if stdout.Len() != 0 {

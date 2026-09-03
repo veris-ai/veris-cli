@@ -89,6 +89,7 @@ func root() *cli.Command {
 	r.Sub = append(r.Sub, loginCommands()...)
 	r.Sub = append(r.Sub, envCommand(), initCommand())
 	r.Sub = append(r.Sub, sandboxCommands()...)
+	r.Sub = append(r.Sub, snapshotCommand(), baselineCommand())
 	r.Sub = append(r.Sub, routingCommands()...)
 	r.Sub = append(r.Sub, doctorCommand(), versionCommand())
 	// `veris` alone is a mistake, not a request for help: the usage goes to
