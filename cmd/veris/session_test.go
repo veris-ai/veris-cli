@@ -642,3 +642,20 @@ func TestSessionOutputHelpers(t *testing.T) {
 		}
 	})
 }
+
+func TestSessionFailNamesAShellKey(t *testing.T) {
+	b := newBench(t)
+	b.global(cfg.Global{ActiveProfile: "dev", Profiles: map[string]cfg.Profile{
+		"dev": {APIBase: "https://dev.example", APIKey: "vsk_profilekey000"}}})
+	t.Setenv(cfg.EnvAPIKey, "vsk_shellkey00000")
+	s, stderr := open(t, cli.Globals{}, "", "")
+	err := s.fail("get", "environment", &api.Error{Status: http.StatusUnauthorized, Detail: "invalid or missing API key"})
+	want := "✗ VERIS_API_KEY from your shell was rejected by https://dev.example: [401] invalid or missing API key\n" +
+		"→ Next: unset VERIS_API_KEY to use profile 'dev', or export a key for https://dev.example\n"
+	if stderr.String() != want {
+		t.Errorf("stderr %q, want %q", stderr.String(), want)
+	}
+	if !errors.Is(err, printed(1)) {
+		t.Errorf("err = %#v, want printed(1)", err)
+	}
+}

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,6 +115,17 @@ func (s *session) consoleURL() string {
 // the login to redo. Commands use this one; the free function is for code
 // that has a UI but no session.
 func (s *session) fail(verb, noun string, err error) error {
+	// A 401 on a key the shell exported is not a login problem: the profile
+	// may be fine, the shell is just pointing every command at another
+	// plane's key. Say where the key came from and how to stop that.
+	if status, _ := describe(err); status == http.StatusUnauthorized && s.res.APIKeySource == cfg.SourceEnv {
+		var ae *api.Error
+		if errors.As(err, &ae) {
+			s.ui.Fail("%s from your shell was rejected by %s: %s", cfg.EnvAPIKey, s.res.APIBase, ae.Error())
+			s.ui.Next(fmt.Sprintf("unset %s to use profile '%s', or export a key for %s", cfg.EnvAPIKey, s.res.ProfileName, s.res.APIBase))
+			return printed(1)
+		}
+	}
 	return failAs(s.ui, s.res.ProfileName, verb, noun, err)
 }
 

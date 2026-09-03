@@ -121,6 +121,7 @@ type loginOptions struct {
 	consoleURL string
 	noBrowser  bool
 	keyStdin   bool
+	name       string
 }
 
 func loginCommand() *cli.Command {
@@ -142,6 +143,7 @@ saved. A key given as KEY works too but lands in shell history.`,
 			fs.StringVar(&o.consoleURL, "console-url", "", "console `URL` for → links, when the plane's own answer is wrong")
 			fs.BoolVar(&o.noBrowser, "no-browser", false, "print the URL without opening it")
 			fs.BoolVar(&o.keyStdin, "key-stdin", false, "read an API key from stdin instead of pairing")
+			fs.StringVar(&o.name, "name", "", "how this device appears in the console's key list (default: veris on <machine>)")
 		},
 		Run: func(ctx *cli.Context, args []string) error {
 			return runLogin(ctx, o, args)
@@ -190,7 +192,10 @@ func (s *session) loginDevice(o loginOptions) error {
 	// and a stale one from a previous login has no business on the wire.
 	plane := api.New(base, "")
 	plane.UserAgent = "veris/" + s.ver
-	client := clientName()
+	client := o.name
+	if client == "" {
+		client = clientName()
+	}
 	code, err := plane.DeviceCode(ctx, client)
 	if err != nil {
 		if api.IsStatus(err, 404) {
@@ -517,7 +522,7 @@ func meOrg(me *api.Me) *api.Organization {
 // clientName is what the approver sees asked: the binary and the machine,
 // within the 120 characters the control plane accepts.
 func clientName() string {
-	host, _ := os.Hostname()
+	host := machineName()
 	name := "veris"
 	if host != "" {
 		name += " on " + host
@@ -526,6 +531,26 @@ func clientName() string {
 		name = string(r[:120])
 	}
 	return name
+}
+
+// machineName is the machine as a person would name it: macOS's computer
+// name when it has one (os.Hostname there is often "Mac.localdomain"), else
+// the hostname with its domain stripped.
+func machineName() string {
+	if runtime.GOOS == "darwin" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "scutil", "--get", "ComputerName").Output(); err == nil {
+			if n := strings.TrimSpace(string(out)); n != "" {
+				return n
+			}
+		}
+	}
+	host, _ := os.Hostname()
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		host = host[:i]
+	}
+	return host
 }
 
 // origin is the scheme and host of a URL, for learning the console from the

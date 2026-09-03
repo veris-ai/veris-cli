@@ -630,7 +630,9 @@ func TestEnvList(t *testing.T) {
 		if code != 1 {
 			t.Errorf("exit %d, want 1", code)
 		}
-		wantLines(t, stderr, "✗ Not logged in for profile 'default': [401] invalid or missing API key", "→ Next: veris login --profile default")
+		wantLines(t, stderr,
+			"✗ VERIS_API_KEY from your shell was rejected by "+b.srv.URL+": [401] invalid or missing API key",
+			"→ Next: unset VERIS_API_KEY to use profile 'default', or export a key for "+b.srv.URL)
 	})
 }
 

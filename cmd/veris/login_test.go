@@ -1208,3 +1208,22 @@ func TestLoginOnATerminalOpensTheBrowserAndTicks(t *testing.T) {
 		}
 	})
 }
+
+func TestLoginNameFlagIsTheClientName(t *testing.T) {
+	_, f := loginBench(t)
+	f.tokens = []tokenStep{{tok: minted()}}
+	fastPolls(t)
+	_, stderr, code := veris(t, "login", "--name", "ci runner 7")
+	if code != 0 {
+		t.Fatalf("exit %d\n%s", code, stderr)
+	}
+	if f.seen().clientName != "ci runner 7" {
+		t.Errorf("client_name %q, want the --name value", f.seen().clientName)
+	}
+	if !strings.Contains(stderr, "  Client   ci runner 7\n") {
+		t.Errorf("the pairing block did not show the name:\n%s", stderr)
+	}
+	if got := clientName(); !strings.HasPrefix(got, "veris on ") || strings.Contains(got, ".localdomain") {
+		t.Errorf("default client name %q: want 'veris on <machine>' without a domain suffix", got)
+	}
+}
