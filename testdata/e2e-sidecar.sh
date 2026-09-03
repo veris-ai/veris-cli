@@ -17,7 +17,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
-IMAGE=veris-proxy-sidecar:local
+IMAGE=veris-cli-sidecar:local
 NET=veris-sc-$$
 trap 'docker rm -f veris-sidecar sc-sandbox >/dev/null 2>&1 || true;
       docker network rm "$NET" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT

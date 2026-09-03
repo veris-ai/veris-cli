@@ -27,7 +27,7 @@ say() { printf '\n==> %s\n' "$*"; }
 
 say "build the runner (with cloudflared) and an app that receives callbacks"
 docker build -q -f "$HERE/container/Dockerfile" --target runner \
-  -t veris-proxy-ing:local "$HERE" >/dev/null
+  -t veris-cli-ing:local "$HERE" >/dev/null
 cat > "$WORK/app.py" <<'PY'
 import http.server, json, os, threading, time
 class H(http.server.BaseHTTPRequestHandler):
@@ -65,7 +65,7 @@ before=$(curl -s --max-time 20 -H "X-API-Key: $VERIS_API_KEY" \
 say "run: deploy a sandbox, open the tunnel, run the image inside its namespace"
 set +e
 out=$(HOME="$WORK" "$WORK/veris" run --image veris-ingress-app:local \
-  --proxy-image veris-proxy-ing:local \
+  --proxy-image veris-cli-ing:local \
   --environment "$VERIS_ENVIRONMENT_ID" --expose 3900 --log-level info 2>&1)
 status=$?
 set -e

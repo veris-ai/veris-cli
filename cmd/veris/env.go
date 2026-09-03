@@ -10,10 +10,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/veris-ai/veris-proxy/internal/api"
-	"github.com/veris-ai/veris-proxy/internal/cfg"
-	"github.com/veris-ai/veris-proxy/internal/cli"
-	"github.com/veris-ai/veris-proxy/internal/ui"
+	"github.com/veris-ai/veris-cli/internal/api"
+	"github.com/veris-ai/veris-cli/internal/cfg"
+	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
 // envCommand is the env group: create, list, get, use, delete. On the server

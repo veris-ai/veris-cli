@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // configSources are the ways a command can be told what to route.
@@ -45,7 +45,7 @@ func bindConfigFlags(fs *flag.FlagSet, src *configSources) {
 	fs.StringVar(&src.File, "config", "",
 		"path to a proxy config file")
 	// No backquotes in these strings: Go's flag package reads backquoted text
-	// as the argument NAME, so it rendered "-sandbox veris-proxy use".
+	// as the argument NAME, so it rendered "-sandbox veris use".
 	fs.StringVar(&src.Sandbox, "sandbox", "",
 		"sandbox `id` to route at (also read from $"+discovery.EnvSandboxID+")")
 	fs.BoolVar(&src.Refresh, "refresh", false,

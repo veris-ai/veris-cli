@@ -30,7 +30,7 @@ const DefaultAPIBase = "https://svc.api.veris.ai"
 
 // Environment variables Resolve honours. VERIS_API_BASE, VERIS_API_KEY,
 // VERIS_SANDBOX_ID and VERIS_ENVIRONMENT_ID are the engine's own names, kept
-// so a shell set up for veris-proxy needs no second spelling.
+// so a shell set up for the proxy needs no second spelling.
 const (
 	EnvProfile       = "VERIS_PROFILE"
 	EnvAPIBase       = "VERIS_API_BASE"

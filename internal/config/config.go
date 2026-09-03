@@ -15,7 +15,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/veris-ai/veris-proxy/internal/hostport"
+	"github.com/veris-ai/veris-cli/internal/hostport"
 )
 
 // Mode controls what happens to a host with no matching service.

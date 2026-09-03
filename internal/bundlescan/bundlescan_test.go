@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/trust"
+	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
 // testCA returns a freshly minted self-signed CA in PEM, the shape every real

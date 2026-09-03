@@ -37,7 +37,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/procgroup"
+	"github.com/veris-ai/veris-cli/internal/procgroup"
 )
 
 // DefaultBinary is the cloudflared executable name. The runner image ships it;

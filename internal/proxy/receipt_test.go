@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/veris-ai/veris-proxy/internal/config"
+	"github.com/veris-ai/veris-cli/internal/config"
 )
 
 // The anchoring is load-bearing: five services once hand-wrote a bare

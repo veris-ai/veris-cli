@@ -1,9 +1,12 @@
 # veris installer for Windows.
 #
-#   powershell -c "irm https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.ps1 | iex"
+#   powershell -c "irm https://raw.githubusercontent.com/veris-ai/veris-cli/main/scripts/install.ps1 | iex"
 #
 # Installs the release binary to $env:VERIS_INSTALL_DIR (default
 # %LOCALAPPDATA%\Programs\veris-proxy). No admin rights, no package manager.
+# The directory keeps its pre-rename name on purpose: it is already on the
+# PATH of every machine that ran an earlier installer, and an upgrade has to
+# land on top of that install rather than beside it.
 #
 #   $env:VERIS_PROXY_VERSION = "v0.8.0"   pin a version (default: latest)
 #
@@ -13,7 +16,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$repo = "veris-ai/veris-proxy"
+$repo = "veris-ai/veris-cli"
 $version = if ($env:VERIS_PROXY_VERSION) { $env:VERIS_PROXY_VERSION } else { "latest" }
 $installDir = if ($env:VERIS_INSTALL_DIR) { $env:VERIS_INSTALL_DIR } else {
   Join-Path $env:LOCALAPPDATA "Programs\veris-proxy"

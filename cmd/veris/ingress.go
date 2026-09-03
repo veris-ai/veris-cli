@@ -20,11 +20,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/callback"
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/proxy"
-	"github.com/veris-ai/veris-proxy/internal/tunnel"
+	"github.com/veris-ai/veris-cli/internal/callback"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/tunnel"
 )
 
 // ingressOptions is what `--expose` and its companions asked for.

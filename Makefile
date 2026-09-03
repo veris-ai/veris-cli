@@ -39,7 +39,7 @@ dist:
 # ("Failed to initialize nft: Protocol not supported"), because emulation does
 # not carry the netfilter syscalls, which reads as a broken proxy rather than
 # as a missing architecture.
-IMAGE ?= ghcr.io/veris-ai/veris-proxy
+IMAGE ?= ghcr.io/veris-ai/veris-cli
 
 image:
 	docker buildx build --platform linux/amd64,linux/arm64 \

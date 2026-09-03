@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // Naming a sandbox on one command must not change what any other command uses.

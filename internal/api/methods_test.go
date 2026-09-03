@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // Fixtures shaped like api/tests' answers: a sandbox as test_sandboxes.py

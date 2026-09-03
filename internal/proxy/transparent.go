@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/hostport"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/hostport"
 )
 
 // This file serves connections the kernel redirected to us (iptables REDIRECT)

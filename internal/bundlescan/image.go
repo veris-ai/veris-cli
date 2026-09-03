@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/discovery"
 )
 
 // Docker is the execution seam: everything the scan asks of the docker CLI

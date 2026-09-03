@@ -22,12 +22,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/ca"
-	"github.com/veris-ai/veris-proxy/internal/cli"
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/proxy"
-	"github.com/veris-ai/veris-proxy/internal/ui"
+	"github.com/veris-ai/veris-cli/internal/ca"
+	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".

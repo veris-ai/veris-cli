@@ -16,13 +16,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/ca"
-	"github.com/veris-ai/veris-proxy/internal/cli"
-	"github.com/veris-ai/veris-proxy/internal/config"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/procgroup"
-	"github.com/veris-ai/veris-proxy/internal/proxy"
-	"github.com/veris-ai/veris-proxy/internal/trust"
+	"github.com/veris-ai/veris-cli/internal/ca"
+	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/procgroup"
+	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
 // run is the whole product in one command: start the proxy, hand the child the
@@ -816,7 +816,7 @@ func javaTrustStore(authority *ca.CA) string {
 // are pulled by our cluster, and this one is pulled by whoever is testing, on
 // their laptop or in their CI. Requiring a registry login before the first run
 // is a wall in front of the one command this tool exists for.
-const defaultProxyImage = "ghcr.io/veris-ai/veris-proxy:runner"
+const defaultProxyImage = "ghcr.io/veris-ai/veris-cli:runner"
 
 // sandboxOrEnvironment gives the container exactly one routing target.
 func sandboxOrEnvironment(src configSources, environment string) string {

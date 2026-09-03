@@ -14,9 +14,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/veris-ai/veris-proxy/internal/bundlescan"
-	"github.com/veris-ai/veris-proxy/internal/discovery"
-	"github.com/veris-ai/veris-proxy/internal/trust"
+	"github.com/veris-ai/veris-cli/internal/bundlescan"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
 // bundlesSubdir is where the patched copies live under the share. The share

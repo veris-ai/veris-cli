@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/ca"
-	"github.com/veris-ai/veris-proxy/internal/config"
+	"github.com/veris-ai/veris-cli/internal/ca"
+	"github.com/veris-ai/veris-cli/internal/config"
 )
 
 // Transparent mode is what makes the container tier work, so it is worth

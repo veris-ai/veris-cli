@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/api"
-	"github.com/veris-ai/veris-proxy/internal/cfg"
-	"github.com/veris-ai/veris-proxy/internal/cli"
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/api"
+	"github.com/veris-ai/veris-cli/internal/cfg"
+	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 const (

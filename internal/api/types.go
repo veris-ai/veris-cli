@@ -3,7 +3,7 @@ package api
 import (
 	"encoding/json"
 
-	"github.com/veris-ai/veris-proxy/internal/routes"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // Sandbox statuses, as models.py's SandboxStatus literal spells them.

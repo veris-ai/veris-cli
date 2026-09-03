@@ -1,10 +1,11 @@
-# veris-proxy
+# veris
 
-Routes outbound HTTP(S) from code under test at simulated services in a
-[Veris](https://veris.ai) dependency sandbox. The code under test is never
-modified.
-
-A single static binary with no runtime dependencies, so it drops into any
+One CLI for the [Veris](https://veris.ai) dependency sandbox. It logs in to a
+control plane, defines the environments a project tests against, starts
+sandboxes of them, and routes the code under test at a sandbox from outside
+the process: the code keeps its production hostnames, credentials and client
+libraries, and every run ends with a receipt of what the sandbox received. A
+single static binary with no runtime dependencies, so it drops into any
 container image including Alpine and distroless.
 
 ## Why a proxy rather than a base-URL override
@@ -20,19 +21,22 @@ faithful.
 macOS and Linux:
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/veris-ai/veris-cli/main/scripts/install.sh | sh
 ```
 
 Windows:
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/veris-ai/veris-proxy/main/scripts/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/veris-ai/veris-cli/main/scripts/install.ps1 | iex"
 ```
 
 The installer downloads the released static binary for this OS/arch into
-`~/.local/bin` (`%LOCALAPPDATA%\Programs\veris-proxy` on Windows). No root and
-no package manager, so it works the same on a laptop, a CI runner, and inside
-a container build.
+`~/.local/bin` (`%LOCALAPPDATA%\Programs\veris-proxy` on Windows, kept under
+its old name because it is already on the PATH of every machine that ran an
+earlier installer). No root and no package manager, so it works the same on a
+laptop, a CI runner, and inside a container build. The binary used to be
+called `veris-proxy`; the installer leaves a `veris-proxy` shim beside `veris`
+so scripts that still say so keep working.
 
 | Variable | Effect |
 |---|---|
@@ -40,57 +44,290 @@ a container build.
 | `VERIS_PROXY_VERSION` | Pin a version, e.g. `v0.8.0` (default: latest) |
 
 Binaries for every supported platform are also attached to each
-[release](https://github.com/veris-ai/veris-proxy/releases).
+[release](https://github.com/veris-ai/veris-cli/releases).
 
-## Quick start
+## The first ten minutes
 
-```sh
-export VERIS_API_KEY=...
-veris-proxy run --environment env_abc123 --image your-image -- pytest -q
-```
-
-Or with no command at all, letting the image's own `ENTRYPOINT` and `CMD` run —
-which is what an application image is built to do:
+Five commands, no ids typed:
 
 ```sh
-veris-proxy run --environment env_abc123 --image your-image
+veris login          # pair once: a code on screen, approved in the console
+veris env create     # name the services; writes .veris/twin.yaml
+veris up             # a sandbox of that environment, waited on until routable
+veris run            # the test command through the proxy, with a receipt
+veris down           # delete the sandbox
 ```
 
-One command, no docker of your own, nothing provisioned in advance.
-`--environment` deploys a fresh sandbox of that environment for this run and
-deletes it afterwards; the proxy starts in its own container, your image runs
-in a second one sharing that network namespace, the output streams, the run
-reports what the sandbox received, your command's exit code propagates, and
-everything is torn down.
+`veris login` prints a pairing code and opens the console, where a signed-in
+person approves it for one of their organisations. The key arrives on the next
+poll and is saved to `~/.veris/twin.yaml` (mode 0600) under a profile:
 
-`--sandbox sbx_abc123` instead attaches to a sandbox that already exists —
-the right shape when something seeded state into it first, or when several
-suites share one world. Everything below works the same in either mode.
+```
+$ veris login
+Pairing this machine with Veris
+  Profile  default
+  API      https://svc.api.veris.ai
+  Client   veris on victor-mbp
+
+  Open   https://studio.veris.ai/connect?code=8FZS-YQKQ
+  Code   8FZS-YQKQ
+  (opened in your browser — pass --no-browser to skip)
+
+✓ Approved for Acme
+✓ Logged in as key 'veris on victor-mbp' (key_b8bx3hw6bx929g7eg1hmo, vsk_mi4pa0uo…)
+✓ API key saved to /Users/victor/.veris/twin.yaml (profile 'default', mode 0600)
+→ https://studio.veris.ai/overview
+→ Next: veris env create
+```
+
+`veris env create` is an interview on a TTY (name, a searchable service
+picker, TTL, boot source, data files, test command) and flag-driven off one.
+The name and service list go to the server; everything else goes to
+`.veris/twin.yaml` in this folder, created if there is none. The first
+environment of a project is its default.
+
+```
+$ veris env create checkout-svc --services stripe,postgres --ttl 240 --command 'pytest -q'
+✓ Environment created: 4h8k2m6n0p3r7t1v5x9z2b4d6 (checkout-svc: stripe, postgres)
+✓ Added 'checkout-svc' to .veris/twin.yaml as the default
+✓ Added .veris/twin.local.yaml to .gitignore (per-machine; holds sandbox ids)
+→ https://studio.veris.ai/environments/4h8k2m6n0p3r7t1v5x9z2b4d6
+→ Next: veris up
+```
+
+`veris up` deploys a sandbox of that environment, remembers its id for this
+folder at once, waits until the control plane reports it ready *and* every
+twin answers through the public gateway, then prints the env-var hint each
+service carries:
+
+```
+$ veris up
+Starting 'checkout-svc' (checkout-svc: stripe, postgres) · boot bundle · ttl 240 min
+✓ Sandbox created: 7hqz4m2n9c1v5x8b3k6t0r2p4
+  ✓ postgres  ready  (data plane; handed to the app, not proxied)
+  ✓ stripe    routable  218 ms
+  stripe     STRIPE_API_BASE=https://svc.api.veris.ai/s/7hqz4m2n9c1v5x8b3k6t0r2p4/stripe
+  postgres   DATABASE_URL=postgresql://app:app@34.55.134.28:5432/sb7hqz4m2n…?sslmode=require
+             (data plane; handed to the app, not proxied)
+✓ Up: 7hqz4m2n9c1v5x8b3k6t0r2p4 is this folder's sandbox (expires 16:04)
+→ https://studio.veris.ai/sandboxes/7hqz4m2n9c1v5x8b3k6t0r2p4
+→ Next: veris run
+```
+
+The hints are for reading, not for pasting into the app. `veris run` takes the
+command from the project file, routes it at this folder's sandbox, and reports
+what the sandbox received:
+
+```
+$ veris run
+veris: using sandbox 7hqz4m2n9c1v5x8b3k6t0r2p4 (this folder)
+........                                                                 [100%]
+8 passed in 4.21s
+veris: the sandbox received 7 request(s):
+  stripe                       7
+```
+
+`veris down` deletes the sandbox and clears the pointer. The TTL is the
+backstop if it never runs.
+
+Every command takes `--json` (the machine-readable body on stdout, progress on
+stderr), `-q`, `--yes` for its confirmations, `--profile` and `--api-base`,
+before or after the command word — except `run`, `serve` and `check`, which
+take their own flags after it and refuse a global placed before it by name.
+Any unambiguous prefix of a command works (`veris sand get`, `veris env c`).
+Human output goes to stderr; stdout belongs to your command and to `--json`.
+
+## Profiles and CI
+
+A profile is one login: a control plane, a key, and the organisation the key
+is bound to. `~/.veris/twin.yaml` holds them:
+
+```yaml
+active_profile: default
+profiles:
+  default:
+    api_base: https://svc.api.veris.ai
+    api_key: vsk_mi4pa0uo…             # 0600; printed only as a prefix
+    console_url: https://studio.veris.ai
+  dev:
+    api_base: https://svc.dev.api.veris.ai
+    console_url: https://studio.dev.veris.ai
+    api_key: vsk_9a7b3c1d…
+```
+
+`veris login --profile dev --api-base https://svc.dev.api.veris.ai` pairs
+against a second plane; the device-code response carries the matching console
+URL, so pointing at dev pairs through `studio.dev.veris.ai` without a second
+flag. `profile list`, `profile get`, `profile use NAME` and `profile delete
+NAME` manage them. `whoami` names which credential a command would send and
+where it came from; it is the first thing a broken CI job should run.
+`logout` revokes the key on the plane and removes it locally (`--keep-key`
+skips the revoke, for a key shared with CI).
+
+Which profile a command uses: `--profile` → `VERIS_PROFILE` → the
+environment's own `profile:` line in the project file → `active_profile` →
+`default`.
+
+CI never logs in. `VERIS_API_KEY` (plus `VERIS_API_BASE` for a plane other
+than production) beats the profile on every command, and when it is set the
+profile's key is never read. Where a file is wanted anyway:
+
+```sh
+printf '%s' "$VERIS_API_KEY" | veris login --key-stdin --profile ci
+```
+
+The key is verified against `/v1/me` before it is saved. A key given as a
+positional `KEY` works too, with a warning that it lands in shell history.
+
+## Environments and the project file
+
+On the server an environment is only a named service set. Everything that
+makes a start-up specific — TTL, boot source, data files, callback URL, proxy
+defaults, test command — lives in a named config in `.veris/twin.yaml`, which
+is committed and found by walking up from the current directory, so a
+monorepo can carry one per service folder:
+
+```yaml
+version: 1
+project: checkout-svc
+default: dev                        # used when nothing else names one
+environments:
+  dev:
+    id: k3j2v0d8p1q7x9r2m5n8b4c6a   # the server environment: stripe, postgres
+    ttl_minutes: 240
+    boot: bundle                    # bundle | baseline | snapshot
+    data:                           # rows of your own, added by up after boot
+      - data/dev-customers.json
+    proxy:
+      require_service: [stripe]
+      expose: 3000
+      image: python:3.12
+    run:
+      command: [pytest, -q]
+  ci:
+    id: 9q1w2e3r4t5y6u7i8o9p0a1s2
+    profile: dev                    # this environment lives on the dev plane
+    ttl_minutes: 20
+    boot: bundle
+    proxy:
+      require_service: ["stripe:1"]
+      strict: true
+    run:
+      command: [pytest, -q, tests/integration]
+```
+
+`env create` writes `id`, `ttl_minutes`, `boot`, `snapshot`, `data` and
+`run.command`; the `proxy:` block is yours to add. No secrets and no sandbox
+ids go in this file.
+
+Which environment is in use, most explicit first: `--env NAME|ID` →
+`VERIS_ENV` → `use:` in `.veris/twin.local.yaml` → `default:` in the nearest
+`.veris/twin.yaml` → the profile's `default_environment` →
+`VERIS_ENVIRONMENT_ID` as a bare id. Layers never merge: a local `use:` hides
+the project default entirely. `env use NAME` writes the folder-scoped override
+into the gitignored `twin.local.yaml`, so a teammate's clone keeps the
+committed default; `env use NAME --global` sets the profile-level default for
+folders with no project file. A NAME resolves against the project file first,
+then against the server by id or exact name; an ambiguous name lists the
+candidates.
+
+| Command | Does |
+|---|---|
+| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--default] [--force]` | Define a named environment. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. |
+| `env list` | Two blocks: configured (this project's, `★` default, `●` in use here) and available (every server environment the key can see, which config points at it, live sandboxes). |
+| `env get [NAME\|ID]` | The resolved settings, where each came from, and the server record. |
+| `env use [NAME\|ID] [--global]` | Choose for this folder, or the profile. A picker on a TTY when NAME is omitted. |
+| `env delete NAME\|ID [--server] [--cascade]` | Drop the config. `--server` deletes the server environment too, refused while it has live sandboxes unless `--cascade` deletes them first. |
+
+`veris init` is `env create --default` for a folder with no project file yet.
+
+## Sandboxes
+
+A sandbox is one disposable deployment of an environment, alive until its TTL.
+`up`, `status` and `down` act on this folder's sandbox; `sandbox …` is the same
+set of verbs for a sandbox named by `--id`.
+
+`up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot
+ID|NAME] [--callback-url URL] [--timeout 300s]` takes each setting from the
+flag, then the environment config, then the defaults (ttl 120, boot bundle).
+It writes the sandbox id to `.veris/twin.local.yaml` (0600, gitignored) as soon
+as the control plane answers, then waits in two stages: until the sandbox is
+`ready`, and then until every twin's `/veris/health` answers through the
+public gateway, because the API measures ready from its own node and the
+gateway can lag it by seconds. Only then is the sandbox routable and the
+environment's `data:` files added. A sandbox that fails to boot is exit 1 with
+the reason; one still on its way at the deadline is exit 4 and kept, since it
+may yet come up, and `veris status` says. A folder already pointing at a
+sandbox is warned that the old one keeps running until its TTL.
+
+`status` (and `sandbox get --id ID`) prints the sandbox's state, boot source
+and expiry, then every twin with its status, env hint, URL and table counts.
+`sandbox list [--env NAME | --all]` lists the in-use environment's sandboxes,
+or every environment's; an environment that cannot be listed is a `!` line,
+never silence. `sandbox reset` restores every twin to its boot seed and sets
+the clock live; it is refused (409) for a sandbox booted from a snapshot or a
+promoted baseline, because that world is an image, and the CLI prints the
+allowed move: `veris down && veris up`.
+
+`down [--all]` deletes this folder's sandbox, or every sandbox of the in-use
+environment after one confirmation. `sandbox delete --id ID` deletes any other.
+
+Which sandbox a command means: `--sandbox` (`run`, `serve`) or `--id`
+(`sandbox …`) → `VERIS_SANDBOX_ID` → the folder's pointer. The pointer records which environment its sandbox came from, and a
+`run --env ci` at dev's sandbox is refused rather than take ci's command and
+proxy settings to a world of dev's services.
+
+## run
+
+```sh
+veris run [--sandbox <id>] [--env NAME] [--image <image>] [--cap-add <CAP>] [--require-service <n>] -- <cmd>
+```
+
+`run` resolves the project, the login and the folder for what the command line
+left out, so the daily form is a bare `veris run`. The environment config
+answers for the command after `--` (`run.command`), the requirements
+(`proxy.require_service`, `proxy.require_callback`), what to expose
+(`proxy.expose`), which image (`proxy.image`) and strict mode
+(`proxy.strict`). Absence is what lets the file answer, not emptiness, so
+`--expose 0` still wins over the file. `--env NAME` picks a config other than
+the one in use; a name the project file does not know is refused. A refusal
+that stems from a file setting names it (`proxy.expose in .veris/twin.yaml`)
+rather than a flag you never typed.
+
+Three ways to name where traffic goes. `--environment <id>` deploys a fresh
+sandbox of that environment for this run and deletes it afterwards
+(`--ttl-minutes` bounds its life if teardown never runs). `--sandbox <id>`
+attaches to one that exists. With neither, and no `VERIS_SANDBOX_ID` or
+`--config`, the run routes at this folder's pointer and says so on stderr.
+
+### In a container (the default to reach for)
+
+```sh
+veris run --image your-image -v "$PWD:/work" -w /work -- pytest -q
+```
+
+Or with no command at all, letting the image's own `ENTRYPOINT` and `CMD` run,
+which is what an application image is built to do. The proxy starts in its
+own container, your image runs in a second one sharing that network
+namespace, the output streams, your command's exit code propagates, and
+everything is torn down. `-v`, `-e` and `-w` pass through to your container.
 
 **Your image needs nothing** — no capability, no `iptables`, no entrypoint
-change, no particular base. Distroless and scratch work. Every requirement sits
-on the proxy container, which we build.
+change, no particular base. Distroless and scratch work. Every requirement
+sits on the proxy container, which we build.
 
 ```
-veris-proxy: interception live in veris-proxy-35681
-veris-proxy: sandbox ready sandbox_id=sbx_9f2c1e
+veris: using sandbox 7hqz4m2n9c1v5x8b3k6t0r2p4 (this folder)
+veris: interception live in veris-proxy-35681
+veris: sandbox ready sandbox_id=7hqz4m2n9c1v5x8b3k6t0r2p4
    7 customers, first: gus.thornton@example.com
-veris-proxy: the sandbox received 1 request(s):
+veris: the sandbox received 1 request(s):
   stripe                       1
 ```
 
-The `sandbox ready` line names the sandbox this run is routed at — the one
-`--environment` just deployed, or the `--sandbox` you passed — so something
+The `sandbox ready` line names the sandbox this run is routed at, so something
 seeding state mid-run, or you diagnosing one, can address it. Your container
 sees the same id as `VERIS_SANDBOX_ID`.
-
-An `--environment` run that sent the sandbox nothing exits 3 on its own —
-deploying a sandbox for a suite that never called it is a failure, not a
-pass. `--require-service stripe[:count]` sharpens that into per-service
-assertions and takes over the verdict entirely. Attaching with `--sandbox`
-asserts nothing by default: the receipt is still printed, so a run that sent
-nothing says so, but the exit code stays your command's. `-v`, `-e` and
-`-w` pass through to your container.
 
 Your container runs with **every Linux capability dropped**. That is the
 hardened default and it stays; what it costs is any entrypoint that switches
@@ -102,22 +339,47 @@ exactly the named capabilities and nothing else (`CHOWN`, `DAC_OVERRIDE`,
 Or skip the switch: build the image to run as the target `USER` and it needs
 nothing. The proxy container's own capabilities are unaffected either way.
 
-See [`container/README.md`](container/README.md) for the two docker commands
-this is doing for you, for running the proxy against an image you cannot
-restart, and for adding it to an image you already have.
+`--keep-proxy` leaves the proxy container running afterwards, to inspect it;
+`--proxy-image` swaps the runner image (default
+`ghcr.io/veris-ai/veris-cli:runner`). See
+[`container/README.md`](container/README.md) for the two docker commands this
+is doing for you, for running the proxy against an image you cannot restart,
+and for adding it to an image you already have.
 
-## Environment
+### Without a container
 
-| Variable | Purpose | Default |
-|---|---|---|
-| `VERIS_API_KEY` | Reads the sandbox from the control plane. Never written to disk. | — |
-| `VERIS_SANDBOX_ID` | Sandbox to route at, when no flag or config names one. | — |
-| `VERIS_PROXY_CONFIG` | Path to a config file. | — |
+`veris run` without `--image` runs your command as a local child process with
+proxy and CA environment variables set, which is a *request* rather than an
+enforcement — a library that ignores those variables reaches the real vendor.
+It does not cover Java, static Go binaries, Apache HttpClient or aiohttp; the
+container path does. The flags that belong to the proxy container —
+`--expose`, `--require-callback`, `--environment`, `--ttl-minutes`,
+`--cap-add`, `--patch-bundled-cas` — are refused here with the reason, and
+`--listen`, `--ca-dir` and `--java-truststore`, which describe a proxy in this
+process, are refused with `--image`.
 
-`--api-key`, `--sandbox` and `--config` override the matching variable.
+### The receipt and the exit code
 
-The control plane is `https://svc.api.veris.ai`. There is nothing to point
-it at and nothing to configure.
+`run` records every request the sandbox received, keyed by host, service and
+matched path prefix, and prints the summary when the command finishes
+(`--quiet` skips it). Sandbox control-plane requests — seeding, manuals, wire
+traces — are counted apart on their own line and never satisfy a requirement:
+they are usually the *harness* talking to the sandbox, not the code under
+test.
+
+An `--environment` run that sent the sandbox nothing exits 3 on its own —
+deploying a sandbox for a suite that never called it is a failure, not a
+pass. `--require-service stripe[:count]` and `--require-host host[:count]`
+sharpen that into per-service assertions and take over the verdict entirely.
+Attaching, with `--sandbox` or the folder's pointer, asserts nothing by
+default: the receipt is still printed, so a run that sent nothing says so, but
+the exit code stays your command's — which is why `proxy.require_service` in
+the project file is worth setting.
+
+`run` exits with the command's own status, or 3 if a requirement went unmet,
+or 4 if the outcome is indeterminate. `--strict` blocks unmapped hosts (see
+below). `--route service=host[/prefix]` replaces one service's derived routes
+for this run.
 
 ### Receiving webhooks
 
@@ -126,12 +388,8 @@ hosted sandbox cannot reach an app on your laptop. `--expose` opens a tunnel
 for that direction and registers it with the sandbox:
 
 ```sh
-veris-proxy serve --sandbox sbx_abc123 --expose 3000
+veris run --image your-image --expose 3000 --require-callback /hooks/stripe
 ```
-
-Ingress belongs to the session rather than to one command, so `serve` owns it.
-`run --image` takes the same flags and forwards them to the proxy container,
-where cloudflared reaches your image over the shared namespace's loopback.
 
 The port is the one your app listens on. Your image starts only after the proxy
 reports ready, so the registration probe necessarily runs before anything is
@@ -141,47 +399,34 @@ registers that with the vendor itself — through the vendor's own API, because
 that registration call is the code path that ships.
 
 ```
-veris-proxy: callbacks arrive at https://odd-forest-1a2b.trycloudflare.com
-veris-proxy: callbacks registered  via=stripe
+veris: callbacks arrive at https://odd-forest-1a2b.trycloudflare.com
+veris: callbacks registered  via=stripe
 ...
-veris-proxy: your app received 2 callback(s):
+veris: your app received 2 callback(s):
   POST   /hooks/stripe                2 -> 200
 ```
 
-`--require-callback /hooks/stripe` exits 3 if nothing arrived. Without it a
-webhook suite that received nothing still passes, which is the same failure the
-egress receipt exists to catch.
+`--require-callback /hooks/stripe[:count]` exits 3 if nothing arrived (`*`
+for any path). Without it a webhook suite that received nothing still passes,
+which is the same failure the egress receipt exists to catch.
 
 A quick tunnel needs no Cloudflare account and mints a new hostname each run.
-`--expose-token` (plus `--expose-hostname`) uses a named tunnel instead, for a
-stable URL. If your app runs on the HOST while the proxy is in a container, add
-`--expose-host host.docker.internal` — loopback there is the container's own.
+`--expose-token` (or `VERIS_TUNNEL_TOKEN`, plus `--expose-hostname`) uses a
+named tunnel instead, for a stable URL. If your app runs on the HOST while the
+proxy is in a container, add `--expose-host host.docker.internal` — loopback
+there is the container's own.
 
-### A sandbox of your own
-
-`--environment` works for a long-lived `serve` session the same way it does
-for `run`:
-
-```sh
-veris-proxy serve --environment env_abc123 --expose 3000
-```
-
-When you are receiving callbacks it is not just simpler but safer, for a
-reason worth stating plainly: `client.default_base_url` is a sandbox-wide
-singleton. Two concurrent runs sharing one sandbox overwrite each other's
-callback URL, and the first run's webhooks are then delivered to the second
-run's app — silently, with neither able to notice. A sandbox per run removes
-that entirely.
-
-It also removes the registration window. The tunnel needs only a local port, so
-it opens first and its URL is handed over at creation; the sandbox is never
-alive without knowing where to deliver. `--ttl-minutes` bounds the sandbox's
-life if teardown never runs, so a crashed run cannot leak one.
-
-Attaching with `--sandbox` still works, and still registers by PATCH. It warns
-when it replaces someone else's URL.
-
-The URL is a capability, in either mode: anyone holding it can POST to your app.
+When you are receiving callbacks, a sandbox per run is not just simpler but
+safer, for a reason worth stating plainly: the callback destination is a
+sandbox-wide singleton. Two concurrent runs sharing one sandbox overwrite each
+other's callback URL, and the first run's webhooks are then delivered to the
+second run's app — silently, with neither able to notice. `--environment`
+removes that entirely, and removes the registration window too: the tunnel
+needs only a local port, so it opens first and its URL is handed over at
+creation; the sandbox is never alive without knowing where to deliver.
+Attaching to an existing sandbox still registers, by PATCH, and warns when it
+replaces someone else's URL. The URL is a capability, in either mode: anyone
+holding it can POST to your app.
 
 ### Non-HTTP services: handed over, not proxied
 
@@ -200,52 +445,113 @@ handed to the command as $DATABASE_URL" — so an unproxied database reads as
 the deliberate handoff it is. An explicit `-e DATABASE_URL=...` of your own
 still wins, exactly as `docker run` precedence has it.
 
-### Without a container
-
-`veris-proxy run` without `--image` is the fallback for work that is not
-containerised. It runs your command as a local child process with proxy and CA
-environment variables set, which is a *request* rather than an enforcement — a
-library that ignores those variables reaches the real vendor. It does not cover
-Java, static Go binaries, Apache HttpClient or aiohttp; the container path does.
-
-```sh
-veris-proxy run --sandbox sbx_abc123 -- pytest -q
-```
-
-## Commands
+## serve and check
 
 | Command | Purpose |
 |---|---|
-| `serve` | Run the proxy. This is what the container image runs. |
-| `run` | Fallback: run a LOCAL command with proxy env vars, and report what it sent. |
+| `serve` | Run the proxy. This is what the container image runs, and what a long-lived local session runs. |
 | `check` | Assert a live proxy belongs to THIS run. Exit 2 if not. |
 
+```sh
+veris serve --sandbox 7hqz4m2n9c1v5x8b3k6t0r2p4 --expose 3000
+veris serve --environment k3j2v0d8p1q7x9r2m5n8b4c6a --expose 3000
+```
+
+Ingress belongs to the session rather than to one command, so `serve` owns
+it; `run --image` takes the same `--expose*` and `--require-callback` flags
+and forwards them to the proxy container. `serve --environment` deploys a
+sandbox for the session the way `run --environment` does for a run, with
+`--ttl-minutes` (default 60) as the leak bound.
+
 `serve --write-env FILE` and `serve --ready-file FILE` are how a supervisor
-picks the proxy up: the environment as sourceable POSIX exports, and an
-edge-triggered marker written last, so its existence means every listener is
-bound and the environment is complete. `--write-env` records the **bound**
-address, so `--listen :0` works.
+picks the proxy up: the environment as sourceable POSIX exports
+(`--env-format docker` for `docker run --env-file`), and an edge-triggered
+marker written last, so its existence means every listener is bound and the
+environment is complete. `--write-env` records the **bound** address, so
+`--listen :0` works. `--env-trust-only` emits only the CA variables, for a
+tier where the kernel already does the routing. `serve --print-routes` shows
+what a sandbox id resolves to without starting anything.
 
-`run` exits with the command's own status, or 3 if a `--require-service` /
-`--require-host` assertion went unmet, or 4 if the outcome is indeterminate.
+`check [--expect-canary <token>] [--any-run] [--proxy <url>] [--timeout 5s]`
+asserts on a per-run canary token *before* your tests run, reading
+`VERIS_PROXY_URL` and `VERIS_CANARY` from the environment `serve` wrote. It
+fails if the proxy is unreachable, if it is not a Veris proxy, or if it belongs
+to a different run — a proxy left running from an earlier run, pointing at a
+different sandbox, would otherwise let tests pass against the wrong simulated
+data. A canary always exists: the proxy mints one per process when the config
+names none, so the assertion never quietly weakens into a liveness probe.
+`--any-run` accepts any live Veris proxy.
 
-`run`, `serve` and `env` all take the same routing flags, most explicit first:
-`--config <file>` · `--sandbox <id>` · `$VERIS_PROXY_CONFIG` ·
-`$VERIS_SANDBOX_ID`. The layers never merge. `serve --print-routes` shows what
-a sandbox id resolves to without starting anything.
+The receipt answers the question the canary cannot: interception was live, but
+did this run actually *use* it? A suite that quietly stopped calling its
+dependency passes the canary check and produces an empty receipt. Without
+both, "interception silently did not happen" and "everything worked" look
+identical.
+
+## doctor
+
+`veris doctor [--env NAME]` is the one screen that answers "why is my first
+run failing". Every check is one line — `✓` passed, `!` worth knowing, `✗`
+will fail a run — ordered the way a run depends on them: the binary, the
+login, the plane, the gateway, docker, the project file, the environment, the
+sandbox. Nothing is changed; the `→` lines name the command that would.
+
+```
+$ veris doctor
+✓ veris v0.9.0 (darwin/arm64)
+✓ Logged in: Acme via profile 'default' (vsk_mi4pa0uo…)
+✓ Control plane https://svc.api.veris.ai reachable (status ok)
+! docker not on PATH — host tier works; --image (container tier) will not
+✓ Project file /Users/victor/src/checkout-svc/.veris/twin.yaml (2 environments, default 'dev')
+✓ Environment dev (k3j2v0d8…) reachable; services: stripe, postgres
+```
+
+It exits 1 when any check failed, and `--json` puts the same checks on stdout.
+`veris version` prints the binary's version and, when a plane is resolved and
+answers within 3 s, the plane's on a second line.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | usage or configuration error, API refusal, a sandbox that failed to boot, a login denied or expired, a declined confirmation |
+| 2 | `check` failed: no proxy, not ours, or a different run |
+| 3 | the run did not call a service it was required to call (`--require-service`, `--require-host`, `--require-callback`, or an empty receipt on an `--environment` run) |
+| 4 | the run's outcome is indeterminate; `up` timed out with the sandbox kept |
+| n | otherwise, whatever the command under `run` exited with |
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `VERIS_API_KEY` | Beats the profile on every command; the profile's key is then never read. Never written to disk. |
+| `VERIS_API_BASE` | The control plane, when not `https://svc.api.veris.ai`. |
+| `VERIS_PROFILE` | Which login to use, below `--profile`. |
+| `VERIS_ENV` | Environment name or id, below `--env`. |
+| `VERIS_ENVIRONMENT_ID` | A bare environment id, honoured last in the environment chain; `serve --environment` defaults to it. |
+| `VERIS_SANDBOX_ID` | Sandbox to route at, when no flag names one and above the folder's pointer. |
+| `VERIS_PROXY_CONFIG` | Path to a proxy config file. |
+| `VERIS_TUNNEL_TOKEN` | cloudflared named-tunnel token, for `--expose` with a stable hostname. |
+| `VERIS_PROXY_URL`, `VERIS_CANARY` | Written by `serve --write-env`; read by `check`. |
+| `VERIS_PUBLIC_URL` | Handed to your app under `--expose`: the URL callbacks arrive at. |
+
+`--api-key`, `--api-base`, `--sandbox` and `--config` override the matching
+variable. Precedence for every value is the most explicit source that says
+anything: flag → environment variable → `.veris/twin.local.yaml` →
+`.veris/twin.yaml` → profile → built-in default.
 
 ## Config
 
 Naming a sandbox is usually all you need — the routes come from the control
 plane. A config file is for pinning them yourself. JSON rather than YAML keeps
-the binary dependency-free and the wire format unambiguous. See
-[`examples/proxy.json`](examples/proxy.json).
+the wire format unambiguous. See [`examples/proxy.json`](examples/proxy.json).
 
 ```json
 {
   "version": 1,
   "listen": "127.0.0.1:8080",
-  "sandbox_id": "sbx_abc123",
+  "sandbox_id": "7hqz4m2n9c1v5x8b3k6t0r2p4",
   "mode": "strict",
   "upstream": { "base_url": "https://sandbox.veris.ai" },
   "services": [
@@ -257,6 +563,10 @@ the binary dependency-free and the wire format unambiguous. See
   ]
 }
 ```
+
+`run` and `serve` take the same routing flags, most explicit first:
+`--config <file>` · `--sandbox <id>` · `$VERIS_PROXY_CONFIG` ·
+`$VERIS_SANDBOX_ID`. The layers never merge.
 
 Host matching is exact or a single leading `*.` wildcard. Exact always beats
 wildcard, so `api.stripe.com` can route differently from `*.stripe.com`.
@@ -284,9 +594,10 @@ An unresolved service upstream is derived as
 
 ### Where the hostnames come from
 
-You do not have to write the `hosts` and `paths` above. They are **generated**
-from each service's measured backend — the host the simulation was actually
-driven against — embedded in the binary, and drift-tested against those
+You do not have to write the `hosts` and `paths` above. They come from the
+control plane when it serves routes, else from a table **generated** from each
+service's measured backend — the host the simulation was actually driven
+against — embedded in the binary at release, and drift-tested against those
 backends.
 
 That matters because the facts are not guessable. A hand-written table put
@@ -295,9 +606,6 @@ Google's `/tokeninfo` on `www.googleapis.com`; the measured record puts it on
 introspection would have been routed at a service that does not answer there.
 Google's identity surface alone spans four hostnames, and three Google services
 share a fourth.
-
-`--sandbox` combines that table with the control plane's answer for a given
-sandbox, so the config nobody wrote is still the measured one.
 
 ## Two design decisions worth knowing
 
@@ -308,47 +616,26 @@ package registries, an internal API and anything else the code under test talks
 to behave exactly as they always did, so pointing a project at a sandbox is one
 command rather than a configuration project.
 
-`--strict` (or `"mode": "strict"`) blocks unmapped hosts with a
-`421 Misdirected Request` and an actionable error, for a run that has to prove
-the code under test reached nothing but the sandbox. 421 because a missing route
-is permanent for the life of the run: 5xx sits in the retry set of every HTTP
-client, so a blocked request used to spend the caller's whole retry budget in
-backoff before failing anyway. That guarantee is real, but it is not the only
-way to get it: the receipt below reports what the sandbox actually received, so
-a suite quietly talking to the real vendor is visible without having to forbid
-every host nobody thought to list.
+`--strict` (or `"mode": "strict"`, or `proxy.strict` in the project file)
+blocks unmapped hosts with a `421 Misdirected Request` and an actionable
+error, for a run that has to prove the code under test reached nothing but the
+sandbox. 421 because a missing route is permanent for the life of the run: 5xx
+sits in the retry set of every HTTP client, so a blocked request used to spend
+the caller's whole retry budget in backoff before failing anyway. That
+guarantee is real, but it is not the only way to get it: the receipt reports
+what the sandbox actually received, so a suite quietly talking to the real
+vendor is visible without having to forbid every host nobody thought to list.
 
 ### The receipt makes a silent no-op impossible
 
-Two mechanisms, answering two different questions.
-
-`veris-proxy check` asserts on a per-run canary token *before* your tests run.
-It fails if the proxy is unreachable, if it is not a Veris proxy, or if it
-belongs to a different run — a proxy left running from an earlier run, pointing
-at a different sandbox, would otherwise let tests pass against the wrong
-simulated data. A canary always exists: the proxy mints one per process when
-the config names none, so the assertion never quietly weakens into a liveness
-probe.
-
-The receipt answers the question the canary cannot: interception was live, but
-did this run actually *use* it? `run` records every request the sandbox
-received, keyed by host, service and matched path prefix, and prints the
-summary when the command finishes. `--require-service stripe:2` turns that into
-an exit code. A suite that quietly stopped calling its dependency passes the
-canary check and produces an empty receipt.
-
-Sandbox control-plane requests — seeding, manuals, wire traces — are counted
-apart and never satisfy `--require-service` or the empty-receipt check: they
-are usually the *harness* talking to the sandbox, not the code under test. The
-printed receipt lists them on their own line.
-
-Without both, "interception silently did not happen" and "everything worked"
-look identical.
+Two mechanisms, answering two different questions: `check` proves the proxy in
+front of the suite is this run's, and the receipt proves the suite used it.
+Either alone leaves a way for a green run to have tested nothing.
 
 ## HTTP/2
 
-All three tiers negotiate h2 by ALPN, and fall back to HTTP/1.1 for a client
-that does not offer it. The leg from the proxy to the sandbox asks for h2 too.
+All tiers negotiate h2 by ALPN, and fall back to HTTP/1.1 for a client that
+does not offer it. The leg from the proxy to the sandbox asks for h2 too.
 
 This is not a detail. Google, Stripe and most large vendors serve HTTP/2, so a
 client that negotiates h2 in production and HTTP/1.1 here is exercising a
@@ -365,10 +652,11 @@ nothing in the process under test has to honour anything. Needs
 whether you control the image:
 
 - **Your image joins the proxy's network namespace** (`--network
-  container:veris-proxy`) — the one to reach for. Every requirement lands on
-  our container rather than yours: it is root, it has iptables, it drops
-  itself. Yours needs no capability, no iptables, no entrypoint change and no
-  particular base image, so distroless and scratch work.
+  container:veris-proxy`) — the one to reach for, and what `run --image`
+  does. Every requirement lands on our container rather than yours: it is
+  root, it has iptables, it drops itself. Yours needs no capability, no
+  iptables, no entrypoint change and no particular base image, so distroless
+  and scratch work.
 - **One container, proxy inside.** Simpler to operate, and the trade is that
   those requirements move onto your image, which must also start as root.
   Missing any of them the entrypoint refuses rather than silently degrading.
@@ -376,12 +664,13 @@ whether you control the image:
 `serve --transparent` stands itself up when it starts as root on Linux: it
 installs the redirect, puts the CA in the system trust store, and drops to an
 unprivileged uid before serving. So an image can run the binary directly and
-needs no entrypoint script from us.
+needs no entrypoint script from us. `--redirect-external` says something else
+installed the redirect.
 
-The proxy runs as a dedicated uid (14741) inside that container, because the
-redirect exempts its own upstream calls by uid and one rule cannot tell two
-processes with one uid apart. The entrypoint refuses to start if your command
-would share it.
+The proxy runs as a dedicated uid (14741, `--proxy-uid`) inside that
+container, because the redirect exempts its own upstream calls by uid and one
+rule cannot tell two processes with one uid apart. The entrypoint refuses to
+start if your command would share it.
 
 See [`container/README.md`](container/README.md) for both arrangements, and for
 composing with an entrypoint you already have.
@@ -406,7 +695,7 @@ copying the JDK's own cacerts and adding the Veris CA, never replacing it,
 since a store holding only our CA would break every other TLS connection in the
 JVM — and emits `JAVA_TOOL_OPTIONS` with the `-D` proxy, `nonProxyHosts` and
 truststore flags, which every JVM including Gradle and Maven test forks picks
-up.
+up. `--java-truststore` and `--java-truststore-pass` name one you built.
 
 An app that loads its own keystore from disk never consults the JVM default
 truststore. Add the CA to its keystore yourself:
@@ -471,12 +760,27 @@ certificate hashes after chain validation (OkHttp `CertificatePinner`, curl
 `--pinnedpubkey`, aiohttp `fingerprint=`). No added root can satisfy that;
 it is a boundary, not a configuration problem.
 
+## Coming next
+
+Not in this binary yet; each is reachable meanwhile with `curl` against the
+`/veris/*` URLs that `status` prints:
+
+- `sandbox data add|schema|get` — rows of your own, validated by each twin,
+  and the shape they take. `up` already adds the environment's `data:` files.
+- `sandbox services list|get|manual` — a twin's testing notes and tables.
+- `sandbox trace` — the sandbox's own request ledger, the receipt from the
+  other side.
+- `run --fresh` — `up`, add, `run`, `down` in one process, for CI.
+- `snapshot create|list|get|delete` and `baseline get|promote|set|clear` —
+  capture a sandbox's state and pin what every later `up` boots. `up --boot
+  baseline|snapshot` already boots one that exists.
+
 ## Development
 
 ```sh
 make test    # go test -race
 make lint    # gofmt + go vet
-make build   # a binary for this machine (bin/veris-proxy)
+make build   # a binary for this machine (bin/veris)
 make dist    # static binaries for 5 platforms
 make e2e     # against real curl, Python and Node clients
 ```

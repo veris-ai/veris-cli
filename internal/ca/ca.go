@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/veris-ai/veris-proxy/internal/hostport"
+	"github.com/veris-ai/veris-cli/internal/hostport"
 )
 
 const (
