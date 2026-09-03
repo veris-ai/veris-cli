@@ -22,11 +22,11 @@ say() { printf '\n==> %s\n' "$*"; }
 
 say "build a linux binary and an image that ONLY contains it"
 ( cd "$HERE" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
-    go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
+    go build -o "$WORK/veris" ./cmd/veris )
 cat > "$WORK/Dockerfile" <<'DOCKER'
 FROM alpine:3.22
 RUN apk add --no-cache iptables ca-certificates
-COPY veris-proxy /usr/local/bin/veris-proxy
+COPY veris /usr/local/bin/veris
 # No ENTRYPOINT of ours, no entrypoint script, no su-exec. The binary is it.
 DOCKER
 docker build -q -t veris-noent:local "$WORK" >/dev/null
@@ -49,12 +49,12 @@ cat > "$WORK/config.json" <<'JSON'
 }
 JSON
 
-# The whole thing: the container's command IS `veris-proxy serve`.
+# The whole thing: the container's command IS `veris serve`.
 say "run the binary directly as the container command"
 docker run -d --name noent-proxy --network "$NET" --cap-add=NET_ADMIN \
   -v "$WORK/config.json":/veris/config.json:ro \
   veris-noent:local \
-  veris-proxy serve --config /veris/config.json --ca-dir /veris/ca \
+  veris serve --config /veris/config.json --ca-dir /veris/ca \
     --transparent --log-level info >/dev/null
 
 for _ in $(seq 1 40); do

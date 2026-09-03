@@ -108,9 +108,9 @@ func child(t *testing.T, role string) []string {
 	return []string{os.Args[0], "-test.run=TestMain"}
 }
 
-// cli runs `veris-proxy args...` as a separate process and reports what a
+// cli runs `veris args...` as a separate process and reports what a
 // script would see: the two streams apart, and the exit code.
-func cli(t *testing.T, args ...string) (stdout, stderr string, code int) {
+func invoke(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	argv := child(t, "cli")
 	t.Setenv("VERIS_TEST_CLI_ARGS", strings.Join(args, " "))
@@ -218,7 +218,7 @@ func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
 	for _, argv := range [][]string{
 		{"run", "--help"}, {"run", "-h"}, {"serve", "--help"}, {"check", "-h"},
 	} {
-		stdout, stderr, code := cli(t, argv...)
+		stdout, stderr, code := invoke(t, argv...)
 		if code != 0 {
 			t.Errorf("%v exited %d, want 0 (stderr: %q)", argv, code, stderr)
 		}
@@ -230,7 +230,7 @@ func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
 		}
 	}
 
-	stdout, stderr, code := cli(t, "run", "--no-such-flag")
+	stdout, stderr, code := invoke(t, "run", "--no-such-flag")
 	if code != 1 {
 		t.Errorf("a bad flag exited %d, want 1", code)
 	}
@@ -243,7 +243,7 @@ func TestHelpIsAnAnswerNotAFailure(t *testing.T) {
 		}
 	}
 	// The top-level help was already right and stays so.
-	if stdout, _, code := cli(t, "--help"); code != 0 || !strings.Contains(stdout, "Usage:") {
+	if stdout, _, code := invoke(t, "--help"); code != 0 || !strings.Contains(stdout, "Usage:") {
 		t.Errorf("top-level --help: exit %d, stdout %q", code, stdout)
 	}
 }

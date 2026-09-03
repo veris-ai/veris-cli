@@ -1,6 +1,6 @@
 # Publish the runner image to GHCR.
 #
-# This is the image `veris-proxy run --image` starts beside the code under
+# This is the image `veris run --image` starts beside the code under
 # test, and it is pulled by whoever is testing — a laptop, someone else's CI —
 # never by our cluster. That is the whole reason it lives here and is public:
 # a client should be able to run the proxy without a Google account, without

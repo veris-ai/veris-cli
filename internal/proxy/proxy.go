@@ -244,7 +244,7 @@ func mintCanary() string {
 	if _, err := rand.Read(buf); err != nil {
 		// crypto/rand does not fail in practice, and a proxy that cannot
 		// identify itself is worse than one that will not start.
-		panic("veris-proxy: cannot generate a canary token: " + err.Error())
+		panic("veris: cannot generate a canary token: " + err.Error())
 	}
 	return "cnry_" + hex.EncodeToString(buf)
 }
@@ -309,7 +309,7 @@ func (s *Server) serveDirect(w http.ResponseWriter, req *http.Request) {
 		s.canaryHits.Add(1)
 	case StatusPath:
 	default:
-		http.Error(w, "veris-proxy: configure this address as an HTTP proxy, "+
+		http.Error(w, "veris: configure this address as an HTTP proxy, "+
 			"or request "+StatusPath+" for status", http.StatusBadRequest)
 		return
 	}

@@ -25,8 +25,8 @@ say() { printf '\n==> %s\n' "$*"; }
 jqp() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
 
 say "build the proxy"
-( cd "$(dirname "$0")/.." && go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
-PROXY="$WORK/veris-proxy"
+( cd "$(dirname "$0")/.." && go build -o "$WORK/veris" ./cmd/veris )
+PROXY="$WORK/veris"
 
 say "provision a sandbox"
 env_id=$(curl -fsS "${auth[@]}" "${json[@]}" \
@@ -87,10 +87,10 @@ status=$?
 set -e
 
 code=$(cat "$WORK/code" 2>/dev/null || echo "none")
-echo "    HTTP $code, veris-proxy exit $status"
+echo "    HTTP $code, veris exit $status"
 head -c 400 "$WORK/body.json" 2>/dev/null; echo
 
-[ "$status" = 0 ] || { echo "FAIL: veris-proxy run exited $status"; exit 1; }
+[ "$status" = 0 ] || { echo "FAIL: veris run exited $status"; exit 1; }
 [ "$code" = 200 ] || { echo "FAIL: expected HTTP 200 from the simulated Stripe"; exit 1; }
 grep -q '"object"' "$WORK/body.json" || { echo "FAIL: response is not a Stripe payload"; exit 1; }
 

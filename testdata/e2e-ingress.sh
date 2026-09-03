@@ -53,7 +53,7 @@ DOCKER
 docker build -q -t veris-ingress-app:local "$WORK" >/dev/null
 
 say "build the CLI"
-( cd "$HERE" && go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
+( cd "$HERE" && go build -o "$WORK/veris" ./cmd/veris )
 
 # The id is logged inside the proxy container, so the host cannot read it.
 # Comparing the environment's sandbox list across the run is both simpler and
@@ -64,7 +64,7 @@ before=$(curl -s --max-time 20 -H "X-API-Key: $VERIS_API_KEY" \
 
 say "run: deploy a sandbox, open the tunnel, run the image inside its namespace"
 set +e
-out=$(HOME="$WORK" "$WORK/veris-proxy" run --image veris-ingress-app:local \
+out=$(HOME="$WORK" "$WORK/veris" run --image veris-ingress-app:local \
   --proxy-image veris-proxy-ing:local \
   --environment "$VERIS_ENVIRONMENT_ID" --expose 3900 --log-level info 2>&1)
 status=$?

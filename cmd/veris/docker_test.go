@@ -41,7 +41,7 @@ func TestTheRoutedSandboxIsAnnouncedFromTheStatusEndpoint(t *testing.T) {
 	var out, logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	announceSandbox(&out, log, fetchSandboxID(srv.URL))
-	if got, want := out.String(), "veris-proxy: sandbox ready sandbox_id=sbx_deployed\n"; got != want {
+	if got, want := out.String(), "veris: sandbox ready sandbox_id=sbx_deployed\n"; got != want {
 		t.Fatalf("announced %q, want %q", got, want)
 	}
 	if logs.Len() != 0 {

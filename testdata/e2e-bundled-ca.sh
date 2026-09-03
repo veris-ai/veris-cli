@@ -52,7 +52,7 @@ trap 'docker rm -f "$STUB" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 say() { printf '\n==> %s\n' "$*"; }
 
 say "build the CLI, the runner image, and a workload image with stripe baked in"
-( cd "$HERE" && go build -o "$WORK/veris-proxy" ./cmd/veris-proxy )
+( cd "$HERE" && go build -o "$WORK/veris" ./cmd/veris )
 docker build -q -f "$HERE/container/Dockerfile" --target runner -t "$RUNNER" "$HERE" >/dev/null
 
 # The probe is the shipping code path: the SDK pointed at its production
@@ -163,7 +163,7 @@ JSON
 # HOME under $WORK, so the scan cache and anything else the CLI writes stay in
 # this run. run_with takes flags AND the command; run_case keeps the fixed
 # probe for the cases that share it.
-run_with() { HOME="$WORK" "$WORK/veris-proxy" run --image "$APP" \
+run_with() { HOME="$WORK" "$WORK/veris" run --image "$APP" \
   --proxy-image "$RUNNER" --config "$WORK/config.json" "$@" 2>&1; }
 run_case() { run_with "$@" -- python3 /probe.py; }
 

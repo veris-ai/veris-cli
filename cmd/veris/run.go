@@ -152,8 +152,8 @@ func cmdRun(args []string) error {
 	// command supplied here overrides them, exactly as `docker run` does.
 	argv := fs.Args()
 	if len(argv) == 0 && *image == "" {
-		return errors.New("run needs a command: veris-proxy run [--sandbox <id>] -- <cmd> [args...]\n" +
-			"or name an image and let its own entrypoint run: veris-proxy run --image <image>")
+		return errors.New("run needs a command: veris run [--sandbox <id>] -- <cmd> [args...]\n" +
+			"or name an image and let its own entrypoint run: veris run --image <image>")
 	}
 	// Ingress lives in the proxy, and without --image the proxy is this
 	// process -- which does not open one. Refusing beats accepting a callback
@@ -165,7 +165,7 @@ func cmdRun(args []string) error {
 		// reported first is deterministic.
 		callbackWhy := func(flag string) string {
 			return "the callback path is opened by the proxy container. Use " +
-				"`veris-proxy serve " + flag + " ...` for a local proxy"
+				"`veris serve " + flag + " ...` for a local proxy"
 		}
 		imageOnly := []struct {
 			flag string
@@ -342,7 +342,7 @@ func cmdRun(args []string) error {
 	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt, trustAdvice{})
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
-			"veris-proxy: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
+			"veris: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
 			shutErr)
 	}
 
@@ -432,7 +432,7 @@ func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
 			grace = time.After(childGrace)
 		case <-grace:
 			fmt.Fprintf(os.Stderr,
-				"veris-proxy: %s ignored the signal for %s; killing it\n", argv[0], childGrace)
+				"veris: %s ignored the signal for %s; killing it\n", argv[0], childGrace)
 			procgroup.Terminate(cmd, syscall.SIGKILL)
 			grace = nil
 		case err := <-done:
@@ -673,11 +673,11 @@ func dominantReason(reasons map[string]int64) string {
 // is fatal to the verdict. One place so both tiers report in the same order.
 func reportUnmetAndTrust(w io.Writer, unmet []string, receipt proxy.Receipt, advice trustAdvice) (fatal bool) {
 	for _, u := range unmet {
-		fmt.Fprintf(w, "veris-proxy: %s\n", u)
+		fmt.Fprintf(w, "veris: %s\n", u)
 	}
 	trustMsgs, trustFatal := trustFailureDiagnostics(receipt, advice)
 	for _, m := range trustMsgs {
-		fmt.Fprintf(w, "veris-proxy: %s\n", m)
+		fmt.Fprintf(w, "veris: %s\n", m)
 	}
 	return len(unmet) > 0 || trustFatal
 }
@@ -718,12 +718,12 @@ func printReceipt(w *os.File, r proxy.Receipt) {
 	if r.Total == 0 {
 		if r.ControlTotal > 0 {
 			fmt.Fprintf(w,
-				"veris-proxy: the sandbox received no service traffic from this "+
+				"veris: the sandbox received no service traffic from this "+
 					"run -- only %d /veris/* control-plane request(s).\n",
 				r.ControlTotal)
 			return
 		}
-		fmt.Fprintln(w, "veris-proxy: the sandbox received nothing from this run.")
+		fmt.Fprintln(w, "veris: the sandbox received nothing from this run.")
 		return
 	}
 	services := make([]string, 0, len(r.ByService))
@@ -732,7 +732,7 @@ func printReceipt(w *os.File, r proxy.Receipt) {
 	}
 	sort.Strings(services)
 
-	fmt.Fprintf(w, "veris-proxy: the sandbox received %d request(s):\n", r.Total)
+	fmt.Fprintf(w, "veris: the sandbox received %d request(s):\n", r.Total)
 	for _, name := range services {
 		fmt.Fprintf(w, "  %-28s %d\n", name, r.ByService[name])
 	}

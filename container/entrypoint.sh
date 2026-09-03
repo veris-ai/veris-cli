@@ -131,7 +131,7 @@ if [ -n "${VERIS_EXPOSE:-}" ]; then
 fi
 
 # shellcheck disable=SC2086 # EXPOSE_ARGS is a deliberately word-split flag list
-env HOME="$STATE_DIR" veris-proxy serve $TARGET $EXPOSE_ARGS --proxy-uid "$PROXY_UID" \
+env HOME="$STATE_DIR" veris serve $TARGET $EXPOSE_ARGS --proxy-uid "$PROXY_UID" \
   --ca-dir "$CA_DIR" ${VERIS_STRICT:+--strict} \
   --listen "0.0.0.0:${PROXY_PORT}" \
   --transparent \
@@ -179,7 +179,7 @@ if [ "$NAMESPACE_MODE" = 1 ]; then
   # WHICH run answered, not merely that something did.
   [ -s "$ENV_FILE" ] || die "the proxy wrote no environment file"
   CANARY="$(sed -n 's/^VERIS_CANARY=//p' "$ENV_FILE")"
-  veris-proxy check --proxy "http://127.0.0.1:${PROXY_PORT}" \
+  veris check --proxy "http://127.0.0.1:${PROXY_PORT}" \
     --expect-canary "$CANARY" --quiet \
     || die "the proxy is not intercepting"
 
@@ -235,7 +235,7 @@ export VERIS_PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 # The canary comes from the environment file above, so this asserts the proxy
 # answering is the one this script started -- not one inherited from an image
 # layer or a sidecar pointing at a different sandbox.
-veris-proxy check --proxy "$VERIS_PROXY_URL" --quiet \
+veris check --proxy "$VERIS_PROXY_URL" --quiet \
   || die "interception is not live; refusing to run the command"
 
 log "running: $*"

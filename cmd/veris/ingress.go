@@ -282,10 +282,10 @@ func (in *ingress) Receipt() proxy.InboundReceipt {
 // suite that stopped receiving still passes; only a count says otherwise.
 func printInbound(w io.Writer, r proxy.InboundReceipt) {
 	if r.Total == 0 {
-		fmt.Fprintln(w, "veris-proxy: your app received no callbacks from this run.")
+		fmt.Fprintln(w, "veris: your app received no callbacks from this run.")
 		return
 	}
-	fmt.Fprintf(w, "veris-proxy: your app received %d callback(s):\n", r.Total)
+	fmt.Fprintf(w, "veris: your app received %d callback(s):\n", r.Total)
 	for _, c := range r.Callbacks {
 		fmt.Fprintf(w, "  %-6s %-28s %d -> %d\n", c.Method, c.Path, c.Count, c.Status)
 	}

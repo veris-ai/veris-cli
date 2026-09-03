@@ -39,7 +39,7 @@ func init() {
 	if err := json.Unmarshal(tableJSON, &loaded); err != nil {
 		// The file is embedded at build time and covered by a repository test,
 		// so this is a build defect rather than a runtime condition.
-		panic("veris-proxy: embedded vendor_routes.json is unreadable: " + err.Error())
+		panic("veris: embedded vendor_routes.json is unreadable: " + err.Error())
 	}
 }
 
