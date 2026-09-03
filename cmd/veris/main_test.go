@@ -213,6 +213,7 @@ type scriptCase struct {
 	code       int
 	stdoutHas  []string
 	stderrHas  []string
+	stdoutNot  []string
 	stderrNot  []string
 	stdoutNone bool
 	stderrNone bool
@@ -249,6 +250,11 @@ func runScriptCases(t *testing.T, dir string, cases []scriptCase) {
 			for _, want := range tc.stderrHas {
 				if !strings.Contains(stderr, want) {
 					t.Errorf("%v: stderr lacks %q:\n%s", tc.argv, want, stderr)
+				}
+			}
+			for _, bad := range tc.stdoutNot {
+				if strings.Contains(stdout, bad) {
+					t.Errorf("%v: stdout must not carry %q:\n%s", tc.argv, bad, stdout)
 				}
 			}
 			for _, bad := range tc.stderrNot {
@@ -321,7 +327,7 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			argv: []string{"--help"},
 			code: 0,
 			stdoutHas: []string{
-				"  veris sandbox   get|list|delete|reset|services|data|trace|clock [--id ID]\n",
+				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
 				"  veris snapshot  create|list|get|delete\n",
 				"  veris baseline  get|promote|set|clear|list\n",
 				"  veris run       [--sandbox <id>] [--fresh]",
@@ -444,6 +450,105 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			argv:       []string{"ba", "g"},
 			code:       1,
 			stderrHas:  []string{"✗ No environment selected\n", "→ Next: veris env use NAME, or pass --env\n"},
+			stderrNot:  []string{"panic", "Usage:", "unknown command", "ambiguous"},
+			stdoutNone: true,
+		},
+	})
+}
+
+// The leaves Milestone 3 added or changed -- --watch on up, status and
+// sandbox get; sandbox exports and get --exports; the doctor and version
+// polish; --expose in run's host tier -- as a script sees them: the root
+// help names them, each leaf's help is on stdout with its flags, and a
+// prefix chain reaches the new leaves and fails as they fail on a machine
+// with no login and no project, not as the tree does.
+func TestTheMilestoneThreeLeavesAnswerAsAScriptSeesThem(t *testing.T) {
+	dir := bareMachine(t)
+	runScriptCases(t, dir, []scriptCase{
+		{
+			name: "the root help lists the new leaves and flags",
+			argv: []string{"--help"},
+			code: 0,
+			stdoutHas: []string{
+				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--watch]\n",
+				"  veris status    [--watch] [--json]\n",
+				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
+				"[--expose PORT] [--require-service <n>] [--require-callback <path>]",
+				"  veris doctor    [--env NAME] [--json]\n",
+				"up --watch and status --watch keep a live panel",
+				"every get and list takes --json",
+			},
+			stderrNone: true,
+		},
+		{
+			name:       "up --help carries --watch",
+			argv:       []string{"up", "--help"},
+			code:       0,
+			stdoutHas:  []string{"Usage:\n  veris up [NAME | --env NAME]", "[--watch] [--json]", "  --watch "},
+			stderrNone: true,
+		},
+		{
+			name:       "status --help carries --watch",
+			argv:       []string{"status", "--help"},
+			code:       0,
+			stdoutHas:  []string{"Usage:\n  veris status [--watch] [--json]", "  --watch "},
+			stderrNone: true,
+		},
+		{
+			name:       "sandbox --help lists exports after the milestone 2 verbs",
+			argv:       []string{"sandbox", "--help"},
+			code:       0,
+			stdoutHas:  []string{"Commands:\n  get", "  clock ", "  exports "},
+			stderrNone: true,
+		},
+		{
+			name: "sandbox get --help carries --watch and --exports together",
+			argv: []string{"sandbox", "get", "--help"},
+			code: 0,
+			stdoutHas: []string{"Usage:\n  veris sandbox get [--id ID] [--watch] [--json] [--exports [--format env|dotenv|json]]",
+				"  --exports ", "  --format ", "  --id ", "  --watch "},
+			stderrNone: true,
+		},
+		{
+			name:       "sandbox exports --help is a leaf with its format flag",
+			argv:       []string{"sandbox", "exports", "--help"},
+			code:       0,
+			stdoutHas:  []string{"veris sandbox exports - ", "Usage:\n  veris sandbox exports [--id ID] [--format env|dotenv|json]", "  --format ", "  --id "},
+			stderrNone: true,
+		},
+		{
+			name:       "doctor --help carries --env and the globals",
+			argv:       []string{"doctor", "--help"},
+			code:       0,
+			stdoutHas:  []string{"veris doctor - ", "Usage:\n  veris doctor [--env NAME] [--json]", "  --env ", "  --json "},
+			stderrNone: true,
+		},
+		{
+			name:       "version --help names --json",
+			argv:       []string{"version", "--help"},
+			code:       0,
+			stdoutHas:  []string{"veris version - ", "Usage:\n  veris version [--json]", "  --json "},
+			stderrNone: true,
+		},
+		{
+			name:       "run --help carries the host tier's tunnel flags",
+			argv:       []string{"run", "--help"},
+			code:       0,
+			stdoutHas:  []string{"Usage of run:", "-expose port", "-expose-hostname hostname", "-expose-token token", "-require-callback", "veris serve --expose"},
+			stderrNone: true,
+		},
+		{
+			name:       "help run describes --expose composing serve in the host tier",
+			argv:       []string{"help", "run"},
+			code:       0,
+			stdoutHas:  []string{"Usage:\n  veris run [--sandbox <id>] [--fresh]", "[--expose PORT]", "veris serve\n--expose", "VERIS_PUBLIC_URL", "--environment and --ttl-minutes stay with --image"},
+			stderrNone: true,
+		},
+		{
+			name:       "a prefix chain reaches sandbox exports, which fails as it does",
+			argv:       []string{"sa", "ex"},
+			code:       1,
+			stderrHas:  []string{"✗ "},
 			stderrNot:  []string{"panic", "Usage:", "unknown command", "ambiguous"},
 			stdoutNone: true,
 		},

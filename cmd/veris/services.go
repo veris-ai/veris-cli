@@ -66,10 +66,10 @@ func sandboxServicesCommand() *cli.Command {
 			{
 				Name:    "manual",
 				Summary: "The twin's testing notes (GET /veris/manual)",
-				Usage:   "veris sandbox services manual NAME [--id ID] [--raw]",
+				Usage:   "veris sandbox services manual NAME [--id ID] [--raw | --json]",
 				Help: "The manual is the twin's own markdown: which credential it accepts, what the packaged seed\n" +
 					"holds, how its faults, callbacks and pagination behave. Without --raw it is rendered lightly\n" +
-					"on stderr; --raw prints the markdown itself to stdout.",
+					"on stderr; --raw prints the markdown itself to stdout; --json prints {service, manual}.",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&manualID, "id", "", "sandbox id (default: this folder's)")
 					fs.BoolVar(&raw, "raw", false, "print the markdown itself to stdout")
@@ -358,13 +358,11 @@ func servicesManual(ctx *cli.Context, idFlag, name string, raw bool) error {
 		return err
 	}
 	if svc.ControlURL == "" {
-		s.ui.Warn("%s has no manual (data plane)", svc.Name)
-		return nil
+		return noManual(s, svc.Name)
 	}
 	manual, err := s.twin(svc.ControlURL).Manual(context.Background())
 	if errors.Is(err, twin.ErrNotSupported) {
-		s.ui.Warn("%s has no manual (data plane)", svc.Name)
-		return nil
+		return noManual(s, svc.Name)
 	}
 	if err != nil {
 		return s.fail("read", "manual of "+svc.Name, err)
@@ -384,6 +382,17 @@ func servicesManual(ctx *cli.Context, idFlag, name string, raw bool) error {
 		s.ui.Info("%s", line)
 	}
 	s.ui.Link(fmt.Sprintf("veris sandbox services manual %s --raw   (the markdown itself)", svc.Name))
+	return nil
+}
+
+// noManual is a data-plane twin, which has no testing notes: a warning,
+// and under --json a body whose manual is null, so `--json | jq` still
+// reads a document rather than nothing.
+func noManual(s *session, name string) error {
+	s.ui.Warn("%s has no manual (data plane)", name)
+	if s.ctx.Globals.JSON {
+		return printJSON(s.ctx.Stdout, map[string]any{"service": name, "manual": nil})
+	}
 	return nil
 }
 

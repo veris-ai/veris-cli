@@ -70,7 +70,8 @@ func cmdRun(args []string) error {
 	var callbackReqs []requirement
 	expose := fs.Int("expose", 0,
 		"publish this local `port` at a public https URL so the sandbox can "+
-			"deliver callbacks to it (with --image, the port your image listens on)")
+			"deliver callbacks to it (with --image, the port your image listens "+
+			"on; without, the proxy runs as `veris serve --expose` beside the command)")
 	exposeHost := fs.String("expose-host", "",
 		"`host` the exposed port is on; defaults to loopback, which is right when "+
 			"your image shares the proxy's network namespace")
@@ -243,29 +244,26 @@ func cmdRun(args []string) error {
 		}
 	}
 
-	// Ingress lives in the proxy, and without --image the proxy is this
-	// process -- which does not open one. Refusing beats accepting a callback
-	// assertion that would never be evaluated.
+	// Without --image the proxy is this process, or -- when a callback path
+	// is wanted -- a `veris serve --expose` child beside it (hosttunnel.go).
+	// What stays refused is a sandbox lifecycle: the CLI's up and --fresh own
+	// deploy and delete in the host tier, and handing the proxy --environment
+	// would give the run a second owner of the same sandbox. A slice, not a
+	// map, so the flag reported first is deterministic.
 	if *image == "" {
-		// Most rows share the callback-path reason; --patch-bundled-cas rides
-		// the same table with its own, because its reason is the image's
-		// filesystem, not the callback path. A slice, not a map, so the flag
-		// reported first is deterministic.
-		callbackWhy := func(flag string) string {
-			return "the callback path is opened by the proxy container. Use " +
-				"`veris serve " + flag + " ...` for a local proxy"
+		lifecycleWhy := func(flag string) string {
+			return "the sandbox's lifecycle is the CLI's in the host tier: " +
+				"veris up deploys one for this folder, and run --fresh " +
+				"deploys and deletes one around the command. Use " +
+				"`veris serve " + flag + " ...` for a local proxy that owns its own"
 		}
 		imageOnly := []struct {
 			flag string
 			set  bool
 			why  string
 		}{
-			{d.label("--expose"), *expose > 0, callbackWhy("--expose")},
-			{"--environment", *environment != "", callbackWhy("--environment")},
-			{d.label("--require-callback"), len(callbackReqs) > 0, callbackWhy("--require-callback")},
-			{"--ttl-minutes", *ttlMinutes > 0, callbackWhy("--ttl-minutes")},
-			{"--expose-token", *exposeToken != "", callbackWhy("--expose-token")},
-			{"--expose-hostname", *exposeHostname != "", callbackWhy("--expose-hostname")},
+			{"--environment", *environment != "", lifecycleWhy("--environment")},
+			{"--ttl-minutes", *ttlMinutes > 0, lifecycleWhy("--ttl-minutes")},
 			{"--patch-bundled-cas", *patchBundledCAs,
 				"the reason is the image's filesystem, not the callback path: it " +
 					"patches CA files inside a container image"},
@@ -285,6 +283,16 @@ func cmdRun(args []string) error {
 		return fmt.Errorf(
 			"%s asserts what your app received, and nothing can "+
 				"arrive without --expose <port>. Add it, or drop the requirement", d.label("--require-callback"))
+	}
+	// The tunnel's own rule, checked here so the host tier refuses before a
+	// serve child is started for nothing; the container tier's serve says
+	// the same inside the container. The token is the flag or the shell's
+	// $VERIS_TUNNEL_TOKEN, exactly what serve will be handed below.
+	tunnelToken := firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN"))
+	if tunnelToken != "" && *exposeHostname == "" {
+		return errors.New(
+			"--expose-token names a tunnel that serves a hostname it is configured " +
+				"with and announces nothing, so --expose-hostname is required alongside it")
 	}
 
 	// The container receives one routing target. An inherited VERIS_SANDBOX_ID
@@ -363,7 +371,7 @@ func cmdRun(args []string) error {
 			KeepProxy:       *keepProxy,
 			Expose:          *expose,
 			ExposeHost:      *exposeHost,
-			TunnelToken:     firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
+			TunnelToken:     tunnelToken,
 			TunnelHostname:  *exposeHostname,
 			Environment:     *environment,
 			TTLMinutes:      *ttlMinutes,
@@ -378,20 +386,24 @@ func cmdRun(args []string) error {
 
 	announcePointer(pointer)
 	return finishFresh(fr, runLocal(localRun{
-		sources:      sources,
-		listen:       *listen,
-		caDir:        *caDir,
-		strict:       *strict,
-		logLevel:     *logLevel,
-		logFormat:    *logFormat,
-		java:         javaOptions{store: *javaStore, pass: *javaPass},
-		argv:         argv,
-		reqs:         reqs,
-		callbackReqs: callbackReqs,
-		quiet:        *quiet,
-		receipt:      *receiptPath,
-		client:       ledgerAPI,
-		fresh:        *fresh,
+		sources:        sources,
+		listen:         *listen,
+		caDir:          *caDir,
+		strict:         *strict,
+		logLevel:       *logLevel,
+		logFormat:      *logFormat,
+		java:           javaOptions{store: *javaStore, pass: *javaPass},
+		argv:           argv,
+		reqs:           reqs,
+		callbackReqs:   callbackReqs,
+		quiet:          *quiet,
+		receipt:        *receiptPath,
+		client:         ledgerAPI,
+		fresh:          *fresh,
+		expose:         *expose,
+		exposeHost:     *exposeHost,
+		tunnelToken:    tunnelToken,
+		tunnelHostname: *exposeHostname,
 	}))
 }
 
@@ -415,11 +427,22 @@ type localRun struct {
 	client *api.Client
 	// fresh is a sandbox this run deployed: an empty ledger fails it.
 	fresh bool
+	// expose is the callback direction: the port to publish, 0 for none.
+	// With one, the proxy is a `veris serve --expose` child rather than
+	// this process (hosttunnel.go), and the rest describe its tunnel.
+	expose         int
+	exposeHost     string
+	tunnelToken    string
+	tunnelHostname string
 }
 
 // runLocal is the host tier: the proxy in this process, the command as a
 // local child, the engine's receipt and the sandbox's ledger afterwards.
+// With --expose the proxy is a serve child instead, and the rest is the same.
 func runLocal(o localRun) error {
+	if o.expose > 0 {
+		return runHostExposed(o)
+	}
 	cfg, source, err := resolveConfig(o.sources)
 	if err != nil {
 		return err
@@ -488,25 +511,55 @@ func runLocal(o localRun) error {
 	}
 
 	receipt := running.Receipt()
-	if !o.quiet {
-		printReceipt(os.Stderr, receipt)
-	}
+	return o.conclude(p, status, &receipt, nil, nil, shutErr, started, finished)
+}
 
-	// Everything that went wrong is REPORTED, whatever ends up owning the exit
-	// code. Only one status can be returned, so a shutdown failure that loses
-	// the tie-break would otherwise vanish -- and it is the one that says the
-	// receipt above may be incomplete.
-	// Trust failures are recorded only by transparent listeners, which this
-	// local tier never opens (goproxy's CONNECT loop discards its own MITM
-	// handshake error) -- so today this can fire only via the containerised
-	// path, and is wired here so both tiers share one verdict when that gap
-	// closes.
-	unmet := unmetRequirements(o.reqs, receipt)
-	// The host tier cannot patch bundles (no image to scan), so the advice
-	// points at the container tier.
-	fatal := reportUnmetAndTrust(os.Stderr, unmet, receipt, trustAdvice{})
+// conclude is the host tier's verdict once the command has exited and the
+// proxy is gone: the receipts printed, the requirements judged on the engine
+// and then on the sandbox's ledger, the exit code decided, the receipt file
+// written. Shared by the in-process proxy and the serve child, so both read
+// the same way.
+//
+// engine is nil when the receipt could not be read (readErr says why); the
+// ledger is still judged, since the sandbox's account does not depend on
+// ours. inbound is nil when nothing was exposed. shutErr is a proxy that did
+// not leave cleanly, which is the one thing that says the receipt above may
+// be incomplete.
+func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
+	inbound *proxy.InboundReceipt, readErr, shutErr error, started, finished time.Time,
+) error {
+	bg := context.Background()
+	fatal := false
+	if readErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"veris: could not read the receipt (%v), so what the sandbox "+
+				"received is unknown\n", readErr)
+	} else {
+		if !o.quiet {
+			printReceipt(os.Stderr, *engine)
+		}
+		// Everything that went wrong is REPORTED, whatever ends up owning the
+		// exit code. Only one status can be returned, so a shutdown failure
+		// that loses the tie-break would otherwise vanish -- and it is the one
+		// that says the receipt above may be incomplete.
+		// Trust failures are recorded only by transparent listeners, which
+		// this local tier never opens (goproxy's CONNECT loop discards its own
+		// MITM handshake error) -- so today this can fire only via the
+		// containerised path, and is wired here so both tiers share one
+		// verdict when that gap closes.
+		unmet := unmetRequirements(o.reqs, *engine)
+		if inbound != nil {
+			if !o.quiet {
+				printInbound(os.Stderr, *inbound)
+			}
+			unmet = append(unmet, unmetCallbacks(o.callbackReqs, *inbound)...)
+		}
+		// The host tier cannot patch bundles (no image to scan), so the
+		// advice points at the container tier.
+		fatal = reportUnmetAndTrust(os.Stderr, unmet, *engine, trustAdvice{})
+	}
 	// Then the sandbox's own account, judged with the same requirements.
-	l, v := p.finish(bg, os.Stderr, &receipt, o.reqs, o.callbackReqs, o.fresh, o.quiet)
+	l, v := p.finish(bg, os.Stderr, engine, o.reqs, o.callbackReqs, o.fresh, o.quiet)
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -523,10 +576,10 @@ func runLocal(o localRun) error {
 		code = status
 	case fatal || v.Fatal:
 		code = exitRequirementUnmet
-	case shutErr != nil || v.Indeterminate:
+	case readErr != nil || shutErr != nil || v.Indeterminate:
 		code = exitIndeterminate
 	}
-	writeReceipt(os.Stderr, o.receipt, p, l, &receipt, v.Assertions, started, finished, code)
+	writeReceipt(os.Stderr, o.receipt, p, l, engine, v.Assertions, started, finished, code)
 	if code != 0 {
 		return exitCode(code)
 	}
@@ -617,7 +670,13 @@ func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
 		NodeAcceptsEnvProxy: nodeAcceptsEnvProxy(),
 		PassThrough:         passThrough(cfg),
 	}))
+	return superviseEnv(env, argv)
+}
 
+// superviseEnv runs the child with env as its whole environment and returns
+// its exit status: supervise once the interception environment is known,
+// which the serve child hands over as a file rather than building here.
+func superviseEnv(env []string, argv []string) (int, error) {
 	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // running the user's own command is the point
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr

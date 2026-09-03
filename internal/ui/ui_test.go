@@ -101,8 +101,8 @@ func TestNewOffTerminal(t *testing.T) {
 	var out bytes.Buffer
 	for _, in := range []interface{ Read([]byte) (int, error) }{strings.NewReader(""), nil} {
 		u := New(&out, in)
-		if u.TTY || u.Color {
-			t.Errorf("New(buffer, %T): TTY=%v Color=%v, want both false", in, u.TTY, u.Color)
+		if u.TTY || u.OutTTY || u.Color {
+			t.Errorf("New(buffer, %T): TTY=%v OutTTY=%v Color=%v, want all false", in, u.TTY, u.OutTTY, u.Color)
 		}
 		if u.Out != &out {
 			t.Error("New did not keep Out")

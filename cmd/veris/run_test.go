@@ -47,11 +47,40 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "fail":
 		os.Exit(7)
+	case "fakeserve":
+		// The serve the host tier composes for --expose, faked: it writes
+		// the same files, answers the same endpoint and stops on the same
+		// signal (hosttunnel_test.go).
+		os.Exit(fakeServe())
+	case "killproxy":
+		// A workload that takes the proxy down mid-run and exits only once
+		// it is gone, so the run's after-read finds nothing to read.
+		url := os.Getenv("VERIS_PROXY_URL") + proxy.StatusPath
+		if resp, err := http.Get(url + "?die=1"); err == nil {
+			resp.Body.Close()
+		}
+		for range 400 {
+			resp, err := http.Get(url)
+			if err != nil {
+				os.Exit(0)
+			}
+			resp.Body.Close()
+			time.Sleep(25 * time.Millisecond)
+		}
+		os.Exit(9)
 	case "cli":
 		// The binary as a script sees it: the dispatcher on the argv handed
 		// over in the environment, exiting exactly the way main does. The
 		// test flags in os.Args are why the argv travels separately.
 		os.Exit(exitStatus(run(strings.Fields(os.Getenv("VERIS_TEST_CLI_ARGS")))))
+	case "wait":
+		// Announces itself, then runs until a signal takes it: a suite the
+		// developer interrupts mid-run.
+		if ready := os.Getenv("VERIS_TEST_READY_FILE"); ready != "" {
+			_ = os.WriteFile(ready, []byte("running"), 0o600)
+		}
+		time.Sleep(5 * time.Minute)
+		os.Exit(0)
 	case "stubborn":
 		// Traps SIGTERM and keeps running, which is what a shell script with a
 		// cleanup handler or a JVM with a shutdown hook can look like.
@@ -935,9 +964,9 @@ func TestRunDefaultsRefusalsNameTheFileSetting(t *testing.T) {
 		line []string
 		want string
 	}{
-		{"expose without image", cfg.EnvConfig{Proxy: cfg.ProxyConfig{Expose: 3000}}, nil,
-			"proxy.expose in " + projPath + " needs --image"},
 		{"require_callback without expose", cfg.EnvConfig{Proxy: cfg.ProxyConfig{RequireCallback: []string{"/hooks"}, Image: "app"}}, nil,
+			"proxy.require_callback in " + projPath + " asserts what your app received"},
+		{"require_callback without expose, host tier", cfg.EnvConfig{Proxy: cfg.ProxyConfig{RequireCallback: []string{"/hooks"}}}, nil,
 			"proxy.require_callback in " + projPath + " asserts what your app received"},
 		{"image against --listen", cfg.EnvConfig{Proxy: cfg.ProxyConfig{Image: "app"}}, []string{"--listen", ":0"},
 			"--listen applies to a local proxy, and proxy.image in " + projPath + " puts the proxy in its own container. Drop it, or pass --image '' to run locally"},
@@ -954,7 +983,7 @@ func TestRunDefaultsRefusalsNameTheFileSetting(t *testing.T) {
 	}
 	// A flag typed on the line is still named as the flag.
 	runProject(b, cfg.EnvConfig{}, "")
-	if err := cmdRun([]string{"--config", cfgPath, "--expose", "3000", "--", "true"}); err == nil || !strings.HasPrefix(err.Error(), "--expose needs --image") {
+	if err := cmdRun([]string{"--config", cfgPath, "--ttl-minutes", "5", "--", "true"}); err == nil || !strings.HasPrefix(err.Error(), "--ttl-minutes needs --image") {
 		t.Errorf("err = %v", err)
 	}
 }
