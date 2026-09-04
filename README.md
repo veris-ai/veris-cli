@@ -882,8 +882,45 @@ The e2e script matters because the Go tests exercise the proxy through Go's own
 TLS stack, which is more forgiving than OpenSSL's. CI runs the unit tests, the
 race detector and every cross-build on any PR.
 
-Releasing: tag `vX.Y.Z`; the release workflow attaches the `make dist` binaries,
-which is where the installer downloads from.
+### Releasing
+
+**Nobody picks the number and nobody pushes the tag.** `ci` passing on `main`
+is the trigger; the commit subjects since the last tag decide the bump; the
+release workflow cuts the tag, attaches the `make dist` binaries the installer
+downloads, and publishes the runner image.
+
+Every commit on `main` is a squashed pull request whose title this repo already
+requires to be `type(scope): subject`, so the history is a conventional-commit
+log without anyone maintaining it as one:
+
+| Commits since the last tag | Result |
+|---|---|
+| `feat` | minor |
+| `fix`, `perf` | patch |
+| `!` before the colon, or `BREAKING CHANGE:` in the body | see below |
+| only `docs`, `chore`, `ci`, `test`, `refactor`, `style`, `build` | **no release** |
+
+The last row is deliberate. Those change nothing a user of the binary can
+observe, and a release nobody can tell apart from the last one is noise in the
+changelog and a download that gains its taker nothing.
+
+**Before 1.0**, which is where this is, a breaking change moves the MINOR.
+`0.y.z` is semver's own place for a public API that is not yet stable, and
+going to `1.0.0` is a claim about stability that a script reading commit
+subjects has no business making. Ask for it by hand: run the release workflow
+with `bump: major`, which is also the way to force any bump the commits did
+not earn.
+
+`scripts/next-version.sh` decides it and runs the same on a laptop, so you can
+see what the next merge would cut before you make it:
+
+```sh
+scripts/next-version.sh          # release=… bump=… previous=… version=…
+bash scripts/next-version-test.sh # the rules, held to examples
+```
+
+Pushing a tag by hand still works and still publishes — it is the escape hatch,
+not the path.
 
 ## Licence
 
