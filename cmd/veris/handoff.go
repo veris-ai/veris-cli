@@ -91,10 +91,15 @@ func writeEnvFile(path, format string, material trust.Material, trustOnly bool, 
 // secret, and using anything else would mean telling every client a new one.
 const trustStorePassword = "changeit"
 
-// passThrough lifts the config's non-HTTP handoffs into trust's shape.
+// passThrough lifts the config's handoffs -- every service the proxy cannot
+// route -- into trust's shape.
 func passThrough(cfg *config.Config) []trust.PassThrough {
-	out := make([]trust.PassThrough, 0, len(cfg.PassEnv))
-	for _, p := range cfg.PassEnv {
+	return passThroughVars(cfg.PassEnv)
+}
+
+func passThroughVars(vars []config.PassEnvVar) []trust.PassThrough {
+	out := make([]trust.PassThrough, 0, len(vars))
+	for _, p := range vars {
 		out = append(out, trust.PassThrough{
 			Name: p.Name, Value: p.Value, Service: p.Service,
 		})

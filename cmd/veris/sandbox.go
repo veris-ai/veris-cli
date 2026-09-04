@@ -989,13 +989,15 @@ func envLabel(s *session, envID string) string {
 	return shortID(envID)
 }
 
-// clockOf is an instant as "HH:MM" local, the doc's "expires 12:34"; "—"
-// when the control plane sent none.
+// clockOf is an instant as "HH:MM ZONE" local, the doc's "expires 12:34
+// EDT"; "—" when the control plane sent none. The zone is printed because
+// the local file beside it records the same instant in UTC, and a bare
+// clock reading against an RFC 3339 stamp looks like two different times.
 func clockOf(t api.Time) string {
 	if t.IsZero() {
 		return "—"
 	}
-	return t.Local().Format("15:04")
+	return t.Local().Format("15:04 MST")
 }
 
 // stampOf is the full local instant, for the status panel.

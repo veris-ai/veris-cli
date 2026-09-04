@@ -439,7 +439,7 @@ func TestUpProvisionsWaitsProbesAndSeeds(t *testing.T) {
 		"  postgres   DATABASE_URL=postgresql://app:app@10.0.0.5:5432/sb?sslmode=require\n",
 		"             (data plane; handed to the app, not proxied)\n",
 		"✓ Added data/customers.json: stripe customers 1, payment_methods 1\n",
-		"✓ Up: "+sbID+" is this folder's sandbox (expires "+expires.Local().Format("15:04")+")\n",
+		"✓ Up: "+sbID+" is this folder's sandbox (expires "+expires.Local().Format("15:04 MST")+")\n",
 		"→ https://studio.example/sandboxes/"+sbID+"\n",
 		"→ Next: veris run\n",
 	)
@@ -712,9 +712,10 @@ func TestUpBootSources(t *testing.T) {
 		Project: "proj",
 		Default: "ci",
 		Environments: map[string]cfg.EnvConfig{
-			"dev":   {ID: devID, Boot: "baseline"},
-			"ci":    {ID: ciID},
-			"night": {ID: ciID, Boot: "snapshot", Snapshot: "nightly"},
+			"dev":     {ID: devID, Boot: "baseline"},
+			"ci":      {ID: ciID},
+			"night":   {ID: ciID, Boot: "snapshot", Snapshot: "nightly"},
+			"bundled": {ID: ciID, Boot: "bundle"},
 		},
 	})
 	older := "snapaaaaaaaaaaaaaaaaaaaaa"
@@ -755,6 +756,23 @@ func TestUpBootSources(t *testing.T) {
 		}
 		if code, _, stderr := runSandboxCLI(t, "up", "ci", "--boot", "snapshot", "--snapshot", older); code != 0 || snapshotSent(t) != older {
 			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("--snapshot alone wins over a config boot of bundle or baseline", func(t *testing.T) {
+		// Naming the snapshot is the intent; the file's boot word yields to
+		// it without --boot snapshot being spelled out as well.
+		for _, env := range []string{"bundled", "dev"} {
+			code, _, stderr := runSandboxCLI(t, "up", env, "--snapshot", older)
+			if code != 0 {
+				t.Fatalf("up %s --snapshot: exit %d:\n%s", env, code, stderr)
+			}
+			if !strings.Contains(stderr, "· boot snapshot "+shortID(older)+" ·") || snapshotSent(t) != older {
+				t.Errorf("up %s --snapshot: the snapshot should boot:\n%s", env, stderr)
+			}
+			if strings.Contains(stderr, "--snapshot only applies") {
+				t.Errorf("up %s --snapshot was refused:\n%s", env, stderr)
+			}
 		}
 	})
 
@@ -947,11 +965,16 @@ func TestSandboxListFansOutWhenThereIsNoListAllRoute(t *testing.T) {
 		if code != 0 || stdout != "" {
 			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
 		}
+		// The zone's abbreviation is the machine's, so the column is as
+		// wide as it prints.
+		exp1, exp2 := now.Add(time.Hour).Local().Format("15:04 MST"), now.Add(2*time.Hour).Local().Format("15:04 MST")
+		width := max(len("Expires"), len(exp1), len(exp2))
+		pad := func(s string) string { return s + strings.Repeat(" ", width-len(s)) }
 		sbInOrder(t, stderr,
 			"! could not list sandboxes of checkout-svc ("+shortID(devID)+"): [403] forbidden\n",
-			"  Sandbox    Environment  Status        Expires  Twins\n",
-			"● "+shortID(sbID)+"  ci           ready         "+now.Add(time.Hour).Local().Format("15:04")+"    stripe, postgres\n",
-			"  "+shortID(otherSbID)+"  ci           provisioning  "+now.Add(2*time.Hour).Local().Format("15:04")+"    stripe\n")
+			"  Sandbox    Environment  Status        "+pad("Expires")+"  Twins\n",
+			"● "+shortID(sbID)+"  ci           ready         "+pad(exp1)+"  stripe, postgres\n",
+			"  "+shortID(otherSbID)+"  ci           provisioning  "+pad(exp2)+"  stripe\n")
 	})
 
 	t.Run("the in-use environment, and --env", func(t *testing.T) {
@@ -1006,7 +1029,7 @@ func TestDownDeletesAndForgetsThePointer(t *testing.T) {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
 		sbInOrder(t, stderr,
-			"Delete sandbox "+sbID+" (ci, expires "+expires.Local().Format("15:04")+")? y\n",
+			"Delete sandbox "+sbID+" (ci, expires "+expires.Local().Format("15:04 MST")+")? y\n",
 			"✓ Sandbox deleted: "+sbID+"\n")
 		if got := plane.deletedIDs(); len(got) != 1 || got[0] != ciID+"/"+sbID {
 			t.Errorf("deleted %v, want the scoped DELETE", got)

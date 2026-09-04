@@ -51,7 +51,7 @@ func initCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "init",
 		Summary: "Set this folder up: env create --default",
-		Usage:   "veris init [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--data FILE] [--command 'cmd']",
+		Usage:   "veris init [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict]",
 		Hidden:  true,
 		Flags:   f.bind,
 		Run: func(ctx *cli.Context, args []string) error {
@@ -64,7 +64,11 @@ func initCommand() *cli.Command {
 // --- env create ------------------------------------------------------------
 
 // createFlags are env create's answers as flags. A prompt asks for every one
-// left out on a TTY; off a TTY a missing one is the NoTTYError naming it.
+// left out on a TTY; off a TTY a missing one is the NoTTYError naming it --
+// except the data files, which are simply none when no --data is given, and
+// the proxy settings, which are never asked for: a run works without them,
+// and an interview that asked about ports and images would be a wall in front
+// of the first environment.
 type createFlags struct {
 	services string
 	from     string
@@ -75,6 +79,13 @@ type createFlags struct {
 	command  optString
 	def      bool
 	force    bool
+
+	// The proxy: block, as run's flags spell it.
+	image           string
+	requireService  listFlag
+	requireCallback listFlag
+	expose          int
+	strict          bool
 }
 
 func (f *createFlags) bind(fs *flag.FlagSet) {
@@ -83,10 +94,15 @@ func (f *createFlags) bind(fs *flag.FlagSet) {
 	fs.IntVar(&f.ttl, "ttl", 0, "sandbox TTL in `minutes` (default 240)")
 	fs.StringVar(&f.boot, "boot", "", "the `source` a sandbox boots from: bundle, baseline or snapshot")
 	fs.StringVar(&f.snapshot, "snapshot", "", "the snapshot `id` or name a sandbox boots, with --boot snapshot")
-	fs.Var(&f.data, "data", "data `file` to add after boot (repeatable or comma-separated; '' for none)")
+	fs.Var(&f.data, "data", "data `file` to add after boot (repeatable or comma-separated; none unless given)")
 	fs.Var(&f.command, "command", "the test command run through the proxy, as one shell `string` ('' for none)")
 	fs.BoolVar(&f.def, "default", false, "make it the project's default environment")
 	fs.BoolVar(&f.force, "force", false, "replace an environment of the same name in .veris/twin.yaml")
+	fs.StringVar(&f.image, "image", "", "proxy.image: run the test command in this container `image`, the proxy beside it")
+	fs.Var(&f.requireService, "require-service", "proxy.require_service: fail a run unless this service was called, `name[:count]` (repeatable or comma-separated)")
+	fs.Var(&f.requireCallback, "require-callback", "proxy.require_callback: fail a run unless the app received a callback on this `path[:count]` (repeatable or comma-separated)")
+	fs.IntVar(&f.expose, "expose", 0, "proxy.expose: publish this local `port` at a public URL so the sandbox can deliver callbacks")
+	fs.BoolVar(&f.strict, "strict", false, "proxy.strict: block unmapped hosts instead of letting them reach the real internet")
 }
 
 func envCreateCommand() *cli.Command {
@@ -94,13 +110,26 @@ func envCreateCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "create",
 		Summary: "Define a named environment",
-		Usage:   "veris env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--data FILE] [--command 'cmd'] [--default] [--force] [--json]",
+		Usage:   "veris env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force] [--json]",
 		Help: `The name and service list go to the server (POST /v1/environments), or
 --from adopts an existing server environment by id. TTL, boot choice, data
 files and test command go to the named config in .veris/twin.yaml, which is
 created when the folder has none. On a TTY every answer left out is asked
-for; off a TTY it must be a flag. The first environment of a project is its
-default.`,
+for; off a TTY the name, --services (or --from), --ttl, --boot and --command
+must be flags, and no --data means no data files. The first environment of
+a project is its default.
+
+The proxy flags are never asked for. They land in the config's proxy: block,
+which fills in whatever a veris run command line leaves out:
+
+  environments:
+    NAME:
+      proxy:
+        image: app:test                  # --image: run the command in this image
+        require_service: [stripe:2]      # --require-service: fail unless it was called
+        require_callback: [/hooks/pay]   # --require-callback: fail unless delivered
+        expose: 3000                     # --expose: publish this port for callbacks
+        strict: true                     # --strict: block unmapped hosts`,
 		Flags: f.bind,
 		Run: func(ctx *cli.Context, args []string) error {
 			return runEnvCreate(ctx, args, &f)
@@ -122,17 +151,53 @@ func validBoot(b string) bool {
 
 // envCreated is env create's --json body.
 type envCreated struct {
-	Name        string   `json:"name"`
-	ID          string   `json:"id"`
-	Services    []string `json:"services"`
-	TTLMinutes  int      `json:"ttl_minutes"`
-	Boot        string   `json:"boot"`
-	Snapshot    string   `json:"snapshot,omitempty"`
-	Data        []string `json:"data"`
-	Command     []string `json:"command"`
-	Default     bool     `json:"default"`
-	Adopted     bool     `json:"adopted"`
-	ProjectFile string   `json:"project_file"`
+	Name        string          `json:"name"`
+	ID          string          `json:"id"`
+	Services    []string        `json:"services"`
+	TTLMinutes  int             `json:"ttl_minutes"`
+	Boot        string          `json:"boot"`
+	Snapshot    string          `json:"snapshot,omitempty"`
+	Data        []string        `json:"data"`
+	Command     []string        `json:"command"`
+	Proxy       cfg.ProxyConfig `json:"proxy"`
+	Default     bool            `json:"default"`
+	Adopted     bool            `json:"adopted"`
+	ProjectFile string          `json:"project_file"`
+}
+
+// proxyConfig is the proxy: block the create flags spell, nil-free so the
+// --json body prints [] rather than null for a list left out.
+func (f *createFlags) proxyConfig() cfg.ProxyConfig {
+	return cfg.ProxyConfig{
+		RequireService:  append([]string{}, f.requireService.vals...),
+		RequireCallback: append([]string{}, f.requireCallback.vals...),
+		Expose:          f.expose,
+		Image:           f.image,
+		Strict:          f.strict,
+	}
+}
+
+// checkProxyFlags refuses a proxy: block run would refuse, now rather than
+// at the first run: an entry is parsed exactly as run parses the flag, and a
+// callback requirement needs a port for the callback to arrive on.
+func (f *createFlags) checkProxyFlags() error {
+	for _, v := range f.requireService.vals {
+		if _, err := parseRequirement("service", v); err != nil {
+			return &cli.UsageError{Msg: err.Error()}
+		}
+	}
+	for _, v := range f.requireCallback.vals {
+		if _, err := parseRequirement("callback", v); err != nil {
+			return &cli.UsageError{Msg: err.Error()}
+		}
+	}
+	if f.expose < 0 || f.expose > 65535 {
+		return &cli.UsageError{Msg: fmt.Sprintf("--expose must be a port, not %d", f.expose)}
+	}
+	if len(f.requireCallback.vals) > 0 && f.expose == 0 {
+		return &cli.UsageError{Msg: "--require-callback asserts what your app received, and nothing can arrive without --expose PORT"}
+	}
+	return nil
 }
 
 func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
@@ -153,6 +218,9 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	// the twin the user named.
 	if f.from != "" && f.services != "" {
 		return &cli.UsageError{Msg: "--services cannot change an adopted environment; the server has no update route. Omit --services, or omit --from"}
+	}
+	if err := f.checkProxyFlags(); err != nil {
+		return err
 	}
 	var command []string
 	if f.command.set {
@@ -278,8 +346,11 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 		}
 	}
 
+	// Asked for on a TTY only: a script that names no data files means
+	// none, and a prompt it cannot answer would refuse an otherwise complete
+	// command line for a setting most environments leave empty.
 	data := f.data.vals
-	if !f.data.set {
+	if !f.data.set && s.ui.TTY {
 		ans, err := s.ui.Input("Data files to add after boot (blank for none)", "", "--data")
 		if err != nil {
 			return err
@@ -328,13 +399,20 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 		}
 	}
 
+	// The proxy block as given, nil lists and all: yaml's omitempty then
+	// leaves out what the flags left out, so the file reads as if written
+	// by hand.
 	proj.Environments[name] = cfg.EnvConfig{
 		ID:         env.ID,
 		TTLMinutes: ttl,
 		Boot:       boot,
 		Snapshot:   snapshot,
 		Data:       data,
-		Run:        cfg.RunConfig{Command: command},
+		Proxy: cfg.ProxyConfig{
+			RequireService: f.requireService.vals, RequireCallback: f.requireCallback.vals,
+			Expose: f.expose, Image: f.image, Strict: f.strict,
+		},
+		Run: cfg.RunConfig{Command: command},
 	}
 	if def {
 		proj.Default = name
@@ -361,8 +439,8 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	if s.ctx.Globals.JSON {
 		return printJSON(ctx.Stdout, envCreated{
 			Name: name, ID: env.ID, Services: env.Services, TTLMinutes: ttl, Boot: boot,
-			Snapshot: snapshot, Data: data, Command: command, Default: def, Adopted: adopted,
-			ProjectFile: proj.Path,
+			Snapshot: snapshot, Data: data, Command: command, Proxy: f.proxyConfig(),
+			Default: def, Adopted: adopted, ProjectFile: proj.Path,
 		})
 	}
 	return nil
@@ -705,7 +783,9 @@ func envUseCommand() *cli.Command {
 		Summary: "Choose the environment this folder uses",
 		Usage:   "veris env use [NAME|ID] [--global]",
 		Help: `NAME resolves against .veris/twin.yaml first, then against the server's
-environments by id or exact name. The choice is written to this folder's
+environments by id or exact name; the shortened id env list prints (the
+first characters and an ellipsis, or any prefix only one id begins with) is
+accepted at both stages. The choice is written to this folder's
 .veris/twin.local.yaml (gitignored), or with --global to the active profile
 as the default for folders that have no project file.`,
 		Flags: func(fs *flag.FlagSet) {
@@ -776,7 +856,7 @@ func runEnvUse(ctx *cli.Context, args []string, global bool) error {
 	// project file; a server-only environment is kept by id, the one form
 	// Resolve accepts without an entry to look up.
 	use := id
-	if _, ok := p.Environments[label]; ok {
+	if e, ok := p.Environments[label]; ok && e.ID == id {
 		use = label
 	}
 	s.res.Local.Use = use
@@ -837,8 +917,13 @@ func pickEnvironment(s *session) (string, error) {
 // resolveEnvName turns what the user typed into an environment: the label
 // to print and the server id. The project file answers first; then the
 // server list, by id or exact name, where more than one match is refused
-// with the candidates rather than guessed between.
+// with the candidates rather than guessed between. A shortened id -- the
+// first characters and an ellipsis, as env list prints it, or a bare prefix
+// -- is accepted at both stages when exactly one id begins with it, since
+// the table is where most ids are read from and a full one cannot be
+// copied out of it.
 func resolveEnvName(s *session, name string) (label, id string, err error) {
+	prefix := idPrefix(name)
 	if p := s.res.Project; p != nil {
 		if e, ok := p.Environments[name]; ok {
 			if e.ID == "" {
@@ -856,6 +941,25 @@ func resolveEnvName(s *session, name string) (label, id string, err error) {
 				return n, e.ID, nil
 			}
 		}
+		var begun []string
+		for _, n := range s.envNames() {
+			if e := p.Environments[n]; prefix != "" && e.ID != "" && strings.HasPrefix(e.ID, prefix) {
+				begun = append(begun, n)
+			}
+		}
+		switch len(begun) {
+		case 1:
+			return begun[0], p.Environments[begun[0]].ID, nil
+		case 0:
+		default:
+			var rows []string
+			for _, n := range begun {
+				rows = append(rows, n+" ("+shortID(p.Environments[n].ID)+")")
+			}
+			s.ui.Fail("'%s' begins the ids of %d environments in %s: %s", name, len(begun), relPath(s.cwd, p.Path), strings.Join(rows, ", "))
+			s.ui.Next("veris env use NAME")
+			return "", "", printed(1)
+		}
 	}
 	c, err := s.client()
 	if err != nil {
@@ -869,6 +973,15 @@ func resolveEnvName(s *session, name string) (label, id string, err error) {
 	for _, env := range envs {
 		if env.ID == name || (env.Name != "" && env.Name == name) {
 			matches = append(matches, env)
+		}
+	}
+	// The prefix is tried only when nothing matched outright: an exact name
+	// that happens to begin some id must not turn ambiguous.
+	if len(matches) == 0 && prefix != "" {
+		for _, env := range envs {
+			if strings.HasPrefix(env.ID, prefix) {
+				matches = append(matches, env)
+			}
 		}
 	}
 	switch len(matches) {
@@ -889,7 +1002,7 @@ func resolveEnvName(s *session, name string) (label, id string, err error) {
 	}
 	var ids []string
 	for _, m := range matches {
-		ids = append(ids, m.ID+" ("+strings.Join(m.Services, ", ")+")")
+		ids = append(ids, m.ID+" ("+serverLabel(&m)+")")
 	}
 	s.ui.Fail("'%s' names %d environments on %s: %s", name, len(matches), s.res.APIBase, strings.Join(ids, ", "))
 	s.ui.Next("veris env use ID")
@@ -906,9 +1019,9 @@ func envGetCommand() *cli.Command {
 		Help: `Without NAME the environment in use resolves as every command resolves it:
 --env, VERIS_ENV, this folder's use:, the project default, the profile's
 default_environment. A NAME resolves against .veris/twin.yaml first, then
-against the server's environments by id or exact name, as env use does.
-Each setting is shown with where it came from, then the server's record
-(GET /v1/environments/{id}).`,
+against the server's environments by id or exact name, as env use does; the
+shortened id env list prints is accepted too. Each setting is shown with
+where it came from, then the server's record (GET /v1/environments/{id}).`,
 		Run: runEnvGet,
 	}
 }
@@ -944,6 +1057,13 @@ func runEnvGet(ctx *cli.Context, args []string) error {
 	if nameArg != "" && s.res.Env == nil {
 		if name, id, err = resolveEnvName(s, nameArg); err != nil {
 			return err
+		}
+		// A shortened id resolved to a configured entry: its settings are
+		// that entry's, as the full id's would have been through Resolve.
+		if p := s.res.Project; p != nil {
+			if e, ok := p.Environments[name]; ok && e.ID == id {
+				conf = &e
+			}
 		}
 	} else if name, id, conf, err = s.requireEnv(); err != nil {
 		return err

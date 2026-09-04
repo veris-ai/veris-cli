@@ -300,6 +300,7 @@ func TestEnvCreateFlagDriven(t *testing.T) {
 	}
 	want := envCreated{Name: "ci", ID: id, Services: []string{"stripe"}, TTLMinutes: 20, Boot: "bundle",
 		Data: []string{"data/ci.json"}, Command: []string{"pytest", "-q", "tests/integration"}, Default: true,
+		Proxy:       cfg.ProxyConfig{RequireService: []string{}, RequireCallback: []string{}},
 		ProjectFile: filepath.Join(b.project, ".veris", "twin.yaml")}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("json = %+v, want %+v", got, want)
@@ -418,7 +419,8 @@ func TestEnvCreateOffATTYNamesTheMissingFlag(t *testing.T) {
 		{[]string{"ci", "--services", "stripe"}, "--ttl"},
 		{[]string{"ci", "--services", "stripe", "--ttl", "20"}, "--boot"},
 		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "snapshot"}, "--snapshot"},
-		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle"}, "--data"},
+		// --data is not asked for off a TTY: none given means none.
+		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle"}, "--command"},
 		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle", "--data", ""}, "--command"},
 	}
 	for _, c := range cases {
@@ -499,6 +501,165 @@ func TestEnvCreateInterview(t *testing.T) {
 			t.Errorf("exit %d, want 1", code)
 		}
 		wantLines(t, stderr, "✗ An environment needs at least one service")
+	})
+}
+
+// The proxy flags land in the config's proxy: block, never asked for and
+// never hand-edited; off a TTY a missing --data means no data files rather
+// than a prompt nobody can answer.
+func TestEnvCreateProxyFlagsAndOptionalData(t *testing.T) {
+	b := newEnvBench(t)
+	stdout, stderr, code := b.run("env", "create", "ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle", "--command", "pytest -q",
+		"--image", "app:test", "--require-service", "stripe:2,github", "--require-service", "postgres",
+		"--require-callback", "/hooks/stripe", "--expose", "3000", "--strict", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	wantProxy := cfg.ProxyConfig{
+		RequireService: []string{"stripe:2", "github", "postgres"}, RequireCallback: []string{"/hooks/stripe"},
+		Expose: 3000, Image: "app:test", Strict: true,
+	}
+	ci := b.loadProject().Environments["ci"]
+	if !reflect.DeepEqual(ci.Proxy, wantProxy) {
+		t.Errorf("proxy block = %+v, want %+v", ci.Proxy, wantProxy)
+	}
+	if len(ci.Data) != 0 {
+		t.Errorf("data = %v, want none without --data", ci.Data)
+	}
+	var got envCreated
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if !reflect.DeepEqual(got.Proxy, wantProxy) || got.Data == nil || len(got.Data) != 0 {
+		t.Errorf("json proxy %+v data %v", got.Proxy, got.Data)
+	}
+	// The file reads as run reads it, under the keys the README documents.
+	raw, err := os.ReadFile(filepath.Join(b.project, ".veris", "twin.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLines(t, string(raw), "proxy:\n", "require_service:\n", "- stripe:2\n", "- github\n", "require_callback:\n", "- /hooks/stripe\n",
+		"expose: 3000\n", "image: app:test\n", "strict: true\n")
+	if strings.Contains(string(raw), "data:") {
+		t.Errorf("no --data should write no data key:\n%s", raw)
+	}
+
+	t.Run("no proxy flag writes no proxy block", func(t *testing.T) {
+		_, stderr, code := b.run("env", "create", "plain", "--services", "stripe", "--ttl", "20", "--boot", "bundle", "--command", "", "--json")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		raw, _ := os.ReadFile(filepath.Join(b.project, ".veris", "twin.yaml"))
+		if plain := string(raw)[strings.Index(string(raw), "plain:"):]; strings.Contains(plain, "proxy:") {
+			t.Errorf("an empty proxy block was written:\n%s", plain)
+		}
+	})
+
+	t.Run("a block run would refuse is refused here, before anything is sent", func(t *testing.T) {
+		posts := len(b.plane.created)
+		for _, c := range []struct{ args, want string }{
+			{"--require-service stripe:zero", `--require-service "stripe:zero": "zero" is not a positive count`},
+			{"--require-callback /hooks", "nothing can arrive without --expose PORT"},
+			{"--expose 70000", "--expose must be a port, not 70000"},
+		} {
+			args := append([]string{"env", "create", "x", "--services", "stripe", "--ttl", "1", "--boot", "bundle", "--command", ""}, strings.Fields(c.args)...)
+			_, stderr, code := b.run(args...)
+			if code != 1 || !strings.Contains(stderr, c.want) {
+				t.Errorf("%s: exit %d, want 1 with %q:\n%s", c.args, code, c.want, stderr)
+			}
+		}
+		if len(b.plane.created) != posts {
+			t.Errorf("a POST was made for a refused line")
+		}
+	})
+
+	t.Run("the help documents the block and the flags", func(t *testing.T) {
+		stdout, _, _ := b.run("env", "create", "--help")
+		wantLines(t, stdout,
+			"no --data means no data files",
+			"      proxy:\n",
+			"        require_service: [stripe:2]",
+			"--require-service NAME[:COUNT]",
+			"--require-callback PATH[:COUNT]",
+			"--expose PORT",
+			"--image IMAGE",
+			"--strict",
+			"proxy.image:")
+	})
+}
+
+// The shortened id env list prints (eight characters and an ellipsis), or a
+// bare prefix, names an environment wherever a full id does, as long as
+// exactly one id begins with it.
+func TestEnvGetAndUseAcceptTheShortenedID(t *testing.T) {
+	b := newEnvBench(t)
+	b.twoEnvs()
+	b.plane.addEnv(devID, "checkout-svc", []string{"stripe", "postgres"}, "")
+	b.plane.addEnv(ciID, "checkout-ci", []string{"stripe"}, "")
+	b.plane.addEnv(probeID, "probe", []string{"stripe"}, "")
+
+	t.Run("env get: a configured entry by its table id, with its settings", func(t *testing.T) {
+		_, stderr, code := b.run("env", "get", shortID(devID))
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		wantLines(t, squash(stderr), "Environment dev ("+devID+") argument", "TTL 240 min .veris/twin.yaml", "Name checkout-svc")
+	})
+	t.Run("env get: a server environment by a bare prefix", func(t *testing.T) {
+		_, stderr, code := b.run("env", "get", probeID[:10])
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		wantLines(t, squash(stderr), "Environment probe ("+probeID+") argument", "Settings none: a bare id with no entry in .veris/twin.yaml")
+	})
+	t.Run("env use: a configured entry is kept by name, a server one by id", func(t *testing.T) {
+		_, stderr, code := b.run("env", "use", shortID(ciID))
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		wantLines(t, stderr, "✓ This folder now uses 'ci' (c1a2b3d4…)")
+		if l := b.loadLocal(); l.Use != "ci" {
+			t.Errorf("local use = %q, want the config's name", l.Use)
+		}
+		_, stderr, code = b.run("env", "use", shortID(probeID))
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		wantLines(t, stderr, "✓ This folder now uses 'probe' (n8crn4cv…)")
+		if l := b.loadLocal(); l.Use != probeID {
+			t.Errorf("local use = %q, want the id", l.Use)
+		}
+	})
+	t.Run("a word that is not shaped like an id is never tried as a prefix", func(t *testing.T) {
+		_, stderr, code := b.run("env", "get", "Dev-1")
+		if code != 1 || !strings.Contains(stderr, "✗ No environment 'Dev-1' in .veris/twin.yaml or on "+b.srv.URL) {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+	t.Run("a prefix two ids begin with lists them", func(t *testing.T) {
+		b.plane.addEnv("n8crn4cvzzzzzzzzzzzzzzzzz", "probe2", []string{"github"}, "")
+		_, stderr, code := b.run("env", "get", shortID(probeID))
+		if code != 1 {
+			t.Errorf("exit %d, want 1", code)
+		}
+		wantLines(t, stderr,
+			"✗ 'n8crn4cv…' names 2 environments on "+b.srv.URL+": "+probeID+" (probe: stripe), n8crn4cvzzzzzzzzzzzzzzzzz (probe2: github)",
+			"→ Next: veris env use ID")
+		// Ten characters tell them apart again.
+		if _, stderr, code := b.run("env", "get", probeID[:10]); code != 0 {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+		// Two configured entries sharing a prefix are refused with their names.
+		p := b.loadProject()
+		p.Environments["dev2"] = cfg.EnvConfig{ID: "k3j2v0d8zzzzzzzzzzzzzzzzz"}
+		if err := p.Save(); err != nil {
+			t.Fatal(err)
+		}
+		_, stderr, code = b.run("env", "use", shortID(devID))
+		if code != 1 {
+			t.Errorf("exit %d, want 1", code)
+		}
+		wantLines(t, stderr, "✗ 'k3j2v0d8…' begins the ids of 2 environments in .veris/twin.yaml: dev (k3j2v0d8…), dev2 (k3j2v0d8…)", "→ Next: veris env use NAME")
 	})
 }
 
@@ -709,7 +870,7 @@ func TestEnvUse(t *testing.T) {
 		if code != 1 {
 			t.Errorf("exit %d, want 1", code)
 		}
-		wantLines(t, stderr, "✗ 'dup' names 2 environments on "+b.srv.URL+": d1u2p3d4u5p6d7u8p9d0u1p2d (stripe), d2u2p3d4u5p6d7u8p9d0u1p2d (github)", "→ Next: veris env use ID")
+		wantLines(t, stderr, "✗ 'dup' names 2 environments on "+b.srv.URL+": d1u2p3d4u5p6d7u8p9d0u1p2d (dup: stripe), d2u2p3d4u5p6d7u8p9d0u1p2d (dup: github)", "→ Next: veris env use ID")
 		if l := b.loadLocal(); l.Use != probeID {
 			t.Errorf("local use changed to %q", l.Use)
 		}

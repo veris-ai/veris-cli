@@ -49,6 +49,9 @@ type ledgerTwins struct {
 	// noLog makes the stripe twin serve no request log at all: its
 	// /veris/requests is FastAPI's 404, as on a twin built without one.
 	noLog bool
+	// yrows is the yente twin's log (yenteTwin), ascending by id.
+	yrows []twin.Request
+	ynext int
 }
 
 func newLedgerTwins(t *testing.T) *ledgerTwins {
@@ -99,6 +102,7 @@ func newLedgerTwins(t *testing.T) *ledgerTwins {
 	mux.HandleFunc(github+"/", func(w http.ResponseWriter, _ *http.Request) {
 		sbJSON(w, 200, map[string]any{})
 	})
+	f.yenteTwin(mux)
 	mux.HandleFunc(stripe+"/veris/requests", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -198,6 +202,49 @@ func (f *ledgerTwins) services() []api.ServiceInfo {
 func (f *ledgerTwins) withGithub() []api.ServiceInfo {
 	github := f.srv.URL + "/s/" + sbID + "/github"
 	return append(f.services(), api.ServiceInfo{Name: "github", Status: "ready", URL: github, ControlURL: github, EnvHint: "GITHUB_API_BASE"})
+}
+
+// withYente is services plus the yente twin: an http twin with a log that
+// the proxy has no hostname for (none served, none in the table), so its
+// URL is handed to the command under YENTE_API_BASE and called directly.
+func (f *ledgerTwins) withYente() []api.ServiceInfo {
+	yente := f.srv.URL + "/s/" + sbID + "/yente"
+	return append(f.services(), api.ServiceInfo{Name: "yente", Status: "ready", URL: yente, ControlURL: yente, EnvHint: "YENTE_API_BASE"})
+}
+
+// yenteTwin serves the yente twin under /s/<sandbox>/yente on mux: health,
+// a request log that honours since_id, and a catch-all that records every
+// vendor-surface call as a handler row.
+func (f *ledgerTwins) yenteTwin(mux *http.ServeMux) {
+	yente := "/s/" + sbID + "/yente"
+	mux.HandleFunc(yente+"/veris/health", func(w http.ResponseWriter, _ *http.Request) {
+		sbJSON(w, 200, map[string]any{"status": "ok", "service": "yente"})
+	})
+	mux.HandleFunc(yente+"/veris/requests", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		q := r.URL.Query()
+		since, _ := strconv.Atoi(q.Get("since_id"))
+		limit := 50
+		if v := q.Get("limit"); v != "" {
+			limit, _ = strconv.Atoi(v)
+		}
+		out := []twin.Request{}
+		for i := len(f.yrows) - 1; i >= 0 && len(out) < limit; i-- {
+			if f.yrows[i].ID > since {
+				out = append(out, f.yrows[i])
+			}
+		}
+		sbJSON(w, 200, map[string]any{"requests": out})
+	})
+	mux.HandleFunc(yente+"/", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.ynext++
+		f.yrows = append(f.yrows, twin.Request{ID: f.ynext, TS: int(time.Now().Unix()), Method: r.Method,
+			Path: strings.TrimPrefix(r.URL.Path, yente), Tier: twin.TierHandler})
+		sbJSON(w, 200, map[string]any{"responses": []any{}})
+	})
 }
 
 // ledgerBench is a logged-in bench, a control plane serving sbID ready
@@ -586,21 +633,204 @@ func TestLedgerAssertionOutcomes(t *testing.T) {
 }
 
 // The engine can be satisfied while the sandbox was not: a twin that did not
-// record what the proxy forwarded. The ledger's verdict owns the exit code
-// even though the child passed, and the disagreement is printed.
-func TestRunRequireServiceUnmetOnTheLedgerExitsThree(t *testing.T) {
+// record what the proxy forwarded. The requirement passes on the engine's
+// count -- one verdict, naming the side that answered and what the other
+// recorded -- and the disagreement between the ledgers is still printed.
+func TestRunRequireServiceMetByTheEngineAloneIsOneVerdict(t *testing.T) {
 	_, _, twins := ledgerBench(t)
 	twins.script(func(f *ledgerTwins) { f.record = false })
 	argv := child(t, "call")
 	err, stderr := runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
-	wantExit(t, err, exitRequirementUnmet)
+	wantExit(t, err, 0)
 	sbInOrder(t, stderr,
 		"veris: the sandbox received 1 request(s):\n",
 		"veris: the sandbox recorded 0 request(s) since the watermark\n",
-		"veris: ✗ the run required service stripe at least 1 time(s) but the sandbox received it 0 time(s)\n",
-		"            — your tests never touched the sandbox (is STRIPE_API_BASE overridden in your test setup?)\n",
 		"veris: ! ledgers differ (engine 1, sandbox 0)\n",
+		"veris: ✓ required stripe ≥1: saw 1 (engine; the sandbox ledger recorded 0)\n",
 	)
+	for _, absent := range []string{"✗", "received it 0 time(s)", "saw it 0 time(s)"} {
+		if strings.Contains(stderr, absent) {
+			t.Errorf("one verdict, not two; stderr should not carry %q:\n%s", absent, stderr)
+		}
+	}
+}
+
+// A twin the proxy does not route -- yente: an http twin with no hostname to
+// intercept -- is handed to the command as its env hint, judged on the
+// sandbox ledger alone, and left out of the two-ledger comparison, which the
+// engine's 0 for it would otherwise always fail. One verdict per
+// requirement, whichever ledger saw the traffic.
+func TestRunHandsAnUnproxiedTwinItsHintAndJudgesItOnTheSandboxLedger(t *testing.T) {
+	// yenteRun runs the child role against a sandbox of stripe, postgres and
+	// yente, requiring stripe and yente, and returns the yente twin's URL
+	// beside the outcome.
+	yenteRun := func(t *testing.T, role string, extra ...string) (string, error, string) {
+		t.Helper()
+		_, plane, twins := ledgerBench(t)
+		plane.script(func(p *sandboxPlane) {
+			p.answer = func(int) *api.Sandbox { return readySandbox(twins.withYente(), time.Now().Add(30*time.Minute)) }
+		})
+		argv := child(t, role)
+		line := append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--require-service", "stripe", "--require-service", "yente"}, extra...)
+		err, stderr := runLine(t, append(append(line, "--"), argv...)...)
+		return twins.srv.URL + "/s/" + sbID + "/yente", err, stderr
+	}
+
+	t.Run("handed, met on the sandbox ledger, compared without it", func(t *testing.T) {
+		url, err, stderr := yenteRun(t, "yente")
+		wantExit(t, err, 0)
+		sbInOrder(t, stderr,
+			"veris: watermark stripe:0 postgres:— yente:0\n",
+			"veris: postgres: not proxied; handed DATABASE_URL=postgresql://app:app@10.0.0.5:5432/sb?sslmode=require\n",
+			"veris: yente: not proxied; handed YENTE_API_BASE="+url+"\n",
+			"veris: the sandbox received 1 request(s):\n",
+			"veris: the sandbox recorded 2 request(s) since the watermark:\n",
+			"  stripe                       1\n",
+			"  yente                        1   (not proxied)\n",
+			"veris: ✓ required stripe ≥1: saw 1   ✓ required yente ≥1: saw 1 (sandbox ledger; not proxied)   ✓ ledgers agree (1 = 1)\n",
+		)
+		for _, absent := range []string{"✗", "ledgers differ", "cannot decide", "saw it 0 time(s)"} {
+			if strings.Contains(stderr, absent) {
+				t.Errorf("stderr should not carry %q:\n%s", absent, stderr)
+			}
+		}
+	})
+	t.Run("a -e of the user's is never overwritten, and is set for the command", func(t *testing.T) {
+		// The child reaches yente through the user's own value of the
+		// variable, which the host tier sets as -e says; the run hands
+		// nothing for it and says nothing about it. The fake twin's port is
+		// only known once the bench exists, hence the placeholder rewritten
+		// by the run line's own fixture.
+		_, plane, twins := ledgerBench(t)
+		plane.script(func(p *sandboxPlane) {
+			p.answer = func(int) *api.Sandbox { return readySandbox(twins.withYente(), time.Now().Add(30*time.Minute)) }
+		})
+		url := twins.srv.URL + "/s/" + sbID + "/yente"
+		argv := child(t, "yente")
+		err, stderr := runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0",
+			"--require-service", "stripe", "--require-service", "yente", "-e", "YENTE_API_BASE=" + url, "--"}, argv...)...)
+		wantExit(t, err, 0)
+		if strings.Contains(stderr, "handed YENTE_API_BASE") {
+			t.Errorf("a variable set with -e must not be handed over it:\n%s", stderr)
+		}
+		if !strings.Contains(stderr, "veris: postgres: not proxied; handed DATABASE_URL=") {
+			t.Errorf("the other handoff still happens:\n%s", stderr)
+		}
+		if !strings.Contains(stderr, "✓ required yente ≥1: saw 1 (sandbox ledger; not proxied)") {
+			t.Errorf("stderr:\n%s", stderr)
+		}
+	})
+	t.Run("neither ledger shows it: exit 3, one line", func(t *testing.T) {
+		_, err, stderr := yenteRun(t, "call")
+		wantExit(t, err, exitRequirementUnmet)
+		sbInOrder(t, stderr,
+			"veris: ✗ the run required service yente at least 1 time(s) but the sandbox received it 0 time(s)\n",
+			"            — your tests never touched the sandbox (is YENTE_API_BASE overridden in your test setup?)\n",
+			"veris: ✓ required stripe ≥1: saw 1   ✓ ledgers agree (1 = 1)\n",
+		)
+		if strings.Contains(stderr, "required service yente at least 1 time(s) but the sandbox saw it 0 time(s)") {
+			t.Errorf("the engine must not judge a twin the ledger judges:\n%s", stderr)
+		}
+	})
+}
+
+// vouch merges the engine's receipt into the ledger's assertions: either
+// side showing the count meets the requirement, an unproxied twin is the
+// ledger's alone, and an engine that forwarded nothing refutes a
+// requirement the ledger could not read.
+func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
+	marks := []twinMark{{name: "stripe"}, {name: "yente", notProxied: true}}
+	engine := &proxy.Receipt{Total: 3, ByService: map[string]int64{"stripe": 3}}
+	req := func(name string, n int64) []requirement {
+		return []requirement{{kind: "service", name: name, count: n}}
+	}
+
+	t.Run("the ledger met it and the engine saw less", func(t *testing.T) {
+		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 5}}}
+		got := assertLedger(l, marks, req("stripe", 5), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || !got[0].OK || got[0].Source != "ledger" || got[0].met() != "required stripe ≥5: saw 5 (sandbox ledger; the engine saw 3)" {
+			t.Errorf("%+v: %s", got, got[0].met())
+		}
+	})
+	t.Run("the engine met it and the ledger recorded less", func(t *testing.T) {
+		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 1}}}
+		got := assertLedger(l, marks, req("stripe", 2), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || !got[0].OK || got[0].Got != 3 || got[0].Source != "engine" || got[0].met() != "required stripe ≥2: saw 3 (engine; the sandbox ledger recorded 1)" {
+			t.Errorf("%+v: %s", got, got[0].met())
+		}
+	})
+	t.Run("both agree: no source named", func(t *testing.T) {
+		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3}}}
+		got := assertLedger(l, marks, req("stripe", 3), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || !got[0].OK || got[0].Source != "" || got[0].met() != "required stripe ≥3: saw 3" {
+			t.Errorf("%+v: %s", got, got[0].met())
+		}
+	})
+	t.Run("neither shows it", func(t *testing.T) {
+		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3}}}
+		got := assertLedger(l, marks, req("stripe", 4), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || got[0].OK || got[0].Indeterminate || got[0].Got != 3 {
+			t.Errorf("%+v", got)
+		}
+	})
+	t.Run("an unproxied twin is the ledger's alone, whatever the engine says", func(t *testing.T) {
+		l := &ledger{Twins: []*ledgerTwin{{Name: "yente", Count: 4, NotProxied: true}}}
+		got := assertLedger(l, marks, req("yente", 1), nil, false)
+		vouch(got, &proxy.Receipt{ByService: map[string]int64{"yente": 0}})
+		if len(got) != 1 || !got[0].OK || !got[0].NotProxied || got[0].met() != "required yente ≥1: saw 4 (sandbox ledger; not proxied)" {
+			t.Errorf("%+v: %s", got, got[0].met())
+		}
+		got = assertLedger(&ledger{Twins: []*ledgerTwin{{Name: "yente", NotProxied: true}}}, marks, req("yente", 1), nil, false)
+		vouch(got, &proxy.Receipt{ByService: map[string]int64{"yente": 9}})
+		if len(got) != 1 || got[0].OK || got[0].Source != "" {
+			t.Errorf("the engine's count of an unproxied twin is no evidence: %+v", got)
+		}
+	})
+	t.Run("an unreadable ledger: the engine vouches, or refutes", func(t *testing.T) {
+		broken := &ledger{Unreadable: []string{"stripe: [500] the log is unavailable"}}
+		got := assertLedger(broken, marks, req("stripe", 1), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || !got[0].OK || got[0].Indeterminate || got[0].met() != "required stripe ≥1: saw 3 (engine; stripe's ledger could not be read)" {
+			t.Errorf("%+v: %s", got, got[0].met())
+		}
+		got = assertLedger(broken, marks, req("stripe", 4), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || got[0].OK || got[0].Indeterminate ||
+			got[0].unmet() != "the run required service stripe at least 4 time(s) but the engine saw it 3 time(s) and stripe's ledger could not be read" {
+			t.Errorf("%+v: %s", got, got[0].unmet())
+		}
+		// Read to the cap, rows may yet exist: undecided stays undecided.
+		capped := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3, Capped: true}}}
+		got = assertLedger(capped, marks, req("stripe", 4), nil, false)
+		vouch(got, engine)
+		if len(got) != 1 || !got[0].Indeterminate {
+			t.Errorf("a capped ledger is not refuted by the engine: %+v", got)
+		}
+		// Without the engine's receipt nothing changes.
+		got = assertLedger(broken, marks, req("stripe", 1), nil, false)
+		vouch(got, nil)
+		if len(got) != 1 || !got[0].Indeterminate {
+			t.Errorf("%+v", got)
+		}
+	})
+	t.Run("the comparison leaves unproxied twins out", func(t *testing.T) {
+		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3}, {Name: "yente", Count: 4, NotProxied: true}}}
+		var out strings.Builder
+		printVerdict(&out, l, nil, engine, false)
+		if out.String() != "veris: ✓ ledgers agree (3 = 3)\n" {
+			t.Errorf("printed:\n%s", out.String())
+		}
+		// Only unproxied twins: nothing to compare, so nothing is claimed.
+		out.Reset()
+		printVerdict(&out, &ledger{Twins: []*ledgerTwin{{Name: "yente", Count: 4, NotProxied: true}}}, nil, engine, false)
+		if out.String() != "" {
+			t.Errorf("printed:\n%s", out.String())
+		}
+	})
 }
 
 // A suite that crashed before it reached the sandbox is exit 3, not its
@@ -663,26 +893,46 @@ func cacheSandboxAt(t *testing.T, id, upstream string) {
 	}
 }
 
-// A ledger that cannot be read leaves an assertion undecided (exit 4) and a
-// run without assertions to its own status, with the line that says why.
-// The engine is satisfied in each case -- the child calls the service -- so
-// the exit code is the ledger's alone.
-func TestRunRequireIndeterminateWhenTheLedgerIsUnreadable(t *testing.T) {
+// A ledger that cannot be read leaves a service requirement to the engine:
+// what the proxy forwarded meets it (exit 0, the line saying the ledger was
+// not read) or refutes it (exit 3). A run without assertions keeps its own
+// status, with the line that says why.
+func TestRunTheEngineAnswersWhenTheLedgerIsUnreadable(t *testing.T) {
 	t.Run("the twin's log fails after the watermark", func(t *testing.T) {
 		_, _, twins := ledgerBench(t)
 		twins.script(func(f *ledgerTwins) { f.failAfter = 1 })
 		argv := child(t, "call")
 		err, stderr := runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
-		wantExit(t, err, exitIndeterminate)
+		wantExit(t, err, 0)
 		sbInOrder(t, stderr,
 			"veris: watermark stripe:0 postgres:—\n",
 			"veris: the sandbox received 1 request(s):\n",
 			"veris: ! the sandbox ledger could not be read (stripe: [500] the log is unavailable)\n",
-			"veris: ! cannot decide whether the run required service stripe at least 1 time(s): stripe's ledger could not be read\n",
+			"veris: ✓ required stripe ≥1: saw 1 (engine; stripe's ledger could not be read)\n",
 		)
+		if strings.Contains(stderr, "cannot decide") {
+			t.Errorf("the engine showed the count:\n%s", stderr)
+		}
+
+		// The engine forwarded nothing: refuted, in one line, exit 3.
+		twins.script(func(f *ledgerTwins) { f.requestsCalls = 0 })
+		argv = child(t, "silent")
+		err, stderr = runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
+		wantExit(t, err, exitRequirementUnmet)
+		sbInOrder(t, stderr,
+			"veris: ! the sandbox ledger could not be read (stripe: [500] the log is unavailable)\n",
+			"veris: ✗ the run required service stripe at least 1 time(s) but the engine saw it 0 time(s) and stripe's ledger could not be read\n",
+			"            — your tests never touched the sandbox (is STRIPE_API_BASE overridden in your test setup?)\n",
+		)
+		for _, absent := range []string{"cannot decide", "saw it 0 time(s)\n"} {
+			if strings.Contains(stderr, absent) {
+				t.Errorf("one verdict; stderr should not carry %q:\n%s", absent, stderr)
+			}
+		}
 
 		// No assertion depended on it: the child's status, and the line.
 		twins.script(func(f *ledgerTwins) { f.requestsCalls = 0 })
+		argv = child(t, "call")
 		err, stderr = runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--"}, argv...)...)
 		wantExit(t, err, 0)
 		if !strings.Contains(stderr, "veris: ! the sandbox ledger could not be read (stripe: [500] the log is unavailable)\n") {
@@ -697,10 +947,11 @@ func TestRunRequireIndeterminateWhenTheLedgerIsUnreadable(t *testing.T) {
 		cacheSandboxAt(t, "sbx_nokey", sandbox(t))
 		argv := child(t, "call")
 		err, stderr := runLine(t, append([]string{"--sandbox", "sbx_nokey", "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
-		wantExit(t, err, exitIndeterminate)
-		if !strings.Contains(stderr, "veris: ! the sandbox ledger could not be read (no API key to read sandbox sbx_nokey with") {
-			t.Errorf("stderr:\n%s", stderr)
-		}
+		wantExit(t, err, 0)
+		sbInOrder(t, stderr,
+			"veris: ! the sandbox ledger could not be read (no API key to read sandbox sbx_nokey with",
+			"veris: ✓ required stripe ≥1: saw 1 (engine; the sandbox ledger could not be read)\n",
+		)
 		if strings.Contains(stderr, "watermark") {
 			t.Errorf("no watermark can be taken without the sandbox:\n%s", stderr)
 		}
@@ -905,10 +1156,11 @@ func TestRunFreshLifecycle(t *testing.T) {
 		ciProject(t, b, customersJSON)
 		argv := child(t, "call")
 		// The watermark is the first read of the log; the seeding before it
-		// reads nothing. The after-read is the second, and fails -- with the
-		// engine satisfied, so the ledger alone decides.
+		// reads nothing. The after-read is the second, and fails: the fresh
+		// run's own rule -- that the sandbox recorded anything -- cannot be
+		// decided, and the engine has no say in it.
 		twins.script(func(f *ledgerTwins) { f.failAfter = 1 })
-		err, stderr := runLine(t, append([]string{"--fresh", "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
+		err, stderr := runLine(t, append([]string{"--fresh", "--listen", "127.0.0.1:0", "--"}, argv...)...)
 		wantExit(t, err, exitIndeterminate)
 		if got := plane.deletedIDs(); len(got) != 0 {
 			t.Errorf("exit 4 must keep the sandbox: %v", got)

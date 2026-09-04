@@ -109,7 +109,7 @@ Starting 'checkout-svc' (checkout-svc: stripe, postgres) · boot bundle · ttl 2
   stripe     STRIPE_API_BASE=https://svc.api.veris.ai/s/7hqz4m2n9c1v5x8b3k6t0r2p4/stripe
   postgres   DATABASE_URL=postgresql://app:app@34.55.134.28:5432/sb7hqz4m2n…?sslmode=require
              (data plane; handed to the app, not proxied)
-✓ Up: 7hqz4m2n9c1v5x8b3k6t0r2p4 is this folder's sandbox (expires 16:04)
+✓ Up: 7hqz4m2n9c1v5x8b3k6t0r2p4 is this folder's sandbox (expires 16:04 EDT)
 → https://studio.veris.ai/sandboxes/7hqz4m2n9c1v5x8b3k6t0r2p4
 → Next: veris run
 ```
@@ -217,8 +217,9 @@ environments:
 ```
 
 `env create` writes `id`, `ttl_minutes`, `boot`, `snapshot`, `data` and
-`run.command`; the `proxy:` block is yours to add. No secrets and no sandbox
-ids go in this file.
+`run.command`, and the `proxy:` block from `--image`, `--require-service`,
+`--require-callback`, `--expose` and `--strict` (`env create --help` shows
+the block each writes). No secrets and no sandbox ids go in this file.
 
 Which environment is in use, most explicit first: `--env NAME|ID` →
 `VERIS_ENV` → `use:` in `.veris/twin.local.yaml` → `default:` in the nearest
@@ -228,12 +229,13 @@ the project default entirely. `env use NAME` writes the folder-scoped override
 into the gitignored `twin.local.yaml`, so a teammate's clone keeps the
 committed default; `env use NAME --global` sets the profile-level default for
 folders with no project file. A NAME resolves against the project file first,
-then against the server by id or exact name; an ambiguous name lists the
-candidates.
+then against the server by id or exact name; the shortened id `env list`
+prints (`k3j2v0d8…`, or any prefix only one id begins with) is accepted at
+both stages, and an ambiguous name or prefix lists the candidates.
 
 | Command | Does |
 |---|---|
-| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--default] [--force]` | Define a named environment. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. |
+| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block; off a TTY, no `--data` means no data files. |
 | `env list` | Two blocks: configured (this project's, `★` default, `●` in use here) and available (every server environment the key can see, which config points at it, live sandboxes). |
 | `env get [NAME\|ID]` | The resolved settings, where each came from, and the server record. |
 | `env use [NAME\|ID] [--global]` | Choose for this folder, or the profile. A picker on a TTY when NAME is omitted. |
@@ -428,22 +430,26 @@ Attaching to an existing sandbox still registers, by PATCH, and warns when it
 replaces someone else's URL. The URL is a capability, in either mode: anyone
 holding it can POST to your app.
 
-### Non-HTTP services: handed over, not proxied
+### Unproxied services: handed over, not proxied
 
-A sandbox can hold services that are not HTTP — a Postgres service's `url` is
-a connection string, a wire protocol this proxy does not speak. Interception
-would be the wrong tool anyway: client code already reads its database DSN
-from an environment variable in production, so configuration through the
-environment IS the code path that ships.
+A sandbox can hold services the proxy has no hostname to intercept for: a
+Postgres service's `url` is a connection string, a wire protocol this proxy
+does not speak, and a data-plane twin such as yente answers on a locally run
+instance that no client calls over the internet, so no vendor hostname is
+measured for it. Interception would be the wrong tool anyway: client code
+already reads its database DSN or base URL from an environment variable in
+production, so configuration through the environment IS the code path that
+ships.
 
-The proxy hands each such service's connection string to your command under
-the exact variable the platform names for it (its `env_hint` —
-`DATABASE_URL` for Postgres), in every tier: the local child process, the
-workload container's `--env-file`, and `serve --write-env` output, including
-trust-only mode. Startup says so per service — "postgres: not proxied;
-handed to the command as $DATABASE_URL" — so an unproxied database reads as
-the deliberate handoff it is. An explicit `-e DATABASE_URL=...` of your own
-still wins, exactly as `docker run` precedence has it.
+`run` hands each such service's URL to your command under the exact variable
+the platform names for it (its `env_hint` — `DATABASE_URL` for Postgres,
+`YENTE_API_BASE` for yente), in every tier: the local child process, the
+workload container, and `serve --write-env` output, including trust-only
+mode. The run says so per variable — `veris: yente: not proxied; handed
+YENTE_API_BASE=…` — so an unproxied twin reads as the deliberate handoff it
+is, and a `--require-service` on it is judged on the sandbox's own ledger,
+the only one its traffic ever reaches. An explicit `-e DATABASE_URL=...` of
+your own is never overwritten, exactly as `docker run` precedence has it.
 
 ## serve and check
 
@@ -737,7 +743,8 @@ Three mechanisms close that gap, in the order to reach for them:
    and an official override read it from `veris.env` already: gRPC
    (`GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`), Bundler, Composer, Hex, Julia, Nix,
    Perl LWP, gcloud. Nothing to do.
-2. **`run --image ... --patch-bundled-cas` (experimental).** Scans the image
+2. **`run --image ... --patch-bundled-cas`**, the default for an SDK that
+   bundles its own CA. Scans the image
    and your `-v` mounts for known bundled CA files (certifi, pip's vendored
    certifi, botocore, Stripe's Python and Ruby layouts, httplib2), appends
    the Veris CA to a copy of each, and bind-mounts the copy read-only over
