@@ -50,12 +50,14 @@ type Service struct {
 	URL     string `json:"url"`
 	Status  string `json:"status"`
 	EnvHint string `json:"env_hint"`
-	// Routes are the real hostnames this service answers for, when the control
-	// plane serves them. Same provenance as the embedded table -- generated
-	// from the measured vendor backends, never authored -- but they arrive
-	// with the sandbox, so a service added to the platform is routable the day
-	// it lands instead of waiting for the next proxy release. Older control
-	// planes omit the field; the embedded table then decides.
+	// Routes are the real hostnames this service answers for -- generated on
+	// the control plane from the measured vendor backends, never authored, and
+	// served with the sandbox, so a service added to the platform is routable
+	// the day it lands instead of waiting for the next proxy release. They are
+	// the only source of hostnames this binary has: a service with none (a
+	// twin with no vendor host, or one the plane has not measured) is not
+	// intercepted, and its URL is handed to the command under its env hint
+	// instead -- or, with no hint, is reported as out of reach.
 	Routes []routes.Entry `json:"routes,omitempty"`
 }
 
@@ -290,13 +292,14 @@ type Unroutable struct {
 // Each service's upstream is the URL the control plane returned, used verbatim.
 // Which real hostnames map onto it resolves most-explicit first:
 //
-//	--route overrides  >  routes the control plane served  >  the embedded table
+//	--route overrides  >  routes the control plane served
 //
-// All three carry the same kind of fact; they differ in freshness and intent.
-// An override is the operator saying "I know better for this run"; the control
-// plane's routes are the platform's current measured record; the embedded
-// table is that same record frozen at this binary's release, kept as the
-// fallback for control planes that do not serve routes yet.
+// There is no third source. An override is the operator saying "I know better
+// for this run"; the control plane's routes are the platform's current
+// measured record, and the only record this binary has. A service with
+// neither has no hostname to intercept, so it is not proxied and its URL is
+// handed to the command under its env hint, exactly as a Postgres DSN is --
+// or, with no hint to hand it under, is reported as out of reach.
 func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.Config, []Unroutable, error) {
 	cfg := &config.Config{
 		Version:   1,
@@ -340,8 +343,9 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 		}
 		if len(entries) == 0 {
 			// An http twin no source has a hostname for -- a data plane like
-			// yente, whose oracle is a locally run instance nobody calls over
-			// the internet -- is the DSN case again: nothing to intercept, and
+			// yente, whose oracle is a locally run instance nobody calls
+			// over the internet, or any twin the control plane served no
+			// route for -- is the DSN case again: nothing to intercept, and
 			// client code that reads its base URL from an environment
 			// variable in production. Handed over under that name, as the
 			// DSN is; without a name there is nothing to hand it as.
@@ -351,14 +355,13 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 				})
 				skipped = append(skipped, Unroutable{svc.Name,
 					"not proxied (no hostname to intercept: the control plane " +
-						"served no route and this binary's table has none); " +
-						"handed to the command as $" + svc.EnvHint})
+						"served no route for it); handed to the command as $" +
+						svc.EnvHint})
 				continue
 			}
 			skipped = append(skipped, Unroutable{svc.Name,
-				"no route: the control plane served none and this binary's " +
-					"table has no measured hostname for it (--route " +
-					svc.Name + "=<host> supplies one for this run)"})
+				"no route: the control plane served no hostname for it " +
+					"(--route " + svc.Name + "=<host> supplies one for this run)"})
 			continue
 		}
 		for _, entry := range entries {
@@ -397,13 +400,13 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 }
 
 // NotProxied reports whether the proxy has no hostname to intercept for svc:
-// a wire protocol it does not speak (a postgres DSN), or an http twin no
-// source -- an override, the control plane, the embedded table -- has a
-// route for (yente). Such a twin's traffic never passes the proxy, so it
-// reaches the sandbox only if the command is handed the twin's URL under its
-// env hint, and only the sandbox's own ledger can count what arrived. It is
-// the decision ToConfig makes, exposed so the CLI can make the same one on a
-// sandbox described by the control plane.
+// a wire protocol it does not speak (a postgres DSN), or an http twin neither
+// source -- an override or the control plane -- has a route for (yente).
+// Such a twin's traffic never passes the proxy, so it reaches the sandbox
+// only if the command is handed the twin's URL under its env hint, and only
+// the sandbox's own ledger can count what arrived. It is the decision
+// ToConfig makes, exposed so the CLI can make the same one on a sandbox
+// described by the control plane.
 func NotProxied(svc Service, overrides map[string][]routes.Entry) bool {
 	if !isHTTP(svc.URL) {
 		return true
@@ -412,22 +415,21 @@ func NotProxied(svc Service, overrides map[string][]routes.Entry) bool {
 	return len(entries) == 0
 }
 
-// routesFor picks one source of routes for a service and names it. The
+// routesFor picks one source of routes for a service and names it. The two
 // sources never merge: a config assembled from two records could not be
 // reasoned about from either, which is the same argument resolveConfig makes
-// about its layers.
+// about its layers. Neither having a hostname is an answer too -- the empty
+// one -- and the caller says so rather than substituting a guess.
 func routesFor(svc Service, overrides map[string][]routes.Entry) ([]routes.Entry, string) {
 	if entries := overrides[svc.Name]; len(entries) > 0 {
 		return entries, "--route"
 	}
 	// Entries without a host are dropped rather than fatal: one malformed row
 	// from a newer control plane must not take down every run against it. A
-	// service whose rows ALL drop falls through to the embedded table.
+	// service whose rows ALL drop is left with no hostname, and is handed over
+	// rather than routed.
 	if served := compactRoutes(svc.Routes); len(served) > 0 {
 		return served, "control plane"
-	}
-	if entries, ok := routes.For(svc.Name); ok {
-		return entries, "embedded table"
 	}
 	return nil, ""
 }

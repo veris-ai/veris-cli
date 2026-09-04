@@ -552,8 +552,10 @@ func runHostExposed(o localRun) error {
 	// serve's environment file already carries what its config hands over;
 	// the handoff is layered again from the sandbox's description so the
 	// run says what was handed, then -e last so the user's own value wins.
-	handed := handoffs(p.sandboxServices(), o.sources.Overrides, o.userEnv)
+	all := handoffs(p.sandboxServices(), o.sources.Overrides, nil)
+	handed := withoutUserVars(all, o.userEnv)
 	announceHandoffs(os.Stderr, handed)
+	announceSuppressed(os.Stderr, all, o.userEnv)
 	env := mergeEnv(os.Environ(), ht.childEnv(o.java))
 	env = mergeEnv(env, handedVars(handed))
 	env = mergeEnv(env, userEnvVars(o.userEnv))

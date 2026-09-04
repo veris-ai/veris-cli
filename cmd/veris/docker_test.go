@@ -12,6 +12,7 @@ import (
 
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 // The handoff for the twins the proxy does not route reaches the workload
@@ -19,7 +20,8 @@ import (
 // itself never carries a variable the user named.
 func TestTheHandoffReachesTheWorkloadBehindTheUsersOwnVariables(t *testing.T) {
 	services := []api.ServiceInfo{
-		{Name: "stripe", URL: "http://gw/s/sbx_1/stripe", ControlURL: "http://gw/s/sbx_1/stripe", EnvHint: "STRIPE_API_BASE"},
+		{Name: "stripe", URL: "http://gw/s/sbx_1/stripe", ControlURL: "http://gw/s/sbx_1/stripe",
+			EnvHint: "STRIPE_API_BASE", Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 		{Name: "postgres", URL: "postgresql://u:p@h:5432/db", EnvHint: "DATABASE_URL"},
 		{Name: "yente", URL: "http://gw/s/sbx_1/yente", ControlURL: "http://gw/s/sbx_1/yente", EnvHint: "YENTE_API_BASE"},
 		{Name: "nameless", URL: "http://gw/s/sbx_1/nameless"},
@@ -44,6 +46,16 @@ func TestTheHandoffReachesTheWorkloadBehindTheUsersOwnVariables(t *testing.T) {
 	announceHandoffs(&out, handed)
 	if out.String() != "veris: yente: not proxied; handed YENTE_API_BASE=http://gw/s/sbx_1/yente\n" {
 		t.Errorf("announced:\n%s", out.String())
+	}
+
+	// The twin whose variable the user set is announced too, and as what
+	// actually happened: the routing note printed earlier said postgres
+	// would be handed over, and it was not.
+	all := handoffs(services, nil, nil)
+	out.Reset()
+	announceSuppressed(&out, all, []string{"DATABASE_URL=postgresql://mine", "DEBUG"})
+	if out.String() != "veris: postgres: not proxied, and not handed over: $DATABASE_URL was set with -e\n" {
+		t.Errorf("suppressed:\n%s", out.String())
 	}
 }
 

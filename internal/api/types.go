@@ -74,8 +74,11 @@ type ServiceInfo struct {
 	// ControlURL is where /veris/* lives, always an http gateway path.
 	ControlURL string `json:"control_url"`
 	EnvHint    string `json:"env_hint"`
-	// Routes are the measured vendor hostnames this service answers for;
-	// nil when unmeasured, in which case the proxy's embedded table decides.
+	// Routes are the measured vendor hostnames this service answers for, and
+	// the only source of them the proxy has. Null when the control plane has
+	// none for it: the proxy then intercepts nothing for this service and
+	// hands its URL to the command under EnvHint instead -- or, with no hint
+	// to hand it under, reports it as out of reach.
 	Routes []routes.Entry `json:"routes"`
 }
 

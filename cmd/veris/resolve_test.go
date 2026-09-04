@@ -42,8 +42,11 @@ func cacheSandbox(t *testing.T, id string, services ...string) {
 		FetchedAt: time.Now().UTC(),
 	}
 	for _, name := range services {
+		// The hostname comes with the sandbox, as the control plane serves it:
+		// there is no other source for the derived config to find one in.
 		snapshot.Services = append(snapshot.Services, discovery.Service{
 			Name: name, URL: "http://sandbox.test/s/" + id + "/" + name, Status: "ready",
+			Routes: []routes.Entry{{Host: "api." + name + ".example"}},
 		})
 	}
 	body, err := json.MarshalIndent(snapshot, "", "  ")

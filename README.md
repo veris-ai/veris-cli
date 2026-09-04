@@ -380,8 +380,9 @@ the project file is worth setting.
 
 `run` exits with the command's own status, or 3 if a requirement went unmet,
 or 4 if the outcome is indeterminate. `--strict` blocks unmapped hosts (see
-below). `--route service=host[/prefix]` replaces one service's derived routes
-for this run.
+below). `--route service=host[/prefix]`, for this run, replaces the routes the
+control plane served for one service or supplies a hostname it served none
+for.
 
 ### Receiving webhooks
 
@@ -439,7 +440,10 @@ instance that no client calls over the internet, so no vendor hostname is
 measured for it. Interception would be the wrong tool anyway: client code
 already reads its database DSN or base URL from an environment variable in
 production, so configuration through the environment IS the code path that
-ships.
+ships. Since the control plane is now the only source of vendor hostnames
+([where they come from](#where-the-hostnames-come-from)), a twin it serves
+none for lands here too — that one is not by design, and `veris doctor` names
+it on its vendor-hostnames line.
 
 `run` hands each such service's URL to your command under the exact variable
 the platform names for it (its `env_hint` — `DATABASE_URL` for Postgres,
@@ -499,14 +503,16 @@ identical.
 `veris doctor [--env NAME]` is the one screen that answers "why is my first
 run failing". Every check is one line — `✓` passed, `!` worth knowing, `✗`
 will fail a run — ordered the way a run depends on them: the binary, the
-login, the plane, the gateway, docker, the project file, the environment, the
-sandbox. Nothing is changed; the `→` lines name the command that would.
+login, the plane, the gateway, the vendor hostnames it serves, docker, the
+project file, the environment, the sandbox. Nothing is changed; the `→` lines
+name the command that would.
 
 ```
 $ veris doctor
 ✓ veris v0.9.0 (darwin/arm64)
 ✓ Logged in: Acme via profile 'default' (vsk_mi4pa0uo…)
 ✓ Control plane https://svc.api.veris.ai reachable (status ok)
+✓ Vendor hostnames served for 30 of 32 catalog twins; none for postgres, yente (not intercepted; handed to the command instead)
 ! docker not on PATH — host tier works; --image (container tier) will not
 ✓ Project file /Users/victor/src/checkout-svc/.veris/twin.yaml (2 environments, default 'dev')
 ✓ Environment dev (k3j2v0d8…) reachable; services: stripe, postgres
@@ -601,10 +607,11 @@ An unresolved service upstream is derived as
 ### Where the hostnames come from
 
 You do not have to write the `hosts` and `paths` above. They come from the
-control plane when it serves routes, else from a table **generated** from each
-service's measured backend — the host the simulation was actually driven
-against — embedded in the binary at release, and drift-tested against those
-backends.
+control plane, with every sandbox and from `GET /v1/services`, and from
+nowhere else. They are **generated** there from each service's measured
+backend — the host the simulation was actually driven against — so a service
+added to the platform is routable the day it lands, with no release of this
+binary.
 
 That matters because the facts are not guessable. A hand-written table put
 Google's `/tokeninfo` on `www.googleapis.com`; the measured record puts it on
@@ -612,6 +619,16 @@ Google's `/tokeninfo` on `www.googleapis.com`; the measured record puts it on
 introspection would have been routed at a service that does not answer there.
 Google's identity surface alone spans four hostnames, and three Google services
 share a fourth.
+
+The binary keeps no copy of the hostnames. A second copy is a second chance to
+be wrong, and one that had gone stale would reroute traffic silently. A
+service the control plane serves no hostname for is therefore not intercepted
+at all: its URL is handed to your command under its `env_hint`, the same
+handoff a Postgres DSN gets, and the run says so per service. A service with
+no `env_hint` either is reported as out of reach instead. `veris doctor` names
+every catalog twin the plane serves no hostname for — `postgres` and `yente`
+are that by design, anything else there is a measurement that has not landed —
+and `--route <service>=<host>[/prefix]` supplies one for a single run.
 
 ## Two design decisions worth knowing
 
@@ -798,9 +815,6 @@ race detector and every cross-build on any PR.
 
 Releasing: tag `vX.Y.Z`; the release workflow attaches the `make dist` binaries,
 which is where the installer downloads from.
-
-`internal/routes/vendor_routes.json` is generated from measured vendor
-backends — never edit it by hand.
 
 ## Licence
 

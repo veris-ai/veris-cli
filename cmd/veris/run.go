@@ -503,6 +503,7 @@ func runLocal(o localRun) error {
 	// entries, minus any the command line set itself.
 	handed := withoutUserVars(cfg.PassEnv, o.userEnv)
 	announceHandoffs(os.Stderr, handed)
+	announceSuppressed(os.Stderr, cfg.PassEnv, o.userEnv)
 	status, runErr := supervise(running, cfg, authority, o.argv, o.java, handed, o.userEnv)
 	finished := time.Now()
 	// The child is gone; what is left is the after-read and, for a --fresh
@@ -624,8 +625,10 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 	// from here, where the sandbox's description is known, so a runner image
 	// need not be current for the handoff to happen; a -e of the user's is
 	// their explicit answer and is left alone.
-	spec.Handoff = handoffs(p.sandboxServices(), nil, spec.EnvVars)
+	all := handoffs(p.sandboxServices(), nil, nil)
+	spec.Handoff = withoutUserVars(all, spec.EnvVars)
 	announceHandoffs(os.Stderr, spec.Handoff)
+	announceSuppressed(os.Stderr, all, spec.EnvVars)
 	// The container run judges on the engine alone what the ledger will not
 	// judge; the rest is judged once, below, with the engine's count merged.
 	reqs := spec.Requirements
@@ -742,6 +745,26 @@ func userEnvVars(userEnv []string) []trust.Var {
 func announceHandoffs(w io.Writer, handed []config.PassEnvVar) {
 	for _, h := range handed {
 		fmt.Fprintf(w, "veris: %s: not proxied; handed %s=%s\n", h.Service, h.Name, h.Value)
+	}
+}
+
+// announceSuppressed names each twin whose URL was NOT handed over, because
+// the command line set the same variable with -e:
+//
+//	veris: stripe: not proxied, and not handed over: $STRIPE_API_BASE was set with -e
+//
+// The -e wins deliberately -- it is the user's explicit answer -- but the
+// routing note printed earlier says the twin is "handed to the command as
+// $NAME", and without this line that promise would be the only thing said
+// about a twin whose traffic is now going wherever the user's own value
+// points.
+func announceSuppressed(w io.Writer, all []config.PassEnvVar, userEnv []string) {
+	set := userSetVars(userEnv)
+	for _, h := range all {
+		if set[h.Name] {
+			fmt.Fprintf(w, "veris: %s: not proxied, and not handed over: $%s was set with -e\n",
+				h.Service, h.Name)
+		}
 	}
 }
 

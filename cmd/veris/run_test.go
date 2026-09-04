@@ -1061,7 +1061,8 @@ func newRunPlane(t *testing.T, id string) *runPlane {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": id, "environment_id": devID, "status": "ready",
-			"services": []map[string]any{{"name": "stripe", "url": "http://sandbox.test/s/" + id + "/stripe", "status": "ready"}},
+			"services": []map[string]any{{"name": "stripe", "url": "http://sandbox.test/s/" + id + "/stripe",
+				"status": "ready", "routes": []map[string]any{{"host": "api.stripe.com"}}}},
 		})
 	}))
 	t.Cleanup(p.srv.Close)
