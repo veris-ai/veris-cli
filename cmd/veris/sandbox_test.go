@@ -53,6 +53,19 @@ func runSandboxCLI(t *testing.T, args ...string) (code int, stdout, stderr strin
 	return exitStatusTo(&errOut, err), out.String(), errOut.String()
 }
 
+// runSandboxCLITTY is runSandboxCLI with a terminal and answers for the
+// prompts one brings out.
+func runSandboxCLITTY(t *testing.T, input string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	in, hook := stdin, newSessionHook
+	stdin = strings.NewReader(input)
+	newSessionHook = func(s *session) { s.ui.TTY = true }
+	t.Cleanup(func() { stdin, newSessionHook = in, hook })
+	var out, errOut bytes.Buffer
+	err := cli.Execute(root(), &cli.Globals{}, args, &out, &errOut)
+	return exitStatusTo(&errOut, err), out.String(), errOut.String()
+}
+
 // sbInOrder asserts that every want appears in got, each after the previous.
 func sbInOrder(t *testing.T, got string, want ...string) {
 	t.Helper()

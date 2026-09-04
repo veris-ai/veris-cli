@@ -272,6 +272,11 @@ the reason; one still on its way at the deadline is exit 4 and kept, since it
 may yet come up, and `veris status` says. A folder already pointing at a
 sandbox is warned that the old one keeps running until its TTL.
 
+A twin verb that takes a name — `sandbox services get`, `sandbox services
+manual` — can be typed without one. A sandbox holding a single twin uses it,
+a terminal is asked which, and anything else is told the names the sandbox
+actually has, written out as the commands to run.
+
 `status` (and `sandbox get --id ID`) prints the sandbox's state, boot source
 and expiry, then every twin with its status, env hint, URL and table counts.
 `sandbox list [--env NAME | --all]` lists the in-use environment's sandboxes,

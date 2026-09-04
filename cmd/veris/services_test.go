@@ -509,9 +509,65 @@ func TestSandboxServicesGet(t *testing.T) {
 			"→ Next: veris sandbox services list\n")
 	})
 
-	t.Run("no NAME", func(t *testing.T) {
+	// Off a terminal, a verb with no NAME is told which twins the sandbox
+	// has -- as the commands themselves, so the fix can be run rather than
+	// read and retyped.
+	t.Run("no NAME lists the twins as commands", func(t *testing.T) {
 		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "get")
-		if code != 1 || !strings.Contains(stderr, "veris: sandbox services get needs a twin NAME") {
+		if code != 1 {
+			t.Errorf("exit %d, want 1:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr,
+			"\u2717 sandbox services get needs the twin's name. Sandbox "+sbID+" has 2:\n",
+			"\u2192 Next: veris sandbox services get stripe\n",
+			"\u2192 Next: veris sandbox services get postgres\n")
+	})
+
+	// The --id that named the sandbox rides along, so a printed line means
+	// the same sandbox when it is run.
+	t.Run("no NAME keeps the --id it was given", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "get", "--id", sbID)
+		if code != 1 {
+			t.Errorf("exit %d, want 1:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "\u2192 Next: veris sandbox services get stripe --id "+sbID+"\n")
+	})
+
+	// A near miss is one line away from right, so the corrected command is
+	// what the refusal offers.
+	t.Run("a near miss is corrected", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "get", "STRIPE")
+		if code != 1 {
+			t.Errorf("exit %d, want 1:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "\u2192 Next: veris sandbox services get stripe\n")
+	})
+
+	// A sandbox with one twin has already answered "which twin?", so it is
+	// not asked -- but the answer is said out loud, since the reader never
+	// typed it.
+	t.Run("a sandbox with one twin needs no NAME", func(t *testing.T) {
+		only := newSandboxPlane(t)
+		twins := newDataTwins(t)
+		dataBench(t, only, twins.services()[:1])
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "get")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "sandbox services get of stripe, the sandbox's only twin\n")
+	})
+
+	t.Run("a terminal is asked which twin", func(t *testing.T) {
+		code, _, stderr := runSandboxCLITTY(t, "2\n", "sandbox", "services", "get")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "? Which twin?", "1) stripe", "2) postgres")
+	})
+
+	t.Run("two NAMEs is a usage error", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "get", "stripe", "postgres")
+		if code != 1 || !strings.Contains(stderr, `sandbox services get takes one twin name (got "stripe postgres")`) {
 			t.Errorf("exit %d:\n%s", code, stderr)
 		}
 	})
