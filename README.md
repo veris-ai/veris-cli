@@ -868,21 +868,6 @@ certificate hashes after chain validation (OkHttp `CertificatePinner`, curl
 `--pinnedpubkey`, aiohttp `fingerprint=`). No added root can satisfy that;
 it is a boundary, not a configuration problem.
 
-## Coming next
-
-Not in this binary yet; each is reachable meanwhile with `curl` against the
-`/veris/*` URLs that `status` prints:
-
-- `sandbox data add|schema|get` — rows of your own, validated by each twin,
-  and the shape they take. `up` already adds the environment's `data:` files.
-- `sandbox services list|get|manual` — a twin's testing notes and tables.
-- `sandbox trace` — the sandbox's own request ledger, the receipt from the
-  other side.
-- `run --fresh` — `up`, add, `run`, `down` in one process, for CI.
-- `snapshot create|list|get|delete` and `baseline get|promote|set|clear` —
-  capture a sandbox's state and pin what every later `up` boots. `up --boot
-  baseline|snapshot` already boots one that exists.
-
 ## Development
 
 ```sh
