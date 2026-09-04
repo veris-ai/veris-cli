@@ -118,6 +118,15 @@ const pgSchemaJSON = `{"tables": {"public.users": {"columns": [
   {"name": "email", "type": "text", "nullable": true}
 ]}}}`
 
+// undeletable is router.py's remove_data refusals, word for word: the
+// tables a twin will not delete, each naming what to do instead.
+var undeletable = map[string]string{
+	"clock":             "clock: the clock is a singleton and cannot be deleted; reset it with PATCH (mode=live, offset_seconds=0)",
+	"client":            "client: the client registration is a singleton and cannot be deleted; PATCH default_base_url to null to unregister",
+	"auth":              "auth: the auth mode is a singleton and cannot be deleted; PATCH mode to 'permissive' to stop checking credential values",
+	"delivery_attempts": "delivery_attempts: the attempt log is append-only and cannot be deleted",
+}
+
 const stripeManual = "# stripe\n\nCredentials  Any sk_test_ key works.\n\n```\ncurl -X POST $STRIPE_API_BASE/v1/customers\n```\n\n## Faults\nA faults row with error.status 402 makes the next matching request fail.\n"
 
 // dataTwins serves /veris/* for the HTTP twins (stripe, and zendesk when a
@@ -135,9 +144,17 @@ type dataTwins struct {
 	rows      map[string][]map[string]any // rows per table, newest first
 	addStatus int                         // POST /veris/data status (0 → 200)
 	adds      []string                    // twins that received a POST /veris/data, in order
+	edits     []dataEdit                  // every PATCH and DELETE /veris/data, in order
 	queries   []string                    // raw query of every GET /veris/data with an entity_type
 	seeds     []string                    // schema_sql of every POST /veris/seed
 	pgData404 bool                        // postgres GET /veris/data is FastAPI's 404 rather than the singletons
+}
+
+// dataEdit is one PATCH or DELETE of /veris/data as the twin received it.
+type dataEdit struct {
+	twin   string
+	method string
+	data   map[string]any
 }
 
 func newDataTwins(t *testing.T) *dataTwins {
@@ -227,6 +244,40 @@ func newDataTwins(t *testing.T) *dataTwins {
 			}
 			f.version++
 			sbJSON(w, 200, map[string]any{"added": added, "warnings": []string{}})
+		case http.MethodPatch, http.MethodDelete:
+			var body struct {
+				Data map[string]any `json:"data"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.edits = append(f.edits, dataEdit{twin: r.PathValue("twin"), method: r.Method, data: body.Data})
+			// router.py refuses to delete the singletons, each with the
+			// message that says what to do instead; the CLI must carry
+			// those through untouched.
+			if r.Method == http.MethodDelete {
+				for table, refusal := range undeletable {
+					if _, ok := body.Data[table]; ok {
+						sbJSON(w, 422, map[string]any{"detail": []string{refusal}})
+						return
+					}
+				}
+			}
+			counts := map[string]int{}
+			for table, rows := range body.Data {
+				list, ok := rows.([]any)
+				if !ok {
+					continue
+				}
+				counts[table] = len(list)
+				if r.Method == http.MethodDelete {
+					f.counts[table] -= len(list)
+				}
+			}
+			f.version++
+			key := "updated"
+			if r.Method == http.MethodDelete {
+				key = "deleted"
+			}
+			sbJSON(w, 200, map[string]any{key: counts})
 		default:
 			sbJSON(w, 405, map[string]string{"detail": "Method Not Allowed"})
 		}
@@ -260,6 +311,12 @@ func (f *dataTwins) addedTo() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.adds...)
+}
+
+func (f *dataTwins) edited() []dataEdit {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]dataEdit(nil), f.edits...)
 }
 
 func (f *dataTwins) rowQueries() []string {

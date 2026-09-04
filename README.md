@@ -87,7 +87,7 @@ The name and service list go to the server; everything else goes to
 environment of a project is its default.
 
 ```
-$ veris env create checkout-svc --services stripe,postgres --ttl 240 --command 'pytest -q'
+$ veris env create checkout-svc --services stripe,postgres --ttl 60 --command 'pytest -q'
 ✓ Environment created: 4h8k2m6n0p3r7t1v5x9z2b4d6 (checkout-svc: stripe, postgres)
 ✓ Added 'checkout-svc' to .veris/twin.yaml as the default
 ✓ Added .veris/twin.local.yaml to .gitignore (per-machine; holds sandbox ids)
@@ -102,7 +102,7 @@ service carries:
 
 ```
 $ veris up
-Starting 'checkout-svc' (checkout-svc: stripe, postgres) · boot bundle · ttl 240 min
+Starting 'checkout-svc' (checkout-svc: stripe, postgres) · boot bundle · ttl 60 min
 ✓ Sandbox created: 7hqz4m2n9c1v5x8b3k6t0r2p4
   ✓ postgres  ready  (data plane; handed to the app, not proxied)
   ✓ stripe    routable  218 ms
@@ -194,7 +194,7 @@ default: dev                        # used when nothing else names one
 environments:
   dev:
     id: k3j2v0d8p1q7x9r2m5n8b4c6a   # the server environment: stripe, postgres
-    ttl_minutes: 240
+    ttl_minutes: 60                 # optional; without it the control plane's default
     boot: bundle                    # bundle | baseline | snapshot
     data:                           # rows of your own, added by up after boot
       - data/dev-customers.json
@@ -216,10 +216,14 @@ environments:
       command: [pytest, -q, tests/integration]
 ```
 
-`env create` writes `id`, `ttl_minutes`, `boot`, `snapshot`, `data` and
-`run.command`, and the `proxy:` block from `--image`, `--require-service`,
-`--require-callback`, `--expose` and `--strict` (`env create --help` shows
-the block each writes). No secrets and no sandbox ids go in this file.
+`env create` writes `id`, `ttl_minutes` (only when one was given), `boot`,
+`snapshot`, `data` and `run.command`, and the `proxy:` block from `--image`,
+`--require-service`, `--require-callback`, `--expose` and `--strict` (`env
+create --help` shows the block each writes). No secrets and no sandbox ids go
+in this file. The TTL's default, minimum and maximum are the control plane's,
+not the CLI's: an environment with no `ttl_minutes` takes whatever it hands
+out, and a number it will not accept is refused by it, with the bounds named
+in the refusal.
 
 Which environment is in use, most explicit first: `--env NAME|ID` →
 `VERIS_ENV` → `use:` in `.veris/twin.local.yaml` → `default:` in the nearest
@@ -235,7 +239,7 @@ both stages, and an ambiguous name or prefix lists the candidates.
 
 | Command | Does |
 |---|---|
-| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block; off a TTY, no `--data` means no data files. |
+| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block; off a TTY, no `--data` means no data files and no `--ttl` means no `ttl_minutes` is recorded. |
 | `env list` | Two blocks: configured (this project's, `★` default, `●` in use here) and available (every server environment the key can see, which config points at it, live sandboxes). |
 | `env get [NAME\|ID]` | The resolved settings, where each came from, and the server record. |
 | `env use [NAME\|ID] [--global]` | Choose for this folder, or the profile. A picker on a TTY when NAME is omitted. |
@@ -251,7 +255,8 @@ set of verbs for a sandbox named by `--id`.
 
 `up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot
 ID|NAME] [--callback-url URL] [--timeout 300s]` takes each setting from the
-flag, then the environment config, then the defaults (ttl 120, boot bundle).
+flag, then the environment config, then the defaults (boot bundle, and no TTL
+of its own: a sandbox nobody gave one lives as long as the control plane says).
 It writes the sandbox id to `.veris/twin.local.yaml` (0600, gitignored) as soon
 as the control plane answers, then waits in two stages: until the sandbox is
 `ready`, and then until every twin's `/veris/health` answers through the

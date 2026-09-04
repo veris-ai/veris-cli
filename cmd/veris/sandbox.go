@@ -34,9 +34,12 @@ const (
 )
 
 const (
-	// defaultTTLMinutes is a sandbox's lifetime when neither the flag nor
-	// the environment config says.
-	defaultTTLMinutes = 120
+	// No default TTL lives here. When neither the flag nor the config says,
+	// the request omits ttl_minutes and the control plane applies its own
+	// default -- the same reasoning as the vendor hostnames: a number the
+	// server owns, kept in one place, so a change there needs no release
+	// here. Its bounds are the server's too, and its refusal names them.
+
 	// defaultUpTimeout is up's whole budget for ready plus routable.
 	defaultUpTimeout = "300s"
 )
@@ -220,12 +223,13 @@ func upCommand() *cli.Command {
 			"remembers its id for this folder at once, waits until the control plane reports it ready and\n" +
 			"every twin answers through the gateway, adds the environment config's data files, and prints\n" +
 			"the env-var hints the code under test needs. Settings come from the flag, then the environment\n" +
-			"config, then the defaults (ttl 120, boot bundle). --watch shows the wait as a live panel of the\n" +
-			"sandbox and its twins on a terminal, redrawn every 2 s until every twin is routable.",
+			"config, then the defaults: boot bundle, and no TTL of its own -- a sandbox nobody gave one\n" +
+			"lives as long as the control plane's own default. --watch shows the wait as a live panel of\n" +
+			"the sandbox and its twins on a terminal, redrawn every 2 s until every twin is routable.",
 		Flags: func(fs *flag.FlagSet) {
 			fs.BoolVar(&o.watch, "watch", false, "show the wait as a live panel (terminal only)")
 			fs.StringVar(&o.env, "env", "", "environment name or id (same as NAME)")
-			fs.IntVar(&o.ttl, "ttl", 0, "sandbox lifetime in minutes (config, then 120)")
+			fs.IntVar(&o.ttl, "ttl", 0, "sandbox lifetime in minutes (config, then the control plane's default)")
 			fs.StringVar(&o.boot, "boot", "", "what the sandbox boots: bundle, baseline or snapshot (config, then bundle)")
 			fs.StringVar(&o.snapshot, "snapshot", "", "snapshot id or name, for --boot snapshot")
 			fs.StringVar(&o.callbackURL, "callback-url", "", "where the twins deliver callbacks (config)")
@@ -318,7 +322,10 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 		return s, nil, s.fail("read", "environment "+envID, err)
 	}
 
-	req := api.CreateSandboxRequest{TTLMinutes: &ttl, Metadata: map[string]string{"project": upProjectName(s, envName)}}
+	req := api.CreateSandboxRequest{Metadata: map[string]string{"project": upProjectName(s, envName)}}
+	if ttl > 0 {
+		req.TTLMinutes = &ttl
+	}
 	bootLabel := bootBundle
 	switch boot {
 	case bootBundle:
@@ -353,8 +360,14 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 	if serverName == "" {
 		serverName = shortID(env.ID)
 	}
-	s.ui.Info("Starting '%s' (%s: %s) · boot %s · ttl %d min",
-		envName, serverName, strings.Join(env.Services, ", "), bootLabel, ttl)
+	// Nothing asked for a TTL, so nothing here knows one: the request omits
+	// it and the sandbox lives as long as the control plane says.
+	life := "ttl from the control plane"
+	if ttl > 0 {
+		life = fmt.Sprintf("ttl %d min", ttl)
+	}
+	s.ui.Info("Starting '%s' (%s: %s) · boot %s · %s",
+		envName, serverName, strings.Join(env.Services, ", "), bootLabel, life)
 	// The pointer is about to be replaced: a sandbox it still names keeps
 	// running until its TTL and is reachable afterwards only by id, so the
 	// orphan is announced with the command that deletes it.
@@ -431,9 +444,6 @@ func upSettings(o upOptions, conf *cfg.EnvConfig) (ttl int, boot, snapshot, call
 		if callback == "" {
 			callback = conf.CallbackURL
 		}
-	}
-	if ttl == 0 {
-		ttl = defaultTTLMinutes
 	}
 	if boot == "" {
 		switch {

@@ -91,7 +91,7 @@ type createFlags struct {
 func (f *createFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.services, "services", "", "comma-separated service `names` from the catalog")
 	fs.StringVar(&f.from, "from", "", "adopt the existing server environment with this `id` instead of creating one")
-	fs.IntVar(&f.ttl, "ttl", 0, "sandbox TTL in `minutes` (default 240)")
+	fs.IntVar(&f.ttl, "ttl", 0, "sandbox TTL in `minutes`, recorded in the config (left out: the control plane's own default)")
 	fs.StringVar(&f.boot, "boot", "", "the `source` a sandbox boots from: bundle, baseline or snapshot")
 	fs.StringVar(&f.snapshot, "snapshot", "", "the snapshot `id` or name a sandbox boots, with --boot snapshot")
 	fs.Var(&f.data, "data", "data `file` to add after boot (repeatable or comma-separated; none unless given)")
@@ -115,9 +115,10 @@ func envCreateCommand() *cli.Command {
 --from adopts an existing server environment by id. TTL, boot choice, data
 files and test command go to the named config in .veris/twin.yaml, which is
 created when the folder has none. On a TTY every answer left out is asked
-for; off a TTY the name, --services (or --from), --ttl, --boot and --command
-must be flags, and no --data means no data files. The first environment of
-a project is its default.
+for; off a TTY the name, --services (or --from), --boot and --command must
+be flags, no --data means no data files, and no --ttl means none is
+recorded, so the control plane's own default applies. The first environment
+of a project is its default.
 
 The proxy flags are never asked for. They land in the config's proxy: block,
 which fills in whatever a veris run command line leaves out:
@@ -312,18 +313,26 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 		}
 	}
 
+	// Asked for once, on a TTY only, and blank is an answer: nothing is
+	// recorded and every sandbox of this environment takes the TTL the
+	// control plane hands out. The CLI keeps no default of its own, because
+	// the bounds are the server's and it is the server's refusal that names
+	// them -- a number suggested here was how a config came to hold 240,
+	// which is over the maximum, and every later up was refused.
 	ttl := f.ttl
-	for ttl == 0 {
-		ans, err := s.ui.Input("Sandbox TTL in minutes", "240", "--ttl")
+	if ttl == 0 && s.ui.TTY {
+		ans, err := s.ui.Input("Sandbox TTL in minutes (blank for the control plane's default)", "", "--ttl")
 		if err != nil {
 			return err
 		}
-		n, perr := strconv.Atoi(strings.TrimSpace(ans))
-		if perr != nil || n <= 0 {
-			s.ui.Warn("'%s' is not a number of minutes", ans)
-			continue
+		if ans = strings.TrimSpace(ans); ans != "" {
+			n, perr := strconv.Atoi(ans)
+			if perr != nil || n <= 0 {
+				s.ui.Warn("'%s' is not a number of minutes; recording none (the control plane's default applies)", ans)
+			} else {
+				ttl = n
+			}
 		}
-		ttl = n
 	}
 
 	boot := f.boot
@@ -1096,7 +1105,10 @@ func runEnvGet(ctx *cli.Context, args []string) error {
 			}
 			return "default"
 		}
-		ttl := "120 min"
+		// A config with no ttl_minutes is a dash, as every other unset
+		// setting is: the number that applies is the control plane's, and
+		// naming one here would be inventing it.
+		ttl := "—"
 		if conf.TTLMinutes > 0 {
 			ttl = fmt.Sprintf("%d min", conf.TTLMinutes)
 		}
