@@ -566,16 +566,18 @@ func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
 			shutErr)
 	}
 
-	// A failing command is the command's own verdict and keeps its exit code: a
-	// harness reading it should see what it always saw. Unmet outranks
-	// indeterminate: a requirement the ledger refuted is a finding, whatever
-	// else it could not decide.
+	// An unmet requirement outranks everything, the command's own failure
+	// included: a suite that crashed before it reached the sandbox proved
+	// nothing about the integration, and 3 says so where the child's code
+	// would read as an ordinary red test. Otherwise a failing command keeps
+	// its exit code, so a harness sees what it always saw, and only a clean
+	// run is downgraded to indeterminate.
 	code := 0
 	switch {
-	case status != 0:
-		code = status
 	case fatal || v.Fatal:
 		code = exitRequirementUnmet
+	case status != 0:
+		code = status
 	case readErr != nil || shutErr != nil || v.Indeterminate:
 		code = exitIndeterminate
 	}
@@ -612,11 +614,13 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 		return err
 	}
 	l, v := p.finish(bg, os.Stderr, nil, spec.Requirements, callbackReqs, fresh, quiet)
+	// Same ranking as the host tier: unmet first, then the command's own
+	// code, then indeterminate.
 	code := int(status)
 	switch {
-	case code != 0:
 	case v.Fatal:
 		code = exitRequirementUnmet
+	case code != 0:
 	case v.Indeterminate:
 		code = exitIndeterminate
 	}

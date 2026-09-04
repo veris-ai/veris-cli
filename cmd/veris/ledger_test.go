@@ -603,6 +603,21 @@ func TestRunRequireServiceUnmetOnTheLedgerExitsThree(t *testing.T) {
 	)
 }
 
+// A suite that crashed before it reached the sandbox is exit 3, not its
+// own code: "never touched the sandbox" is the verdict that matters,
+// whatever the runner reported, and a harness reading 7 would go looking
+// for a test bug instead of a wiring one.
+func TestRunRequireUnmetOutranksAFailingChild(t *testing.T) {
+	_, _, twins := ledgerBench(t)
+	twins.script(func(f *ledgerTwins) { f.record = false })
+	argv := child(t, "fail")
+	err, stderr := runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
+	wantExit(t, err, exitRequirementUnmet)
+	if !strings.Contains(stderr, "veris: ✗ the run required service stripe at least 1 time(s) but the sandbox received it 0 time(s)\n") {
+		t.Errorf("stderr lacks the unmet line:\n%s", stderr)
+	}
+}
+
 // A sandbox that mixes a logged twin with one that keeps no log: a
 // requirement on the unlogged twin, which the child did call, is the
 // engine's verdict alone, and the two ledgers are compared over the twins
@@ -859,9 +874,12 @@ func TestRunFreshLifecycle(t *testing.T) {
 			t.Errorf("deleted %v", got)
 		}
 	})
-	t.Run("a failing child keeps its status and the sandbox still goes", func(t *testing.T) {
+	t.Run("a failing child that never reached the sandbox is exit 3 and the sandbox still goes", func(t *testing.T) {
+		// The child's own 7 is outranked: a fresh run's default requirement
+		// (a non-empty ledger) is unmet, and that verdict is the one a
+		// harness needs.
 		_, plane, _, err, stderr := fresh(t, nil, "fail")
-		wantExit(t, err, 7)
+		wantExit(t, err, exitRequirementUnmet)
 		if got := plane.deletedIDs(); len(got) != 1 {
 			t.Errorf("deleted %v", got)
 		}
