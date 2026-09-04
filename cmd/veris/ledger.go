@@ -572,7 +572,7 @@ type assertion struct {
 // ledger, mirroring the engine's rule for a sandbox it deployed. A nil
 // ledger (never read) makes every assertion indeterminate. The engine's
 // side of a service requirement is merged in afterwards by vouch.
-func assertLedger(l *ledger, marks []twinMark, reqs, callbackReqs []requirement, freshDefault bool) []assertion {
+func assertLedger(l *ledger, marks []twinMark, reqs, callbackReqs []requirement, freshDefault bool, childExit int) []assertion {
 	var out []assertion
 	unreadable := l == nil || len(l.Unreadable) > 0
 	for _, req := range reqs {
@@ -601,7 +601,7 @@ func assertLedger(l *ledger, marks []twinMark, reqs, callbackReqs []requirement,
 		if !a.OK {
 			// Kept on an indeterminate one too: vouch may turn it into a
 			// refusal, and the hint belongs under that line.
-			a.hint = serviceHint(marks, req.name, a.Got)
+			a.hint = serviceHint(marks, req.name, a.Got, childExit)
 		}
 		if a.OK && a.NotProxied {
 			// The engine never sees this twin's traffic, so the sandbox
@@ -721,12 +721,22 @@ func twinUnreadable(l *ledger, name string) bool {
 	return false
 }
 
-// serviceHint is the line under an unmet service requirement: the doc's
-// "your tests never touched the sandbox", naming the env hint the code under
-// test reads its base URL from when the sandbox knows it.
-func serviceHint(marks []twinMark, name string, got int64) string {
+// serviceHint is the line under an unmet service requirement, ordered by
+// what the run already knows rather than by what is most often true.
+//
+// childExit is the command's own exit code. When it is not zero, that comes
+// first: a suite that died before it called the vendor explains an empty
+// count by itself, and the base-URL question below would send the reader at
+// the one change every skill forbids -- measured, on a run whose real cause
+// was "No module named pytest" three lines above. Only a command that
+// succeeded and still sent nothing is evidence of a base URL pointed
+// somewhere else, and only then is the env hint worth naming.
+func serviceHint(marks []twinMark, name string, got int64, childExit int) string {
 	if got > 0 {
 		return "fewer requests reached the sandbox than the run required"
+	}
+	if childExit != 0 {
+		return fmt.Sprintf("the command exited %d: read its own output first, since a command that failed before calling %s proves nothing about the wiring", childExit, name)
 	}
 	for _, m := range marks {
 		if m.name == name && m.envHint != "" {
@@ -749,7 +759,8 @@ type verdict struct {
 // printVerdict reports the assertions and the two-ledger comparison:
 //
 //	veris: ✗ the run required service stripe at least 1 time(s) but the sandbox received it 0 time(s)
-//	            — your tests never touched the sandbox (is STRIPE_API_BASE overridden in your test setup?)
+//	            — the command exited 1: read its own output first, since a command
+//	              that failed before calling stripe proves nothing about the wiring
 //	veris: ✓ required stripe ≥1: saw 7   ✓ required yente ≥1: saw 4 (sandbox ledger; not proxied)   ✓ ledgers agree (7 = 7)
 //
 // engine is nil when the engine's receipt is not available numerically (it
@@ -850,14 +861,14 @@ func (a assertion) met() string {
 // (vouch). It is called after the engine's own receipt and unmet lines, so
 // the two sides read in the doc's order.
 func (p *proof) finish(ctx context.Context, w io.Writer, engine *proxy.Receipt,
-	reqs, callbackReqs []requirement, freshDefault, quiet bool,
+	reqs, callbackReqs []requirement, freshDefault, quiet bool, childExit int,
 ) (*ledger, verdict) {
 	if p == nil || p.none {
 		return nil, verdict{}
 	}
 	if p.readErr != nil {
 		fmt.Fprintf(w, "veris: ! the sandbox ledger could not be read (%v)\n", p.readErr)
-		assertions := assertLedger(nil, nil, reqs, callbackReqs, freshDefault)
+		assertions := assertLedger(nil, nil, reqs, callbackReqs, freshDefault, childExit)
 		vouch(assertions, engine)
 		return nil, printVerdict(w, nil, assertions, engine, quiet)
 	}
@@ -869,7 +880,7 @@ func (p *proof) finish(ctx context.Context, w io.Writer, engine *proxy.Receipt,
 			fmt.Fprintf(w, "veris: ! the sandbox ledger could not be read (%s)\n", u)
 		}
 	}
-	assertions := assertLedger(l, p.marks, reqs, callbackReqs, freshDefault)
+	assertions := assertLedger(l, p.marks, reqs, callbackReqs, freshDefault, childExit)
 	vouch(assertions, engine)
 	if !freshDefault && len(assertions) == 0 && l.total() == 0 && l.complete() && !quiet {
 		fmt.Fprintln(w, "veris: ! the sandbox recorded no service request since the watermark")
