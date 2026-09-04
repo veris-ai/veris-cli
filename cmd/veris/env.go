@@ -290,12 +290,18 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	// the names that exist rather than with the server's 400.
 	var env *api.Environment
 	var services []string
+	// Read whichever branch runs: --from needs it only to say which issuers
+	// the adopted environment brings along, so a plane that cannot list is
+	// not allowed to fail an adoption -- it costs a note, not the command.
+	catalog, err := c.ListServices(bg)
 	if f.from != "" {
+		if err != nil {
+			s.ui.Warn("could not list services: %v", err)
+		}
 		if env, err = c.GetEnvironment(bg, f.from); err != nil {
 			return s.fail("adopt", "environment "+f.from, err)
 		}
 	} else {
-		catalog, err := c.ListServices(bg)
 		if err != nil {
 			return s.fail("list", "services", err)
 		}
@@ -410,7 +416,8 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	}
 	ensureIgnored(s, proj)
 
-	svcs := strings.Join(env.Services, ", ")
+	announceAdded(s, env.Services, catalog)
+	svcs := withAdded(env.Services, catalog)
 	if adopted {
 		s.ui.Success("Adopted existing environment %s (%s) as '%s'", shortID(env.ID), serverLabel(env), name)
 	} else {
@@ -462,6 +469,16 @@ func serviceOptions(catalog []api.CatalogService) []ui.Option {
 		}
 		if svc.Description != "" {
 			detail = svc.Description + "  " + detail
+		}
+		// Which of these two a service carries decides how it reads in the
+		// list: one that brings an issuer along, or an issuer that arrives on
+		// its own with several. Without the note an issuer looks like a peer
+		// nobody picked, and then turns up in the sandbox anyway.
+		switch {
+		case len(svc.Requires) > 0:
+			detail += "  (+ " + strings.Join(svc.Requires, ", ") + ", added automatically)"
+		case len(svc.ProvidesFor) > 0:
+			detail += "  (added automatically with " + strings.Join(svc.ProvidesFor, ", ") + ")"
 		}
 		opts = append(opts, ui.Option{Value: svc.Name, Label: svc.Name, Detail: detail})
 	}

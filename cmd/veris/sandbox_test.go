@@ -259,6 +259,17 @@ func newSandboxPlane(t *testing.T) *sandboxPlane {
 		lists: map[string]func() (int, any){},
 	}
 	mux := http.NewServeMux()
+	// The catalog, read by up and status to say which twins the platform
+	// added on its own. google-calendar carries the family wiring so a test
+	// can assert the note; stripe and postgres carry none.
+	mux.HandleFunc("GET /v1/services", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, []api.CatalogService{
+			{Name: "stripe", Description: "Stripe payments API"},
+			{Name: "postgres", Description: "Postgres data plane (DSN)"},
+			{Name: "google-calendar", Description: "Google Calendar API v3", Requires: []string{"google-identity"}},
+			{Name: "google-identity", Description: "Sign in with Google", ProvidesFor: []string{"google-calendar"}},
+		})
+	})
 	mux.HandleFunc("GET /v1/environments", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -1360,6 +1371,9 @@ func newJSONPlane(t *testing.T) *httptest.Server {
 		sbJSON(w, 200, map[string]any{"requests": []map[string]any{{"id": 1, "ts": 1772355600, "method": "GET",
 			"path": "/v1/customers/cus_1", "status": 200, "tier": "handler", "duration_ms": 6, "state_version": 3}}})
 	})
+	mux.HandleFunc("GET /v1/services", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, []api.CatalogService{{Name: "stripe"}, {Name: "postgres"}})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		sbJSON(w, 404, map[string]string{"detail": "Not Found"})
@@ -1454,4 +1468,50 @@ func TestJSONEverywhere(t *testing.T) {
 			t.Errorf("snapshot get --json = %q", stdout)
 		}
 	})
+}
+
+// The twin the platform added is the one line in up's output that would
+// otherwise read as a bug: a service nobody named, beside the ones they did.
+func TestUpAndStatusNameTheTwinNobodyAskedFor(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	expires := time.Now().Add(30 * time.Minute)
+	// The environment names three services; the sandbox holds the issuer the
+	// third one signs in through, which nobody typed anywhere.
+	services := append(twins.services(false), api.ServiceInfo{
+		Name: "google-identity", Status: "ready",
+		URL:     twins.srv.URL + "/s/" + sbID + "/google-identity",
+		EnvHint: "GOOGLE_IDENTITY_BASE",
+	})
+	plane.script(func(p *sandboxPlane) {
+		p.envs[ciID] = api.Environment{ID: ciID, Name: "checkout-ci",
+			Services: []string{"stripe", "postgres", "google-calendar"}}
+		p.answer = func(int) *api.Sandbox { return readySandbox(services, expires) }
+	})
+	b.projectFile(cfg.Project{
+		Project:      "proj",
+		Default:      "ci",
+		Environments: map[string]cfg.EnvConfig{"ci": {ID: ciID}},
+	})
+
+	code, _, stderr := runSandboxCLI(t, "up")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	sbInOrder(t, stderr,
+		"checkout-ci: stripe, postgres, google-calendar + google-identity)",
+		"(added automatically: google-calendar signs in through it)")
+
+	code, _, stderr = runSandboxCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	sbInOrder(t, stderr,
+		"google-identity +",
+		"+ google-identity: added automatically: google-calendar signs in through it")
+	// The twins the environment did name carry nothing.
+	if strings.Contains(stderr, "stripe +") {
+		t.Errorf("a twin the environment names is not an addition:\n%s", stderr)
+	}
 }

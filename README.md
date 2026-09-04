@@ -221,6 +221,16 @@ environments:
       command: [pytest, -q, tests/integration]
 ```
 
+Some services are not usable alone. A product service that signs in through
+a family issuer — Google Calendar through Google Identity — is deployed with
+that issuer in every sandbox, so the client's auth base URL resolves without
+anyone knowing to ask for it. That has always been the control plane's
+doing; what the CLI now does is say so. The service picker marks both sides,
+`env create` names the issuer it added and whose sign-in it serves, and `up`
+and `status` mark the twin nobody typed. The environment record still holds
+only the services asked for, so one that gains an issuer later gains it in
+environments defined before it.
+
 `env create` writes `id`, and then only what a flag gave it: `ttl_minutes`,
 `boot`, `snapshot`, `data`, `run.command`, and the `proxy:` block from `--image`,
 `--require-service`, `--require-callback`, `--expose` and `--strict` (`env

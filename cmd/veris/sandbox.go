@@ -380,8 +380,14 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 	if ttl > 0 {
 		life = fmt.Sprintf("ttl %d min", ttl)
 	}
+	// Non-fatal: it only decides how much a line can explain, and a sandbox
+	// is not worth losing to a catalog that did not answer.
+	catalog, catErr := c.ListServices(bg)
+	if catErr != nil {
+		s.ui.Warn("could not list services, so the twins are unannotated: %v", catErr)
+	}
 	s.ui.Info("Starting '%s' (%s: %s) · boot %s · %s",
-		envName, serverName, strings.Join(env.Services, ", "), bootLabel, life)
+		envName, serverName, withAdded(env.Services, catalog), bootLabel, life)
 	// The pointer is about to be replaced: a sandbox it still names keeps
 	// running until its TTL and is reachable afterwards only by id, so the
 	// orphan is announced with the command that deletes it.
@@ -420,7 +426,7 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 			return s, sb, err
 		}
 	}
-	printHints(s.ui, sb.Services)
+	printHints(s.ui, sb.Services, env.Services, catalog)
 	if conf != nil && len(conf.Data) > 0 {
 		if err := addDataFiles(bg, s, sb, conf.Data); err != nil {
 			return s, sb, err
@@ -849,7 +855,7 @@ func countsLine(counts map[string]int) string {
 // printHints prints what the code under test needs: one ENV_HINT=url line
 // per service. A URL that is not http is a data-plane DSN the app dials
 // itself, and says so beneath.
-func printHints(u *ui.UI, services []api.ServiceInfo) {
+func printHints(u *ui.UI, services []api.ServiceInfo, requested []string, catalog []api.CatalogService) {
 	width := nameWidth(services)
 	for _, svc := range services {
 		v := svc.URL
@@ -859,6 +865,11 @@ func printHints(u *ui.UI, services []api.ServiceInfo) {
 		u.Info("  %-*s   %s", width, svc.Name, v)
 		if !isHTTPURL(svc.URL) {
 			u.Info("  %-*s   (data plane; handed to the app, not proxied)", width, "")
+		}
+		// A twin nobody named, appearing beside the ones they did, is the
+		// one line here that would otherwise read as a bug.
+		if note := addedNote(svc.Name, requested, catalog); note != "" {
+			u.Info("  %-*s   (%s)", width, "", note)
 		}
 	}
 }
@@ -903,6 +914,9 @@ func sandboxGet(ctx *cli.Context, idFlag string, watch bool) error {
 		return printJSON(s.ctx.Stdout, sb)
 	}
 	env, envErr := c.GetEnvironment(bg, sb.EnvironmentID)
+	// Only the note's wording depends on it; a plane that will not list
+	// still gets a marked row, just a vaguer reason.
+	statusCatalog, _ := c.ListServices(bg)
 
 	envLine := sb.EnvironmentID
 	if env != nil && env.Name != "" {
@@ -933,10 +947,21 @@ func sandboxGet(ctx *cli.Context, idFlag string, watch bool) error {
 		if hint == "" {
 			hint = "—"
 		}
-		rows = append(rows, []string{"  " + svc.Name, svc.Status, hint, svc.URL, tableCounts(bg, s, svc)})
+		name := "  " + svc.Name
+		if env != nil && addedNote(svc.Name, env.Services, statusCatalog) != "" {
+			name += " +"
+		}
+		rows = append(rows, []string{name, svc.Status, hint, svc.URL, tableCounts(bg, s, svc)})
 	}
 	if len(rows) > 0 {
 		s.ui.Table([]string{"  Twin", "Status", "Env hint", "URL", "Tables"}, rows)
+	}
+	if env != nil {
+		for _, svc := range services {
+			if note := addedNote(svc.Name, env.Services, statusCatalog); note != "" {
+				s.ui.Detail("+ %s: %s", svc.Name, note)
+			}
+		}
 	}
 	if watch {
 		return watchStatus(s, c, sb.ID, envLine)

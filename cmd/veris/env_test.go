@@ -54,6 +54,11 @@ func newEnvPlane(t *testing.T) *envPlane {
 			{Name: "stripe", Description: "Stripe payments API", Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			{Name: "postgres", Description: "Postgres data plane (DSN)"},
 			{Name: "github", Description: "GitHub REST + webhooks", Routes: []routes.Entry{{Host: "api.github.com"}}},
+			{Name: "google-calendar", Description: "Google Calendar API v3",
+				Routes:   []routes.Entry{{Host: "www.googleapis.com", Paths: []string{"/calendar/v3"}}},
+				Requires: []string{"google-identity"}},
+			{Name: "google-identity", Description: "Sign in with Google",
+				Routes: []routes.Entry{{Host: "oauth2.googleapis.com"}}, ProvidesFor: []string{"google-calendar"}},
 		},
 		sandboxes:    map[string][]api.Sandbox{},
 		failDeleteSB: map[string]bool{},
@@ -366,7 +371,7 @@ func TestEnvCreateRefusesUnknownServices(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit %d, want 1", code)
 	}
-	wantLines(t, stderr, "✗ Unknown service(s): foo, bar\n  Available: stripe, postgres, github\n")
+	wantLines(t, stderr, "✗ Unknown service(s): foo, bar\n  Available: stripe, postgres, github, google-calendar, google-identity\n")
 	if len(b.plane.created) != 0 {
 		t.Errorf("POST made despite unknown services: %+v", b.plane.created)
 	}
@@ -1250,4 +1255,71 @@ func TestEnvSplitWords(t *testing.T) {
 	if _, err := splitWords(`pytest "unterminated`); err == nil || err.Error() != `unterminated " quote` {
 		t.Errorf("unterminated: err = %v", err)
 	}
+}
+
+// A service that signs in through a family issuer is not usable without it,
+// so the control plane puts the issuer in every sandbox holding one. That
+// has always happened; what the CLI never did was say so, and the issuer
+// then turned up as a twin nobody picked.
+func TestEnvCreateNamesTheIssuerAServiceBringsAlong(t *testing.T) {
+	b := newEnvBench(t)
+	stdout, stderr, code := b.run("env", "create", "cal", "--services", "google-calendar")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s%s", code, stdout, stderr)
+	}
+	wantLines(t, stderr,
+		"google-identity is added automatically (google-calendar signs in through it)",
+		"\u2713 Environment created: "+b.plane.envs[0].ID+" (cal: google-calendar + google-identity)")
+	// The server row is what was asked for. Resolution happens per sandbox,
+	// so a service that gains an issuer later gains it in old environments
+	// too -- recording the resolved list here would freeze that.
+	if got := b.plane.created[0].Services; !reflect.DeepEqual(got, []string{"google-calendar"}) {
+		t.Errorf("POST carried %v, want just the service asked for", got)
+	}
+
+	t.Run("naming the issuer too adds nothing and says nothing", func(t *testing.T) {
+		_, stderr, code := b.run("env", "create", "both", "--services", "google-calendar,google-identity")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if strings.Contains(stderr, "added automatically") {
+			t.Errorf("an issuer that was asked for is not an addition:\n%s", stderr)
+		}
+	})
+
+	t.Run("a service with no family gains no line", func(t *testing.T) {
+		_, stderr, code := b.run("env", "create", "plain", "--services", "stripe")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if strings.Contains(stderr, "added automatically") || strings.Contains(stderr, " + ") {
+			t.Errorf("stripe brings nothing along:\n%s", stderr)
+		}
+	})
+
+	t.Run("the picker says which way each service is wired", func(t *testing.T) {
+		_, stderr, code := b.runTTY("wired\ngoogle-calendar\n\n\n", "env", "create")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		wantLines(t, stderr,
+			"(+ google-identity, added automatically)",
+			"(added automatically with google-calendar)")
+	})
+
+	// A plane too old to serve the fields says nothing rather than failing:
+	// no dependencies known is exactly the behaviour this CLI had before it
+	// could ask.
+	t.Run("a plane that serves no dependencies is silent about them", func(t *testing.T) {
+		b := newEnvBench(t)
+		b.plane.catalog = []api.CatalogService{{Name: "google-calendar", Description: "Google Calendar API v3"}}
+		_, stderr, code := b.run("env", "create", "old", "--services", "google-calendar")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if strings.Contains(stderr, "added automatically") {
+			t.Errorf("nothing was served to add:\n%s", stderr)
+		}
+		wantLines(t, stderr, "(old: google-calendar)")
+	})
 }
