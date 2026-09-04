@@ -925,3 +925,13 @@ not the path.
 ## Licence
 
 MIT. Built on [elazarl/goproxy](https://github.com/elazarl/goproxy) (BSD-3).
+
+### Reading complete sandbox tables
+
+`veris sandbox data get NAME TABLE` reads one page (20 rows by default).
+`--json` preserves the row-array format and reports partial reads on stderr.
+Use `--offset N --limit N` for another page, or `--all --json` to collect every
+page before printing the array. `--limit` is the page size, at most 1000.
+Stop writers while collecting pages: this is not an atomic snapshot. A changed
+total, stalled page, or failed request fails the command without emitting a
+partial JSON array. Filter the complete array locally to count rows from a run.
