@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/veris-ai/veris-cli/internal/config"
+	"github.com/veris-ai/veris-cli/internal/direct"
 	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
@@ -109,7 +110,7 @@ func NewClient(apiBase, apiKey string) (*Client, error) {
 	return &Client{
 		APIBase: strings.TrimSuffix(apiBase, "/"),
 		APIKey:  apiKey,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		HTTP:    &http.Client{Timeout: 30 * time.Second, Transport: direct.Transport()},
 	}, nil
 }
 
