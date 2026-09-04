@@ -34,9 +34,10 @@ type configSources struct {
 	Local string
 
 	// Overrides is --route, accumulated per service. For a service it names,
-	// the entries REPLACE whatever the control plane or the embedded table
-	// would have derived: an override that merged could never say "only this
-	// host", which is the whole point of overriding.
+	// the entries REPLACE whatever the control plane served: an override that
+	// merged could never say "only this host", which is the whole point of
+	// overriding. It is also the only way to route a service the control
+	// plane serves no hostname for.
 	Overrides map[string][]routes.Entry
 }
 
@@ -56,7 +57,8 @@ func bindConfigFlags(fs *flag.FlagSet, src *configSources) {
 		"control plane API key (defaults to $"+discovery.EnvAPIKey+"; never written to disk)")
 	fs.Func("route",
 		"route a service at a hostname for this run: service=host[/prefix], "+
-			"repeatable; replaces that service's derived routes",
+			"repeatable; replaces the routes the control plane served for it, "+
+			"or supplies one it served none for",
 		func(value string) error {
 			service, entry, err := parseRouteFlag(value)
 			if err != nil {

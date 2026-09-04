@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Proves `--sandbox <id>` end to end: no config file is ever written by hand,
-# and the vendor hostnames come from the generated route table rather than from
-# anything a developer typed.
+# and the vendor hostnames come from the table the control plane generates and
+# serves with the sandbox -- the only source this binary has -- rather than
+# from anything a developer typed.
 #
-# Uses a Google sandbox on purpose. Google is the case that makes the route
-# table worth generating: three services share www.googleapis.com and are told
+# Uses a Google sandbox on purpose. Google is the case that makes the table
+# worth generating: three services share www.googleapis.com and are told
 # apart only by path prefix, and /tokeninfo lives on a different host again.
 #
 # Human-triggered, never CI: it costs a real sandbox.

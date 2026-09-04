@@ -18,7 +18,9 @@ func servicesCommand() *cli.Command {
 		Usage:   "veris services [--json]",
 		Help: "One line per twin: its name (what --services takes), what it stands in for, the\n" +
 			"variable its URL is handed to the app under, and the vendor hostnames the proxy\n" +
-			"intercepts for it. A twin with no hostnames is a data plane (a DSN, not proxied).",
+			"intercepts for it. A twin with no hostnames is not intercepted: either a data\n" +
+			"plane (a DSN, handed to the app) or one this plane serves no hostname for yet.\n" +
+			"veris doctor names which, on its vendor-hostnames line.",
 		Run: func(ctx *cli.Context, args []string) error {
 			if err := noPositionals(ctx, args); err != nil {
 				return err
@@ -52,7 +54,9 @@ func servicesCatalog(ctx *cli.Context) error {
 		}
 		host := strings.Join(hosts, ", ")
 		if host == "" {
-			host = "— (data plane)"
+			// The catalog carries no URL, so "a DSN by design" and "not
+			// measured yet" look the same here. Say only what is known.
+			host = "— (not intercepted)"
 		}
 		hint := svc.EnvHint
 		if hint == "" {

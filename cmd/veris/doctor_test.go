@@ -45,6 +45,14 @@ type doctorPlane struct {
 	probeState   string
 	probeDead    bool
 	clientStatus int
+
+	// The catalog GET /v1/services answers with. By default stripe carries a
+	// vendor hostname and postgres, a data plane, carries none; noRoutes is
+	// the plane that serves no hostnames at all -- in the catalog and with
+	// the sandbox alike, since they are one record on the server -- and
+	// catalogStatus != 0 fails the read.
+	noRoutes      bool
+	catalogStatus int
 }
 
 func (p *doctorPlane) serve(t *testing.T) string {
@@ -101,6 +109,21 @@ func (p *doctorPlane) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch path {
+	case "/v1/services":
+		if p.catalogStatus != 0 {
+			reply(p.catalogStatus, map[string]any{"detail": "Not Found"})
+			return
+		}
+		var stripeRoutes any
+		if !p.noRoutes {
+			stripeRoutes = []map[string]any{{"host": "api.stripe.com", "paths": nil}}
+		}
+		reply(http.StatusOK, []map[string]any{
+			{"name": "stripe", "description": "Stripe payments API",
+				"env_hint": "STRIPE_API_BASE", "routes": stripeRoutes},
+			{"name": "postgres", "description": "Postgres", "env_hint": "DATABASE_URL",
+				"routes": nil},
+		})
 	case "/v1/me":
 		reply(http.StatusOK, map[string]any{
 			"kind": "api_key", "user": nil, "organization_id": "org1",
@@ -150,6 +173,14 @@ func (p *doctorPlane) handle(w http.ResponseWriter, r *http.Request) {
 			expires = 2 * time.Hour
 		}
 		base := "http://" + r.Host
+		// The sandbox carries the same hostnames its catalog does: it is the
+		// document a run reads, so a bench whose catalog serves a route and
+		// whose sandbox serves none would describe a world where doctor says
+		// ✓ and the run intercepts nothing.
+		var stripeRoutes any
+		if !p.noRoutes {
+			stripeRoutes = []map[string]any{{"host": "api.stripe.com"}}
+		}
 		reply(http.StatusOK, map[string]any{
 			"id": sbID, "environment_id": devID, "status": status,
 			"created_at":     time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
@@ -157,7 +188,8 @@ func (p *doctorPlane) handle(w http.ResponseWriter, r *http.Request) {
 			"failure_reason": p.failureReason,
 			"services": []map[string]any{
 				{"name": "stripe", "status": "ready", "url": base + "/s/" + sbID + "/stripe",
-					"control_url": base + "/s/" + sbID + "/stripe", "env_hint": "STRIPE_API_BASE"},
+					"control_url": base + "/s/" + sbID + "/stripe", "env_hint": "STRIPE_API_BASE",
+					"routes": stripeRoutes},
 				{"name": "postgres", "status": "ready", "url": "postgres://x@db/app", "env_hint": "DATABASE_URL"},
 			},
 		})
@@ -270,6 +302,7 @@ func TestDoctorHappyPath(t *testing.T) {
 		"✓ Control plane http://127.0.0.1:",
 		" reachable (status ok, checkout 3f9a1b2c)",
 		"✓ Gateway mode configured (canary gw.api.veris.ai)",
+		"✓ Vendor hostnames served for 1 of 2 catalog twins; none for postgres (not intercepted; handed to the command instead)",
 		"✓ docker on PATH, daemon answers (server 27.1.1)",
 		"✓ cloudflared on PATH (",
 		"✓ CA "+filepath.Join(b.home, ".veris", "ca", "veris-ca.pem")+" (key 0600)",
@@ -304,7 +337,7 @@ func TestDoctorJSONCarriesEveryCheck(t *testing.T) {
 	for _, c := range report.Checks {
 		names = append(names, c.Check+":"+c.Status)
 	}
-	want := "binary:ok login:ok plane:ok gateway:ok docker:ok tunnel:ok ca:ok project:ok environment:ok sandbox:ok clock:ok twin:stripe:ok twin:postgres:ok callback:ok"
+	want := "binary:ok login:ok plane:ok gateway:ok routes:ok docker:ok tunnel:ok ca:ok project:ok environment:ok sandbox:ok clock:ok twin:stripe:ok twin:postgres:ok callback:ok"
 	if got := strings.Join(names, " "); got != want {
 		t.Errorf("checks = %q\nwant     %q", got, want)
 	}
@@ -332,7 +365,9 @@ func TestDoctorNotLoggedIn(t *testing.T) {
 		"! Environment dev (k3j2v0d8…) not checked: not logged in",
 		"! Sandbox 7hqz4m2n… not checked: not logged in",
 	)
-	doctorRejects(t, stderr, "Gateway")
+	// The catalog needs the key the login just failed on: reading it would
+	// blame the catalog for a missing key, above the ✗ that is the finding.
+	doctorRejects(t, stderr, "Gateway", "Vendor hostnames", "vendor hostnames")
 
 	// A key the plane refuses is the same finding with the plane's reason.
 	b.global(cfg.Global{ActiveProfile: "default", Profiles: map[string]cfg.Profile{
@@ -374,7 +409,7 @@ func TestDoctorPlaneDown(t *testing.T) {
 		"! No sandbox for this folder",
 		"→ Next: veris up",
 	)
-	doctorRejects(t, stderr, "Gateway", "Environment")
+	doctorRejects(t, stderr, "Gateway", "Environment", "Vendor hostnames", "vendor hostnames")
 }
 
 func TestDoctorDockerDaemonDown(t *testing.T) {
@@ -401,6 +436,39 @@ func TestDoctorGatewayNotConfigured(t *testing.T) {
 	doctorBench(t, &doctorPlane{gatewayStatus: http.StatusNotFound})
 	_, stderr, _ = runDoctor(t, cli.Globals{})
 	doctorWants(t, stderr, "! Gateway health is not served by http://127.0.0.1:", " (an older control plane)")
+}
+
+// The control plane is the only source of vendor hostnames, so a plane that
+// serves none intercepts nothing: every twin is handed over instead. That is
+// a warning rather than a failure -- a run still happens, and the handoff is
+// a real way to reach a twin -- but it must be said.
+func TestDoctorWarnsWhenTheControlPlaneServesNoVendorHostnames(t *testing.T) {
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, noRoutes: true})
+	_, stderr, code := runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("a plane with no hostnames is a warning, exit %d:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr,
+		"! http://127.0.0.1:",
+		" serves no vendor hostnames for any of its 2 catalog twins, so nothing would be intercepted: a twin with an env hint is handed to the command under it, and one without is not reached at all",
+		"→ Next: update the control plane, or name the hostname per run with veris run --route SERVICE=HOST",
+	)
+	doctorRejects(t, stderr, "Vendor hostnames served")
+	// And on the twin this folder actually depends on, since the sandbox's
+	// hostnames are a separate record from the catalog's and only the twin's
+	// own line reports the one a run would read.
+	doctorWants(t, stderr,
+		"✓ stripe  ok, but no vendor hostname is served for it: not intercepted, so its URL is handed to the command as $STRIPE_API_BASE")
+}
+
+// A catalog that cannot be read says so, rather than claiming either answer.
+func TestDoctorSaysWhenTheCatalogCannotBeRead(t *testing.T) {
+	doctorBench(t, &doctorPlane{gatewayAvailable: true, catalogStatus: http.StatusInternalServerError})
+	_, stderr, code := runDoctor(t, cli.Globals{})
+	if code != 0 {
+		t.Errorf("an unreadable catalog is a warning, exit %d:\n%s", code, stderr)
+	}
+	doctorWants(t, stderr, "! Catalog of http://127.0.0.1:", " not read, so whether it serves vendor hostnames is unknown: ")
 }
 
 func TestDoctorEnvironmentFindings(t *testing.T) {

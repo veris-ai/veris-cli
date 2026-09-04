@@ -460,8 +460,8 @@ func ensureIgnored(s *session, p *cfg.Project) {
 }
 
 // serviceOptions is the catalog as a picker: the name, then its description
-// and the vendor hosts it stands in for, or — for a data plane that is
-// handed to the app rather than intercepted.
+// and the vendor hosts it stands in for, or — for a twin with none, which
+// is handed to the app rather than intercepted.
 func serviceOptions(catalog []api.CatalogService) []ui.Option {
 	opts := make([]ui.Option, 0, len(catalog))
 	for _, svc := range catalog {

@@ -7,8 +7,9 @@ import (
 )
 
 // veris services is the catalog the env create picker reads, as a table for
-// a person and as JSON for a script; a data-plane twin says so instead of
-// listing hostnames.
+// a person and as JSON for a script; a twin with no hostnames says it is not
+// intercepted rather than claiming to be a data plane, which the catalog --
+// carrying no URL -- cannot tell it apart from a twin not measured yet.
 func TestServicesListsTheCatalog(t *testing.T) {
 	b := newEnvBench(t)
 
@@ -22,7 +23,7 @@ func TestServicesListsTheCatalog(t *testing.T) {
 	for _, want := range []string{
 		"Available on " + b.srv.URL + " (3 twins)",
 		"stripe", "Stripe payments API", "api.stripe.com",
-		"postgres", "— (data plane)",
+		"postgres", "— (not intercepted)",
 		"github", "api.github.com",
 		"→ Next: veris env create --services name,name",
 	} {

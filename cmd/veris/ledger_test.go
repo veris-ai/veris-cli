@@ -19,6 +19,7 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/discovery"
 	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/routes"
 	"github.com/veris-ai/veris-cli/internal/twin"
 )
 
@@ -192,7 +193,8 @@ func (f *ledgerTwins) stripe() *twin.Client { return twin.New(f.srv.URL + "/s/" 
 func (f *ledgerTwins) services() []api.ServiceInfo {
 	stripe := f.srv.URL + "/s/" + sbID + "/stripe"
 	return []api.ServiceInfo{
-		{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE"},
+		{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE",
+			Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 		{Name: "postgres", Status: "ready", URL: "postgresql://app:app@10.0.0.5:5432/sb?sslmode=require",
 			ControlURL: f.srv.URL + "/s/" + sbID + "/postgres", EnvHint: "DATABASE_URL"},
 	}
@@ -201,12 +203,14 @@ func (f *ledgerTwins) services() []api.ServiceInfo {
 // withGithub is services plus the github twin, an HTTP twin with a log.
 func (f *ledgerTwins) withGithub() []api.ServiceInfo {
 	github := f.srv.URL + "/s/" + sbID + "/github"
-	return append(f.services(), api.ServiceInfo{Name: "github", Status: "ready", URL: github, ControlURL: github, EnvHint: "GITHUB_API_BASE"})
+	return append(f.services(), api.ServiceInfo{Name: "github", Status: "ready", URL: github,
+		ControlURL: github, EnvHint: "GITHUB_API_BASE", Routes: []routes.Entry{{Host: "api.github.com"}}})
 }
 
 // withYente is services plus the yente twin: an http twin with a log that
-// the proxy has no hostname for (none served, none in the table), so its
-// URL is handed to the command under YENTE_API_BASE and called directly.
+// the proxy has no hostname for -- the control plane serves none, and there
+// is no other source -- so its URL is handed to the command under
+// YENTE_API_BASE and called directly.
 func (f *ledgerTwins) withYente() []api.ServiceInfo {
 	yente := f.srv.URL + "/s/" + sbID + "/yente"
 	return append(f.services(), api.ServiceInfo{Name: "yente", Status: "ready", URL: yente, ControlURL: yente, EnvHint: "YENTE_API_BASE"})
@@ -879,7 +883,8 @@ func TestRunRequireServiceOnATwinWithoutALogIsTheEnginesAlone(t *testing.T) {
 func cacheSandboxAt(t *testing.T, id, upstream string) {
 	t.Helper()
 	snapshot := discovery.Snapshot{SandboxID: id, Status: "ready", APIBase: "http://control.test", FetchedAt: time.Now().UTC(),
-		Services: []discovery.Service{{Name: "stripe", URL: upstream, Status: "ready"}}}
+		Services: []discovery.Service{{Name: "stripe", URL: upstream, Status: "ready",
+			Routes: []routes.Entry{{Host: "api.stripe.com"}}}}}
 	body, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -967,7 +972,8 @@ func TestRunWithoutAControlURLTwinPrintsNoLedger(t *testing.T) {
 	plane.script(func(p *sandboxPlane) {
 		p.answer = func(int) *api.Sandbox {
 			return readySandbox([]api.ServiceInfo{
-				{Name: "stripe", Status: "ready", URL: twins.srv.URL + "/s/" + sbID + "/stripe", EnvHint: "STRIPE_API_BASE"},
+				{Name: "stripe", Status: "ready", URL: twins.srv.URL + "/s/" + sbID + "/stripe",
+					EnvHint: "STRIPE_API_BASE", Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			}, time.Now().Add(30*time.Minute))
 		}
 	})

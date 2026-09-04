@@ -57,10 +57,12 @@ What to route (run and serve both accept these, most explicit first):
   --config <file>   or an explicit config file, used exactly as written
   read from $VERIS_SANDBOX_ID and $VERIS_PROXY_CONFIG when neither is given
 
-  Which hostname belongs to each service comes from the control plane when
-  it serves routes, else from the table embedded at this binary's release.
-  --route <service>=<host>[/prefix]   replace one service's derived routes
-                                      for this run (repeatable)
+  Which hostname belongs to each service comes from the control plane, the
+  only source of them: a service it serves none for is not intercepted, and
+  its URL is handed to the command under its env hint instead.
+  --route <service>=<host>[/prefix]   for this run, replace one service's
+                                      served routes or supply a hostname it
+                                      has none for (repeatable)
 
 Exit codes:
   0  success

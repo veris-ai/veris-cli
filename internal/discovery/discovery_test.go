@@ -13,15 +13,26 @@ import (
 
 // A Calendar sandbox always contains google-identity too: Calendar issues no
 // tokens and verifies them against its sibling. Both must end up routed, and
-// they share a hostname, so this is the case the whole route table exists for.
+// they share a hostname, so this is the case the routing exists for. The
+// routes are the ones the control plane serves with the sandbox, which is
+// where every hostname here comes from.
 func googleSandbox(base string) *Snapshot {
 	return &Snapshot{
 		SandboxID:     "sbx_google",
 		EnvironmentID: "env_1",
 		Status:        "ready",
 		Services: []Service{
-			{Name: "google-calendar", URL: base + "/s/sbx_google/google-calendar", Status: "ready"},
-			{Name: "google-identity", URL: base + "/s/sbx_google/google-identity", Status: "ready"},
+			{Name: "google-calendar", URL: base + "/s/sbx_google/google-calendar", Status: "ready",
+				Routes: []routes.Entry{
+					{Host: "www.googleapis.com", Paths: []string{"/calendar/v3"}},
+				}},
+			{Name: "google-identity", URL: base + "/s/sbx_google/google-identity", Status: "ready",
+				EnvHint: "GOOGLE_IDENTITY_BASE",
+				Routes: []routes.Entry{
+					{Host: "accounts.google.com", Paths: []string{"/o/oauth2/v2/auth"}},
+					{Host: "oauth2.googleapis.com", Paths: []string{"/revoke", "/token", "/tokeninfo"}},
+					{Host: "www.googleapis.com", Paths: []string{"/oauth2/v3"}},
+				}},
 		},
 	}
 }
@@ -47,9 +58,10 @@ func TestAConfigIsDerivedWithNoFileAuthored(t *testing.T) {
 	}
 }
 
-// The measured record puts /tokeninfo on oauth2.googleapis.com. A hand-written
-// table had it on www.googleapis.com, which would route a client's token
-// introspection at a host that does not serve it.
+// The measured record the control plane serves puts /tokeninfo on
+// oauth2.googleapis.com. A hand-written table had it on www.googleapis.com,
+// which would route a client's token introspection at a host that does not
+// serve it.
 func TestTokeninfoIsRoutedWhereGoogleServesIt(t *testing.T) {
 	cfg, _, err := ToConfig(googleSandbox("http://sandbox.test"), nil)
 	if err != nil {
@@ -97,7 +109,8 @@ func TestANonHTTPServiceIsReportedRatherThanDropped(t *testing.T) {
 	snapshot := &Snapshot{
 		SandboxID: "sbx_mixed",
 		Services: []Service{
-			{Name: "stripe", URL: "http://sandbox.test/s/sbx_mixed/stripe"},
+			{Name: "stripe", URL: "http://sandbox.test/s/sbx_mixed/stripe",
+				Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			{Name: "pg", URL: "postgres://user:pw@10.0.0.2:5432/db"},
 		},
 	}
@@ -113,11 +126,12 @@ func TestANonHTTPServiceIsReportedRatherThanDropped(t *testing.T) {
 	}
 }
 
-func TestAServiceWithNoMeasuredHostIsReported(t *testing.T) {
+func TestAServiceTheControlPlaneServedNoHostnameForIsReported(t *testing.T) {
 	snapshot := &Snapshot{
 		SandboxID: "sbx_x",
 		Services: []Service{
-			{Name: "stripe", URL: "http://sandbox.test/s/sbx_x/stripe"},
+			{Name: "stripe", URL: "http://sandbox.test/s/sbx_x/stripe",
+				Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			{Name: "not-a-real-vendor", URL: "http://sandbox.test/s/sbx_x/nope"},
 		},
 	}
@@ -142,15 +156,17 @@ func TestASandboxWithNothingRoutableIsAnError(t *testing.T) {
 	}
 }
 
-// Routes served by the control plane beat the embedded table: they are the
-// same measured record, but current rather than frozen at this binary's
-// release.
-func TestControlPlaneRoutesBeatTheEmbeddedTable(t *testing.T) {
+// The precedence, with the binary carrying no table of its own: what the
+// control plane served is routed, and a service it served nothing for is not
+// proxied at all -- handed over under its env hint rather than routed from
+// some second, older copy of the hostnames.
+func TestTheControlPlanesRoutesAreRoutedAndAServiceWithNoneIsHandedOver(t *testing.T) {
 	snapshot := googleSandbox("http://sandbox.test")
 	snapshot.Services[0].Routes = []routes.Entry{
 		{Host: "calendar.fresh.example", Paths: []string{"/v9"}},
 	}
-	cfg, _, err := ToConfig(snapshot, nil)
+	snapshot.Services[1].Routes = nil
+	cfg, skipped, err := ToConfig(snapshot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,46 +175,64 @@ func TestControlPlaneRoutesBeatTheEmbeddedTable(t *testing.T) {
 		if svc.Name == "google-calendar" {
 			calendarHosts = append(calendarHosts, svc.Hosts...)
 		}
+		if svc.Name == "google-identity" {
+			t.Errorf("google-identity was routed at %v, but the control plane served no hostname for it", svc.Hosts)
+		}
 	}
 	if len(calendarHosts) != 1 || calendarHosts[0] != "calendar.fresh.example" {
 		t.Errorf("calendar hosts = %v, want only the served route", calendarHosts)
 	}
-	// The sibling served no routes, so it still resolves from the table.
-	var identityRouted bool
-	for _, svc := range cfg.Services {
-		if svc.Name == "google-identity" {
-			identityRouted = true
+	if len(cfg.PassEnv) != 1 || cfg.PassEnv[0].Name != "GOOGLE_IDENTITY_BASE" ||
+		cfg.PassEnv[0].Service != "google-identity" {
+		t.Fatalf("pass_env = %+v, want google-identity handed over under its hint", cfg.PassEnv)
+	}
+	reason := ""
+	for _, s := range skipped {
+		if s.Service == "google-identity" {
+			reason = s.Reason
 		}
 	}
-	if !identityRouted {
-		t.Error("google-identity lost its embedded-table routes")
+	if !strings.Contains(reason, "the control plane served no route for it") ||
+		!strings.Contains(reason, "$GOOGLE_IDENTITY_BASE") {
+		t.Errorf("google-identity's note %q says neither why nor under what name", reason)
 	}
 }
 
 // A newer control plane with one malformed row must not take down every run
-// against it; a service whose rows all drop falls back to the table.
-func TestMalformedServedRoutesFallBackToTheTable(t *testing.T) {
+// against it: the row is dropped. A service whose rows ALL drop is left with
+// no hostname, which is the handed-over case, not a fall back to anything.
+func TestAMalformedServedRouteIsDroppedRatherThanFailingTheRun(t *testing.T) {
 	snapshot := googleSandbox("http://sandbox.test")
-	snapshot.Services[0].Routes = []routes.Entry{{Host: "  "}}
+	snapshot.Services[0].Routes = []routes.Entry{
+		{Host: "  "},
+		{Host: "calendar.fresh.example"},
+	}
+	snapshot.Services[1].Routes = []routes.Entry{{Host: "  "}}
 	cfg, _, err := ToConfig(snapshot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var hosts []string
 	for _, svc := range cfg.Services {
-		if svc.Name == "google-calendar" && svc.Hosts[0] != "www.googleapis.com" {
-			t.Errorf("calendar host = %q, want the embedded table's", svc.Hosts[0])
-		}
+		hosts = append(hosts, svc.Hosts...)
+	}
+	if len(hosts) != 1 || hosts[0] != "calendar.fresh.example" {
+		t.Errorf("routed hosts = %v, want the one good row alone", hosts)
+	}
+	if len(cfg.PassEnv) != 1 || cfg.PassEnv[0].Service != "google-identity" {
+		t.Errorf("pass_env = %+v, want the service whose rows all dropped handed over", cfg.PassEnv)
 	}
 }
 
-// --route replaces every derived route for the service it names, and can route
-// a service neither the control plane nor the table knows -- the "measurement
-// has not landed yet" case the flag exists for.
+// --route replaces the routes the control plane served for the service it
+// names, and can route a service the control plane serves no hostname for --
+// the "measurement has not landed yet" case the flag exists for.
 func TestARouteOverrideReplacesAndEnables(t *testing.T) {
 	snapshot := &Snapshot{
 		SandboxID: "sbx_o",
 		Services: []Service{
-			{Name: "stripe", URL: "http://sandbox.test/s/sbx_o/stripe"},
+			{Name: "stripe", URL: "http://sandbox.test/s/sbx_o/stripe",
+				Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			{Name: "brand-new", URL: "http://sandbox.test/s/sbx_o/brand-new"},
 		},
 	}
@@ -212,6 +246,12 @@ func TestARouteOverrideReplacesAndEnables(t *testing.T) {
 	}
 	if len(skipped) != 0 {
 		t.Errorf("unexpectedly skipped: %+v", skipped)
+	}
+	// One entry per service, not two: an override that MERGED with the served
+	// route would leave stripe on api.stripe.com as well, and a map keyed by
+	// name would hide it.
+	if len(cfg.Services) != 2 {
+		t.Fatalf("services = %+v, want one entry each -- the override replaces, never merges", cfg.Services)
 	}
 	hosts := map[string]string{}
 	for _, svc := range cfg.Services {
@@ -316,7 +356,8 @@ func TestADatabaseServiceIsHandedOverNotRouted(t *testing.T) {
 	snapshot := &Snapshot{
 		SandboxID: "sbx_db", EnvironmentID: "env_db",
 		Services: []Service{
-			{Name: "stripe", URL: "http://gw/s/sbx_db/stripe", EnvHint: "STRIPE_API_BASE"},
+			{Name: "stripe", URL: "http://gw/s/sbx_db/stripe", EnvHint: "STRIPE_API_BASE",
+				Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			{Name: "postgres", URL: "postgres://user:pw@10.0.0.2:5432/app",
 				EnvHint: "DATABASE_URL"},
 		},
@@ -360,15 +401,50 @@ func TestADatabaseOnlySandboxStillYieldsAConfig(t *testing.T) {
 	}
 }
 
-// An http twin with no hostname to intercept -- no route from the control
-// plane, none in the table -- is the DSN case again: handed over under its
-// env hint rather than silently left unreachable. One with no hint is still
-// only reported, as before.
+// The shape this binary's missing table makes possible: a control plane that
+// serves no hostname for any http twin. Nothing is intercepted, every twin
+// with a hint is handed over instead, and the run proceeds -- one note per
+// twin is the whole signal. Pinning that here is what makes a later decision
+// to refuse such a run, or to warn once for the whole run, a deliberate
+// change rather than an accident.
+func TestASandboxWithNoRoutedTwinHandsEveryTwinOverAndProceeds(t *testing.T) {
+	snapshot := &Snapshot{
+		SandboxID: "sbx_none", EnvironmentID: "env_none",
+		Services: []Service{
+			{Name: "stripe", URL: "http://gw/s/sbx_none/stripe", EnvHint: "STRIPE_API_BASE"},
+			{Name: "github", URL: "http://gw/s/sbx_none/github", EnvHint: "GITHUB_API_BASE"},
+		},
+	}
+	cfg, skipped, err := ToConfig(snapshot, nil)
+	if err != nil {
+		t.Fatalf("a sandbox with no served hostnames still hands its twins over, got: %v", err)
+	}
+	if len(cfg.Services) != 0 {
+		t.Errorf("routed services = %+v, want nothing intercepted", cfg.Services)
+	}
+	if len(cfg.PassEnv) != 2 {
+		t.Fatalf("pass_env = %+v, want both twins handed over", cfg.PassEnv)
+	}
+	if len(skipped) != 2 {
+		t.Fatalf("skipped = %+v, want one note per twin", skipped)
+	}
+	for _, s := range skipped {
+		if !strings.Contains(s.Reason, "handed to the command as $") {
+			t.Errorf("%s's note %q never names the variable it is handed under", s.Service, s.Reason)
+		}
+	}
+}
+
+// An http twin with no hostname to intercept -- the control plane served
+// none, and there is no other source -- is the DSN case again: handed over
+// under its env hint rather than silently left unreachable. One with no hint
+// is still only reported, as before.
 func TestAnHTTPTwinWithNoRouteIsHandedOverLikeADSN(t *testing.T) {
 	snapshot := &Snapshot{
 		SandboxID: "sbx_yente", EnvironmentID: "env_y",
 		Services: []Service{
-			{Name: "stripe", URL: "http://gw/s/sbx_yente/stripe", EnvHint: "STRIPE_API_BASE"},
+			{Name: "stripe", URL: "http://gw/s/sbx_yente/stripe", EnvHint: "STRIPE_API_BASE",
+				Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 			{Name: "yente", URL: "http://gw/s/sbx_yente/yente", EnvHint: "YENTE_API_BASE"},
 			{Name: "nameless", URL: "http://gw/s/sbx_yente/nameless"},
 		},
@@ -391,7 +467,10 @@ func TestAnHTTPTwinWithNoRouteIsHandedOverLikeADSN(t *testing.T) {
 	if !strings.Contains(reasons["yente"], "handed to the command as $YENTE_API_BASE") {
 		t.Errorf("yente's note %q never names $YENTE_API_BASE", reasons["yente"])
 	}
-	if !strings.HasPrefix(reasons["nameless"], "no route:") {
+	// The full sentence: it is the only recourse a twin that can be neither
+	// intercepted nor handed over ever gets, and --route is offered in it.
+	if reasons["nameless"] != "no route: the control plane served no hostname "+
+		"for it (--route nameless=<host> supplies one for this run)" {
 		t.Errorf("a twin with no hint is reported, not handed: %q", reasons["nameless"])
 	}
 
@@ -400,7 +479,8 @@ func TestAnHTTPTwinWithNoRouteIsHandedOverLikeADSN(t *testing.T) {
 		svc  Service
 		want bool
 	}{
-		{Service{Name: "stripe", URL: "http://gw/stripe"}, false},
+		{Service{Name: "stripe", URL: "http://gw/stripe",
+			Routes: []routes.Entry{{Host: "api.stripe.com"}}}, false},
 		{Service{Name: "yente", URL: "http://gw/yente"}, true},
 		{Service{Name: "postgres", URL: "postgres://u:p@h/db"}, true},
 		{Service{Name: "yente", URL: "http://gw/yente", Routes: []routes.Entry{{Host: "api.yente.test"}}}, false},

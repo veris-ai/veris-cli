@@ -17,6 +17,7 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/cfg"
 	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/routes"
 	"github.com/veris-ai/veris-cli/internal/tunnel"
 	"github.com/veris-ai/veris-cli/internal/twin"
 	"github.com/veris-ai/veris-cli/internal/ui"
@@ -26,10 +27,10 @@ import (
 // check is one line -- ✓ passed, ! worth knowing, ✗ will fail a run -- and
 // they are ordered the way a run depends on them: the login (and a shell
 // key overriding it), the plane it talks to, the gateway that plane offers,
-// docker for the container tier, cloudflared for callbacks, the CA the
-// proxy mints with, then this folder's project file, environment and
-// sandbox with its clock and callback registration. Nothing here changes
-// anything; the → lines say what would.
+// the vendor hostnames that plane serves, docker for the container tier,
+// cloudflared for callbacks, the CA the proxy mints with, then this folder's
+// project file, environment and sandbox with its clock and callback
+// registration. Nothing here changes anything; the → lines say what would.
 
 // doctorCallTimeout bounds every request doctor makes. A plane that takes
 // longer than this to answer a health check is the finding.
@@ -46,9 +47,11 @@ func doctorCommand() *cli.Command {
 Nothing is changed; the → lines name the command that would. Exits 1
 when any check failed, and --json puts the same checks on stdout. --env
 checks a particular environment rather than the one this folder uses.
-Besides the login, plane and project: docker for --image, cloudflared for
---expose, the CA under ~/.veris/ca, and for a sandbox that is up its
-clock (frozen pauses deliveries) and the callback URL registered on it.`,
+Besides the login, plane and project: the vendor hostnames the plane
+serves (nothing is intercepted without them), docker for --image,
+cloudflared for --expose, the CA under ~/.veris/ca, and for a sandbox
+that is up its clock (frozen pauses deliveries) and the callback URL
+registered on it.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&env, "env", "", "environment `name` to check instead of the one in use")
 		},
@@ -111,6 +114,7 @@ func doctorWith(ctx *cli.Context, args []string, env string) error {
 	planeUp := d.plane()
 	if loggedIn && planeUp {
 		d.gateway()
+		d.vendorHostnames()
 	}
 	dockerUp := d.docker()
 	d.tunnel(dockerUp)
@@ -309,6 +313,81 @@ func (d *doctor) gateway() {
 		d.warn("gateway", map[string]any{"available": false},
 			"Gateway mode not configured on %s; runs use the proxy tier", base)
 	}
+}
+
+// vendorHostnames is GET /v1/services, read for the routes it carries. The
+// control plane is the only place those hostnames live -- this binary keeps
+// no table of its own -- so a twin it serves none for is not intercepted at
+// all: its URL is handed to the command under its env hint, and one with no
+// hint is not reached.
+//
+// Some catalog twins have no vendor hostname by design -- a database is a
+// DSN nobody calls over the internet -- so the line names the ones without
+// rather than printing a bare shortfall the reader would have to explain to
+// themselves. That naming is also what tells the two apart: postgres and
+// yente there is the healthy plane; an ordinary vendor twin there is the
+// measurement that has not landed, and the run will hand it over instead of
+// intercepting it. A blank host is dropped here exactly as routesFor drops
+// it, so this line and the router count the same rows.
+func (d *doctor) vendorHostnames() {
+	base := d.s.res.APIBase
+	var catalog []api.CatalogService
+	err := d.call(func(ctx context.Context) error {
+		var err error
+		catalog, err = d.s.plane().ListServices(ctx)
+		return err
+	})
+	if err != nil {
+		d.warn("routes", map[string]any{"api_base": base},
+			"Catalog of %s not read, so whether it serves vendor hostnames is unknown: %v", base, err)
+		return
+	}
+	served := 0
+	without := []string{}
+	for _, svc := range catalog {
+		if servesHostname(svc.Routes) {
+			served++
+			continue
+		}
+		without = append(without, svc.Name)
+	}
+	detail := map[string]any{"api_base": base, "catalog_twins": len(catalog),
+		"with_hostnames": served, "without_hostnames": without}
+	if served == 0 {
+		d.warn("routes", detail,
+			"%s serves no vendor hostnames for any of its %d catalog twins, so nothing would be intercepted: a twin with an env hint is handed to the command under it, and one without is not reached at all",
+			base, len(catalog))
+		d.next("update the control plane, or name the hostname per run with veris run --route SERVICE=HOST")
+		return
+	}
+	if len(without) == 0 {
+		d.ok("routes", detail, "Vendor hostnames served for all %d catalog twins", len(catalog))
+		return
+	}
+	d.ok("routes", detail,
+		"Vendor hostnames served for %d of %d catalog twins; none for %s (not intercepted; handed to the command instead)",
+		served, len(catalog), listNames(without, 6))
+}
+
+// servesHostname reports whether a service arrived with at least one usable
+// vendor hostname. A blank host is dropped here exactly as the router drops
+// it (discovery's compactRoutes), so this screen counts the rows a run would.
+func servesHostname(entries []routes.Entry) bool {
+	for _, r := range entries {
+		if strings.TrimSpace(r.Host) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// listNames joins names for one line of report, keeping it to a line: past
+// max the rest are counted rather than printed.
+func listNames(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:max], ", "), len(names)-max)
 }
 
 // docker is `docker info` with a deadline. Missing docker is ! rather than
@@ -586,8 +665,23 @@ func (d *doctor) sandbox(loggedIn bool) {
 			report(check, map[string]any{"control_url": svc.ControlURL, "status": status},
 				"%s  health: status %q", svc.Name, status)
 		default:
-			d.record("ok", check, svc.Name+" ok", map[string]any{"control_url": svc.ControlURL})
-			d.ui.Detail("✓ %s  ok", svc.Name)
+			// The hostnames a run reads are THIS sandbox's, not the
+			// catalog's: they are two records on the control plane and can
+			// disagree, so the aggregate line above can be ✓ while the twin
+			// this folder depends on routes nothing. The twin's own line is
+			// where that is legible.
+			detail := map[string]any{"control_url": svc.ControlURL}
+			suffix := ""
+			if !servesHostname(svc.Routes) {
+				detail["vendor_hostnames"] = 0
+				reach := ", and no env hint to hand its URL under, so it is out of reach"
+				if svc.EnvHint != "" {
+					reach = ", so its URL is handed to the command as $" + svc.EnvHint
+				}
+				suffix = ", but no vendor hostname is served for it: not intercepted" + reach
+			}
+			d.record("ok", check, svc.Name+" ok"+suffix, detail)
+			d.ui.Detail("✓ %s  ok%s", svc.Name, suffix)
 			continue
 		}
 		if sb.Status == api.StatusReady {
