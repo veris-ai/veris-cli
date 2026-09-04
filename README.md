@@ -495,6 +495,11 @@ veris: your app received 2 callback(s):
 for any path). Without it a webhook suite that received nothing still passes,
 which is the same failure the egress receipt exists to catch.
 
+`--receipt run.json` saves both ledgers and the verdict. `engine.callbacks`
+records the inbound method, path, HTTP status and count, including rejected
+callbacks; `sandbox.deliveries` records the sandbox's outbound attempts. Check
+the application's signature and processing assertions alongside those counts.
+
 A quick tunnel needs no Cloudflare account and mints a new hostname each run.
 `--expose-token` (or `VERIS_TUNNEL_TOKEN`, plus `--expose-hostname`) uses a
 named tunnel instead, for a stable URL. In Cloudflare, configure that hostname's

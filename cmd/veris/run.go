@@ -635,7 +635,7 @@ func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
 	case readErr != nil || shutErr != nil || v.Indeterminate:
 		code = exitIndeterminate
 	}
-	writeReceipt(os.Stderr, o.receipt, p, l, engine, v.Assertions, started, finished, code)
+	writeReceipt(os.Stderr, o.receipt, p, l, engine, inbound, v.Assertions, started, finished, code)
 	if code != 0 {
 		return exitCode(code)
 	}
@@ -669,7 +669,12 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 	// judge; the rest is judged once, below, with the engine's count merged.
 	reqs := spec.Requirements
 	spec.Requirements = p.enginesAlone(reqs)
-	engine, err := runContainerised(spec)
+	containerResult, err := runContainerised(spec)
+	var engine *proxy.Receipt
+	var inbound *proxy.InboundReceipt
+	if containerResult != nil {
+		engine, inbound = containerResult.Engine, containerResult.Inbound
+	}
 	finished := time.Now()
 	if fresh {
 		// As in runLocal: nothing must interrupt the after-read and the
@@ -692,7 +697,7 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 	case v.Indeterminate:
 		code = exitIndeterminate
 	}
-	writeReceipt(os.Stderr, receiptPath, p, l, engine, v.Assertions, started, finished, code)
+	writeReceipt(os.Stderr, receiptPath, p, l, engine, inbound, v.Assertions, started, finished, code)
 	if code != 0 {
 		return exitCode(code)
 	}
