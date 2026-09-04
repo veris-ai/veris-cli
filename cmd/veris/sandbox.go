@@ -321,6 +321,12 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 	req := api.CreateSandboxRequest{TTLMinutes: &ttl, Metadata: map[string]string{"project": upProjectName(s, envName)}}
 	bootLabel := bootBundle
 	switch boot {
+	case bootBundle:
+		// "bundle" sends nothing, and the server boots a pinned baseline
+		// before the bundle whatever the config says; say what will boot.
+		if env.Baseline != nil {
+			bootLabel = "baseline " + shortID(env.Baseline.RevisionID) + " (pinned)"
+		}
 	case bootBaseline:
 		if env.Baseline == nil {
 			s.ui.Warn("Environment '%s' has no baseline; the sandbox boots the bundle", envName)

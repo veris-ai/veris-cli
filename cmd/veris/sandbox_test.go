@@ -802,6 +802,24 @@ func TestUpBootSources(t *testing.T) {
 		}
 	})
 
+	t.Run("bundle in the config still names a pinned baseline, since that is what boots", func(t *testing.T) {
+		plane.script(func(p *sandboxPlane) {
+			env := p.envs[ciID]
+			env.Baseline = &api.EnvironmentBaseline{Image: "reg/ci@sha256:def", RevisionID: "wrld-nct4zz2y"}
+			p.envs[ciID] = env
+		})
+		code, _, stderr := runSandboxCLI(t, "up", "ci", "--boot", "bundle")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if !strings.Contains(stderr, "Starting 'ci' (checkout-ci: stripe, postgres) · boot baseline wrld-nct… (pinned) ·") {
+			t.Errorf("the pinned baseline is what boots; the Starting line should say so:\n%s", stderr)
+		}
+		if created := plane.createdReq(); created.SnapshotID != nil {
+			t.Errorf("bundle sends no snapshot_id, got %v", *created.SnapshotID)
+		}
+	})
+
 	t.Run("a boot word that is not one of the three", func(t *testing.T) {
 		code, _, stderr := runSandboxCLI(t, "up", "--boot", "image")
 		if code != 1 || !strings.Contains(stderr, "✗ --boot must be bundle, baseline or snapshot (got 'image')") {
