@@ -644,7 +644,7 @@ func TestJSONTagsMirrorModelsPy(t *testing.T) {
 		{"ServiceResetResult", ServiceResetResult{}, []string{"name", "ok", "detail"}},
 		{"EgressCredential", EgressCredential{}, []string{"socks_address", "username", "ca_pem", "canary_host", "connect_address", "http_proxy_url", "min_sdk"}},
 		{"GatewayHealth", GatewayHealth{}, []string{"available", "canary_host"}},
-		{"CatalogService", CatalogService{}, []string{"name", "description", "env_hint", "routes"}},
+		{"CatalogService", CatalogService{}, []string{"name", "description", "env_hint", "routes", "requires", "provides_for"}},
 		{"Healthz", Healthz{}, []string{"status", "checkout"}},
 		{"APIKey", APIKey{}, []string{"id", "name", "key_prefix", "status", "created_at", "created_by", "expires_at"}},
 		{"Me", Me{}, []string{"kind", "user", "organization_id", "organizations"}},

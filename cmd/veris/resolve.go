@@ -224,3 +224,38 @@ func printRoutes(w *os.File, cfg *config.Config) {
 		}
 	}
 }
+
+// adoptFolderContext gives serve what run has always had: the login this
+// folder is signed in with, and the sandbox `veris up` wrote down.
+//
+// Credentials are filled whatever the target is, because `serve --sandbox
+// <id>` needed VERIS_API_KEY in an environment where `veris up` had just
+// worked off a saved profile -- two commands, one machine, one login,
+// different answers. An explicit --api-key or --api-base still wins.
+//
+// The pointer is taken only when no flag named a target, through the same
+// pointerSandbox run uses, so the two agree on what "this folder" means and
+// refuse the same cross-environment mistake. A folder with no project file
+// or no pointer is not an error: resolveConfig's own "nothing to route"
+// names the flags to pass, which is the better message.
+func adoptFolderContext(sources *configSources, envFlag string, wantPointer bool) error {
+	s, err := runSession(*sources, envFlag, "serve")
+	if err != nil {
+		return nil
+	}
+	sources.APIBase = firstNonEmpty(sources.APIBase, s.res.APIBase)
+	sources.APIKey = firstNonEmpty(sources.APIKey, s.res.APIKey)
+	if !wantPointer {
+		return nil
+	}
+	id, err := pointerSandbox(s, *sources, "")
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		return nil
+	}
+	sources.Sandbox = id
+	announcePointer(id)
+	return nil
+}

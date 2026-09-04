@@ -16,6 +16,8 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/cfg"
 	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 const (
@@ -47,6 +49,19 @@ func runSandboxCLI(t *testing.T, args ...string) (code int, stdout, stderr strin
 	in, hook := stdin, newSessionHook
 	stdin = strings.NewReader("")
 	newSessionHook = func(s *session) { s.ui.TTY = false }
+	t.Cleanup(func() { stdin, newSessionHook = in, hook })
+	var out, errOut bytes.Buffer
+	err := cli.Execute(root(), &cli.Globals{}, args, &out, &errOut)
+	return exitStatusTo(&errOut, err), out.String(), errOut.String()
+}
+
+// runSandboxCLITTY is runSandboxCLI with a terminal and answers for the
+// prompts one brings out.
+func runSandboxCLITTY(t *testing.T, input string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	in, hook := stdin, newSessionHook
+	stdin = strings.NewReader(input)
+	newSessionHook = func(s *session) { s.ui.TTY = true }
 	t.Cleanup(func() { stdin, newSessionHook = in, hook })
 	var out, errOut bytes.Buffer
 	err := cli.Execute(root(), &cli.Globals{}, args, &out, &errOut)
@@ -207,7 +222,10 @@ func (f *sandboxTwins) services(withPGControl bool) []api.ServiceInfo {
 		pg.ControlURL = f.srv.URL + "/s/" + sbID + "/postgres"
 	}
 	return []api.ServiceInfo{
-		{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE"},
+		// The measured vendor hostname rides with the service, which is what
+		// makes stripe intercepted rather than passed through.
+		{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE",
+			Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 		pg,
 	}
 }
@@ -246,6 +264,17 @@ func newSandboxPlane(t *testing.T) *sandboxPlane {
 		lists: map[string]func() (int, any){},
 	}
 	mux := http.NewServeMux()
+	// The catalog, read by up and status to say which twins the platform
+	// added on its own. google-calendar carries the family wiring so a test
+	// can assert the note; stripe and postgres carry none.
+	mux.HandleFunc("GET /v1/services", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, []api.CatalogService{
+			{Name: "stripe", Description: "Stripe payments API"},
+			{Name: "postgres", Description: "Postgres data plane (DSN)"},
+			{Name: "google-calendar", Description: "Google Calendar API v3", Requires: []string{"google-identity"}},
+			{Name: "google-identity", Description: "Sign in with Google", ProvidesFor: []string{"google-calendar"}},
+		})
+	})
 	mux.HandleFunc("GET /v1/environments", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -441,7 +470,7 @@ func TestUpProvisionsWaitsProbesAndSeeds(t *testing.T) {
 		"✓ Added data/customers.json: stripe customers 1, payment_methods 1\n",
 		"✓ Up: "+sbID+" is this folder's sandbox (expires "+expires.Local().Format("15:04 MST")+")\n",
 		"→ https://studio.example/sandboxes/"+sbID+"\n",
-		"→ Next: veris run\n",
+		"→ Next: veris run -- <your test command>\n",
 	)
 	if strings.Contains(stderr, "not ignored by git") {
 		t.Errorf("a temp dir is no repository; no gitignore warning expected:\n%s", stderr)
@@ -459,6 +488,40 @@ func TestUpProvisionsWaitsProbesAndSeeds(t *testing.T) {
 	}
 	if ptr := sbPointer(t, b); ptr == nil || ptr.ID != sbID || ptr.EnvironmentID != ciID {
 		t.Errorf("local pointer = %+v, want %s in %s", ptr, sbID, ciID)
+	}
+}
+
+// The next-step line owes the reader a command when the environment records
+// none: a bare `veris run` would be refused, and a hint that is refused is
+// worse than no hint.
+func TestUpNamesTheCommandRunStillNeeds(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	expires := time.Now().Add(30 * time.Minute)
+	plane.script(func(p *sandboxPlane) {
+		p.answer = func(int) *api.Sandbox { return readySandbox(twins.services(false), expires) }
+	})
+	b.projectFile(cfg.Project{
+		Project: "proj",
+		Default: "ci",
+		Environments: map[string]cfg.EnvConfig{
+			"ci":     {ID: ciID},
+			"pinned": {ID: devID, Run: cfg.RunConfig{Command: []string{"pytest", "-q"}}},
+		},
+	})
+	code, _, stderr := runSandboxCLI(t, "up")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	sbInOrder(t, stderr, "\u2192 Next: veris run -- <your test command>")
+
+	code, _, stderr = runSandboxCLI(t, "up", "pinned")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "\u2192 Next: veris run\n") {
+		t.Errorf("a recorded run.command still asks for one:\n%s", stderr)
 	}
 }
 
@@ -1313,6 +1376,9 @@ func newJSONPlane(t *testing.T) *httptest.Server {
 		sbJSON(w, 200, map[string]any{"requests": []map[string]any{{"id": 1, "ts": 1772355600, "method": "GET",
 			"path": "/v1/customers/cus_1", "status": 200, "tier": "handler", "duration_ms": 6, "state_version": 3}}})
 	})
+	mux.HandleFunc("GET /v1/services", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, []api.CatalogService{{Name: "stripe"}, {Name: "postgres"}})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		sbJSON(w, 404, map[string]string{"detail": "Not Found"})
@@ -1405,6 +1471,189 @@ func TestJSONEverywhere(t *testing.T) {
 		var sn api.Snapshot
 		if json.Unmarshal([]byte(stdout), &sn) != nil || sn.ID != jsonSnapID {
 			t.Errorf("snapshot get --json = %q", stdout)
+		}
+	})
+}
+
+// The twin the platform added is the one line in up's output that would
+// otherwise read as a bug: a service nobody named, beside the ones they did.
+func TestUpAndStatusNameTheTwinNobodyAskedFor(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	expires := time.Now().Add(30 * time.Minute)
+	// The environment names three services; the sandbox holds the issuer the
+	// third one signs in through, which nobody typed anywhere.
+	services := append(twins.services(false), api.ServiceInfo{
+		Name: "google-identity", Status: "ready",
+		URL:     twins.srv.URL + "/s/" + sbID + "/google-identity",
+		EnvHint: "GOOGLE_IDENTITY_BASE",
+	})
+	plane.script(func(p *sandboxPlane) {
+		p.envs[ciID] = api.Environment{ID: ciID, Name: "checkout-ci",
+			Services: []string{"stripe", "postgres", "google-calendar"}}
+		p.answer = func(int) *api.Sandbox { return readySandbox(services, expires) }
+	})
+	b.projectFile(cfg.Project{
+		Project:      "proj",
+		Default:      "ci",
+		Environments: map[string]cfg.EnvConfig{"ci": {ID: ciID}},
+	})
+
+	code, _, stderr := runSandboxCLI(t, "up")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	sbInOrder(t, stderr,
+		"checkout-ci: stripe, postgres, google-calendar + google-identity)",
+		"(added automatically: google-calendar signs in through it)")
+
+	code, _, stderr = runSandboxCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	sbInOrder(t, stderr,
+		"google-identity +",
+		"+ google-identity: added automatically: google-calendar signs in through it")
+	// The twins the environment did name carry nothing.
+	if strings.Contains(stderr, "stripe +") {
+		t.Errorf("a twin the environment names is not an addition:\n%s", stderr)
+	}
+}
+
+// up --proxy hands the caller a session already routed at the sandbox it
+// just made. The proof is end to end: a real shell runs, a request it makes
+// at the vendor's own hostname reaches the twin, and leaving the shell ends
+// the session with the receipt -- with no file written anywhere.
+func TestUpProxyOpensASessionRoutedAtTheSandbox(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	t.Setenv(discovery.EnvConfig, "")
+	t.Setenv(discovery.EnvSandboxID, "")
+	ciProject(t, b, customersJSON)
+	plane.script(func(p *sandboxPlane) {
+		p.answer = func(int) *api.Sandbox {
+			return readySandbox(twins.services(false), time.Now().Add(30*time.Minute))
+		}
+	})
+	// The "shell" is a one-line script that makes a request at the vendor's
+	// own hostname and exits -- what a real session does by hand, and the
+	// only way to prove the shell it opened was actually routed.
+	t.Setenv("SHELL", fakeShell(t, "call"))
+
+	// up writes through the tree's stream; the session it hands over to is
+	// `run`, which owns os.Stderr. Both are the one stream in real use.
+	var code int
+	var banner string
+	session := captureStderr(t, func() {
+		code, _, banner = runSandboxCLI(t, "up", "--proxy", "--listen", "127.0.0.1:0")
+	})
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s%s", code, banner, session)
+	}
+	// How the session works, said before it starts.
+	sbInOrder(t, banner,
+		"\u2713 Up: "+sbID+" is this folder's sandbox",
+		"Answered by the sandbox, at the vendor's own hostname:",
+		"api.stripe.com",
+		"\u2192 stripe",
+		"Not proxied \u2014 handed to the session as a variable:",
+		"DATABASE_URL",
+		"Every other host reaches its real destination",
+		"interception by proxy and CA variables",
+		"Not enforced here: Java, static Go binaries")
+	// And the session itself: routed at this folder's sandbox, and the
+	// request the shell made actually arrived.
+	sbInOrder(t, session,
+		"veris: using sandbox "+sbID+" (this folder)",
+		"veris: the sandbox received 1 request(s):",
+		"stripe                       1")
+
+	// Nothing is written for the reader to source: the session's own
+	// environment is the handoff, and it lives exactly as long as the proxy.
+	for _, name := range []string{"proxy.env", "proxy.env.ready"} {
+		if _, err := os.Stat(filepath.Join(b.project, ".veris", name)); !os.IsNotExist(err) {
+			t.Errorf(".veris/%s was written; the session is the handoff", name)
+		}
+	}
+	// The sandbox outlives the session.
+	if ptr := sbPointer(t, b); ptr == nil || ptr.ID != sbID {
+		t.Errorf("the folder should still point at %s, got %+v", sbID, ptr)
+	}
+	if got := plane.deletedIDs(); len(got) != 0 {
+		t.Errorf("leaving the session deleted %v; that is veris down's job", got)
+	}
+}
+
+// fakeShell is a program SHELL can point at: it re-execs this test binary in
+// the child role named, which supervise reaches with the session's own
+// environment, proxy variables and all.
+func fakeShell(t *testing.T, role string) string {
+	t.Helper()
+	t.Setenv(childMarker, role)
+	path := filepath.Join(t.TempDir(), "fake-shell")
+	body := "#!/bin/sh\nexec " + os.Args[0] + " -test.run=TestMain\n"
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The flags that describe the proxy are refused without it, rather than
+// accepted and ignored: a --listen that did nothing is how two folders end
+// up fighting over port 8080 with neither told.
+func TestUpProxyFlagsNeedProxy(t *testing.T) {
+	plane := newSandboxPlane(t)
+	b := sandboxBench(t, plane.srv.URL)
+	ciProject(t, b, customersJSON)
+	for _, flag := range [][]string{
+		{"--image", "app:test"},
+		{"--listen", "127.0.0.1:0"},
+		{"--expose", "3000"},
+		{"--strict"},
+	} {
+		code, _, stderr := runSandboxCLI(t, append([]string{"up"}, flag...)...)
+		if code != 1 || !strings.Contains(stderr, flag[0]+" describes the session up would open; add --proxy, or drop it") {
+			t.Errorf("%v: exit %d:\n%s", flag, code, stderr)
+		}
+	}
+}
+
+// serve with no target is this folder's sandbox, the same target run takes.
+// Before this it failed with "nothing to route" while the id it wanted sat
+// in .veris/twin.local.yaml, two lines above on the same screen.
+func TestServeRoutesAtThisFoldersSandbox(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	t.Setenv(discovery.EnvConfig, "")
+	t.Setenv(discovery.EnvSandboxID, "")
+	ciProject(t, b, customersJSON)
+	plane.script(func(p *sandboxPlane) {
+		p.answer = func(int) *api.Sandbox {
+			return readySandbox(twins.services(false), time.Now().Add(30*time.Minute))
+		}
+	})
+	b.local(cfg.Local{Sandbox: &cfg.SandboxRef{ID: sbID, EnvironmentID: ciID}})
+
+	// --print-routes resolves the target and prints what it would intercept
+	// without binding anything, which is exactly the question here.
+	stderr := captureStderr(t, func() {
+		if err := cmdServe([]string{"--print-routes"}); err != nil {
+			t.Errorf("serve --print-routes: %v", err)
+		}
+	})
+	if !strings.Contains(stderr, "veris: using sandbox "+sbID+" (this folder)") {
+		t.Errorf("serve did not say which sandbox it took:\n%s", stderr)
+	}
+
+	// The pointer's own environment is the one it may be used for: taking ci's
+	// sandbox for a run of dev would route at the wrong world with nothing said.
+	t.Run("a pointer from another environment is refused", func(t *testing.T) {
+		err := cmdServe([]string{"--env", "dev", "--print-routes"})
+		if err == nil || !strings.Contains(err.Error(), "belongs to environment") {
+			t.Errorf("err = %v, want the cross-environment refusal", err)
 		}
 	})
 }

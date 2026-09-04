@@ -206,7 +206,7 @@ func TestWatchUpEndsWhenRoutable(t *testing.T) {
 		"  stripe     STRIPE_API_BASE="+twins.srv.URL+"/s/"+sbID+"/stripe\n",
 		"✓ Added data/customers.json: stripe customers 1, payment_methods 1\n",
 		"✓ Up: "+sbID+" is this folder's sandbox (expires "+expires.Local().Format("15:04 MST")+")\n",
-		"→ Next: veris run\n",
+		"→ Next: veris run -- <your test command>\n",
 	)
 	if strings.Contains(stderr, "Waiting for") {
 		t.Errorf("the panel replaces the spinner:\n%s", stderr)

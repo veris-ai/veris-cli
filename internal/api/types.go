@@ -218,6 +218,18 @@ type CatalogService struct {
 	Description string         `json:"description"`
 	EnvHint     string         `json:"env_hint"`
 	Routes      []routes.Entry `json:"routes"`
+	// Requires names the services the platform adds to any sandbox holding
+	// this one -- the issuer a product service signs in through. Naming one
+	// service is asking for both, and the client's auth base URL resolves
+	// without anyone having to know that.
+	//
+	// ProvidesFor is the other direction: for an issuer, the services that
+	// bring it along.
+	//
+	// Both are empty from a control plane too old to serve them, which reads
+	// as "no dependencies known" and must never read as an error.
+	Requires    []string `json:"requires"`
+	ProvidesFor []string `json:"provides_for"`
 }
 
 // Healthz is GET /healthz: unauthenticated, and Checkout fingerprints the

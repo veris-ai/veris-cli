@@ -21,10 +21,14 @@ func TestServicesListsTheCatalog(t *testing.T) {
 		t.Errorf("stdout must stay empty without --json, got %q", stdout)
 	}
 	for _, want := range []string{
-		"Available on " + b.srv.URL + " (3 twins)",
+		"Available on " + b.srv.URL + " (5 twins)",
 		"stripe", "Stripe payments API", "api.stripe.com",
 		"postgres", "— (not intercepted)",
 		"github", "api.github.com",
+		// The name carries the issuer the service brings along, and a
+		// footnote says what the marker means.
+		"google-calendar (+google-identity)",
+		"(+name) is added automatically with the service beside it",
 		"→ Next: veris env create --services name,name",
 	} {
 		if !strings.Contains(stderr, want) {
@@ -40,7 +44,7 @@ func TestServicesListsTheCatalog(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
 		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
 	}
-	if len(got) != 3 || got[0]["name"] != "stripe" {
+	if len(got) != 5 || got[0]["name"] != "stripe" {
 		t.Errorf("json = %v", got)
 	}
 	if strings.Contains(stderr, "{") {

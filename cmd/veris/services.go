@@ -14,6 +14,7 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/cli"
 	"github.com/veris-ai/veris-cli/internal/twin"
+	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
 // dataPlaneNote is what stands in for row counts on a twin that has none:
@@ -51,12 +52,15 @@ func sandboxServicesCommand() *cli.Command {
 			{
 				Name:    "get",
 				Summary: "One twin: URL, control URL, env hint, status, every table",
-				Usage:   "veris sandbox services get NAME [--id ID] [--json]",
+				Help: "NAME is the twin's own name, the first column of `veris sandbox services list`. Left out,\n" +
+					"a sandbox with one twin uses it, a terminal is asked which, and anything else is told the\n" +
+					"names the sandbox actually has.",
+				Usage: "veris sandbox services get [NAME] [--id ID] [--json]",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&getID, "id", "", "sandbox id (default: this folder's)")
 				},
 				Run: func(ctx *cli.Context, args []string) error {
-					name, err := oneTwinName(ctx, args)
+					name, err := atMostOneTwinName(ctx, args)
 					if err != nil {
 						return err
 					}
@@ -66,16 +70,19 @@ func sandboxServicesCommand() *cli.Command {
 			{
 				Name:    "manual",
 				Summary: "The twin's testing notes (GET /veris/manual)",
-				Usage:   "veris sandbox services manual NAME [--id ID] [--raw | --json]",
+				Usage:   "veris sandbox services manual [NAME] [--id ID] [--raw | --json]",
 				Help: "The manual is the twin's own markdown: which credential it accepts, what the packaged seed\n" +
 					"holds, how its faults, callbacks and pagination behave. Without --raw it is rendered lightly\n" +
-					"on stderr; --raw prints the markdown itself to stdout; --json prints {service, manual}.",
+					"on stderr; --raw prints the markdown itself to stdout; --json prints {service, manual}.\n" +
+					"NAME is the twin's own name, the first column of `veris sandbox services list`. Left out,\n" +
+					"a sandbox with one twin uses it, a terminal is asked which, and anything else is told the\n" +
+					"names the sandbox actually has.",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&manualID, "id", "", "sandbox id (default: this folder's)")
 					fs.BoolVar(&raw, "raw", false, "print the markdown itself to stdout")
 				},
 				Run: func(ctx *cli.Context, args []string) error {
-					name, err := oneTwinName(ctx, args)
+					name, err := atMostOneTwinName(ctx, args)
 					if err != nil {
 						return err
 					}
@@ -86,17 +93,80 @@ func sandboxServicesCommand() *cli.Command {
 	}
 }
 
-// oneTwinName is the single NAME a verb takes; none or several is a usage
-// error in main's "veris: …" voice.
-func oneTwinName(ctx *cli.Context, args []string) (string, error) {
-	verb := strings.Join(ctx.Path[1:], " ")
+// atMostOneTwinName is the NAME a verb takes, "" when none was given. Two or
+// more is a usage error in main's "veris: …" voice; none is not an error
+// here, because the twins that would answer it are in the sandbox and this
+// runs before the sandbox has been read. chooseTwin finishes the job.
+func atMostOneTwinName(ctx *cli.Context, args []string) (string, error) {
 	switch len(args) {
+	case 0:
+		return "", nil
 	case 1:
 		return args[0], nil
-	case 0:
-		return "", fmt.Errorf("%s needs a twin NAME (veris sandbox services list shows them)", verb)
 	}
-	return "", fmt.Errorf("%s takes one twin NAME (got %q)", verb, strings.Join(args, " "))
+	return "", fmt.Errorf("%s takes one twin name (got %q)",
+		strings.Join(ctx.Path[1:], " "), strings.Join(args, " "))
+}
+
+// chooseTwin is the twin a verb acts on when the command line may not have
+// named one. A sandbox with a single twin has already answered the question;
+// a terminal is asked; anything else is told, in the only form that is
+// useful off a terminal -- the commands themselves, ready to run.
+//
+// It needs the sandbox, so it runs after openSandboxServices rather than
+// during argument parsing: "which twin" is a question only the sandbox can
+// answer, and an error that names the twins beats one that names the rule.
+func chooseTwin(s *session, sb *api.Sandbox, name, idFlag string) (*api.ServiceInfo, error) {
+	if name != "" {
+		return twinNamed(s, sb, name)
+	}
+	verb := strings.Join(s.ctx.Path[1:], " ")
+	switch len(sb.Services) {
+	case 0:
+		s.ui.Fail("Sandbox %s has no twins", sb.ID)
+		return nil, printed(1)
+	case 1:
+		only := sb.Services[0]
+		s.ui.Info("%s of %s, the sandbox's only twin", verb, only.Name)
+		return &sb.Services[0], nil
+	}
+	if s.ui.TTY {
+		opts := make([]ui.Option, 0, len(sb.Services))
+		for _, svc := range sb.Services {
+			opts = append(opts, ui.Option{Value: svc.Name, Label: svc.Name, Detail: twinDetail(svc)})
+		}
+		opt, err := s.ui.Select("Which twin?", opts, "NAME")
+		if err != nil {
+			return nil, err
+		}
+		return twinNamed(s, sb, opt.Value)
+	}
+	s.ui.Fail("%s needs the twin's name. Sandbox %s has %d:", verb, sb.ID, len(sb.Services))
+	for _, svc := range sb.Services {
+		s.ui.Next(twinCommand(verb, svc.Name, idFlag))
+	}
+	return nil, printed(1)
+}
+
+// twinCommand is one of the commands the refusal above lists: the verb as it
+// was typed, the twin's name, and the --id that was given, so a line can be
+// copied back onto the prompt unchanged.
+func twinCommand(verb, name, idFlag string) string {
+	cmd := "veris " + verb + " " + name
+	if idFlag != "" {
+		cmd += " --id " + idFlag
+	}
+	return cmd
+}
+
+// twinDetail is what the picker shows beside a twin's name: its status, and
+// the variable its URL is handed over under when it has one.
+func twinDetail(svc api.ServiceInfo) string {
+	detail := string(svc.Status)
+	if svc.EnvHint != "" {
+		detail += "  " + svc.EnvHint
+	}
+	return detail
 }
 
 // openSandboxServices is how every services and data verb starts: the
@@ -137,8 +207,37 @@ func twinNamed(s *session, sb *api.Sandbox, name string) (*api.ServiceInfo, erro
 		return svc, nil
 	}
 	s.ui.Fail("No twin named '%s' in sandbox %s (have: %s)", name, sb.ID, strings.Join(serviceNames(sb.Services), ", "))
-	s.ui.Next("veris sandbox services list")
+	// A near miss gets the corrected command rather than a listing to read:
+	// "calendar" for google-calendar is the common way to get here, and the
+	// fix is one line the user can run.
+	if near := nearestTwin(sb.Services, name); near != "" {
+		s.ui.Next("veris " + strings.Join(s.ctx.Path[1:], " ") + " " + near)
+	} else {
+		s.ui.Next("veris sandbox services list")
+	}
 	return nil, printed(1)
+}
+
+// nearestTwin is the one twin a mistyped name can only have meant: the same
+// name in another case, or the only one containing it as a word. Two
+// candidates mean nothing is suggested -- a guess between them would send
+// the user to the wrong twin as confidently as to the right one.
+func nearestTwin(services []api.ServiceInfo, name string) string {
+	want := strings.ToLower(name)
+	var near []string
+	for _, svc := range services {
+		got := strings.ToLower(svc.Name)
+		if got == want {
+			return svc.Name
+		}
+		if strings.Contains(got, want) {
+			near = append(near, svc.Name)
+		}
+	}
+	if len(near) == 1 {
+		return near[0]
+	}
+	return ""
 }
 
 // isSingleton reports whether a table of the bare GET /veris/data is one of
@@ -306,7 +405,7 @@ func servicesGet(ctx *cli.Context, idFlag, name string) error {
 	if err != nil {
 		return err
 	}
-	svc, err := twinNamed(s, sb, name)
+	svc, err := chooseTwin(s, sb, name, idFlag)
 	if err != nil {
 		return err
 	}
@@ -353,7 +452,7 @@ func servicesManual(ctx *cli.Context, idFlag, name string, raw bool) error {
 	if err != nil {
 		return err
 	}
-	svc, err := twinNamed(s, sb, name)
+	svc, err := chooseTwin(s, sb, name, idFlag)
 	if err != nil {
 		return err
 	}

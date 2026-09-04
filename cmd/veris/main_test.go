@@ -149,6 +149,29 @@ func TestTheCommandTreeAnswersLikeTheDispatcherDid(t *testing.T) {
 // sibling the test adds: `s` then names both serve and sandbox, and neither
 // wins. The message lists the candidates sorted and the exit is 1, the same
 // row of the table as an unknown command.
+// up, status and down are the root's, and answer under `veris sandbox` too:
+// a reader who found the group first should not be told its own lifecycle
+// verbs live elsewhere. Hidden, so the group's help still lists only the
+// --id verbs and no prefix becomes ambiguous.
+func TestTheFolderVerbsAnswerUnderSandboxToo(t *testing.T) {
+	dir := bareMachine(t)
+	for _, verb := range []string{"up", "status", "down"} {
+		stdout, _, code := invokeIn(t, dir, "sandbox", verb, "--help")
+		if code != 0 {
+			t.Errorf("veris sandbox %s --help: exit %d", verb, code)
+		}
+		if want := "veris sandbox " + verb; !strings.Contains(stdout, want) {
+			t.Errorf("veris sandbox %s --help lacks %q:\n%s", verb, want, stdout)
+		}
+	}
+	stdout, _, _ := invokeIn(t, dir, "sandbox", "--help")
+	for _, verb := range []string{"up", "status", "down"} {
+		if strings.Contains(stdout, "\n  "+verb+" ") {
+			t.Errorf("the sandbox group lists %q, which belongs to the root:\n%s", verb, stdout)
+		}
+	}
+}
+
 func TestAnAmbiguousPrefixNamesItsCandidates(t *testing.T) {
 	r := root()
 	var stdout, stderr bytes.Buffer
@@ -328,9 +351,9 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			code: 0,
 			stdoutHas: []string{
 				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
-				"  veris snapshot  create|list|get|delete\n",
-				"  veris baseline  get|promote|set|clear|list\n",
-				"  veris run       [--sandbox <id>] [--fresh]",
+				"veris snapshot create|list|get|delete",
+				"veris baseline get|promote|set|clear|list",
+				"  veris run       [--fresh]",
 				"  snapshot   Recorded worlds: create, list, get, delete\n",
 				"  baseline   What every new sandbox boots: get, promote, set, clear, list\n",
 				"veris snapshot,\nveris baseline",
@@ -470,11 +493,11 @@ func TestTheMilestoneThreeLeavesAnswerAsAScriptSeesThem(t *testing.T) {
 			argv: []string{"--help"},
 			code: 0,
 			stdoutHas: []string{
-				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--watch]\n",
+				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--proxy [--image IMG]] [--watch]\n",
 				"  veris status    [--watch] [--json]\n",
 				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
 				"[--expose PORT] [--require-service <n>] [--require-callback <path>]",
-				"  veris doctor    [--env NAME] [--json]\n",
+				"veris doctor [--env NAME] [--json]",
 				"up --watch and status --watch keep a live panel",
 				"every get and list takes --json",
 			},

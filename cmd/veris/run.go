@@ -180,7 +180,7 @@ func cmdRun(args []string) error {
 	// no --env never consulted those files before they existed, and a stray
 	// file must not take that away. The warning explains a later "no API
 	// key", which the broken profile would otherwise have supplied.
-	s, err := runSession(sources, *env)
+	s, err := runSession(sources, *env, "run")
 	if err != nil {
 		if *env != "" || *fresh || !explicitTarget(sources, *environment) {
 			return err
@@ -214,7 +214,8 @@ func cmdRun(args []string) error {
 	if len(argv) == 0 && *image == "" {
 		if envName != "" {
 			return fmt.Errorf("run needs a command (none configured for '%s'): "+
-				"pass one after --, or set run.command in %s", envName, s.res.Project.Path)
+				"pass one after --, or record one as run.command in %s "+
+				"(veris env create --command writes it)", envName, s.res.Project.Path)
 		}
 		return errors.New("run needs a command: veris run [--sandbox <id>] -- <cmd> [args...]\n" +
 			"or name an image and let its own entrypoint run: veris run --image <image>")
@@ -1141,7 +1142,7 @@ func unmetRequirements(reqs []requirement, r proxy.Receipt) []string {
 // sent to the sandbox, as opposed to what it was configured to send.
 // Control-plane traffic prints on its own lines: it proves the harness could
 // reach the sandbox, never that the code under test did.
-func printReceipt(w *os.File, r proxy.Receipt) {
+func printReceipt(w io.Writer, r proxy.Receipt) {
 	if r.Total == 0 {
 		if r.ControlTotal > 0 {
 			fmt.Fprintf(w,
@@ -1220,12 +1221,12 @@ func sandboxForContainer(src configSources) string {
 // parses its own flags and so never receives the tree's Context: the one it
 // builds carries --api-base, the only global with a bearing on resolution,
 // and the --env and --sandbox it parsed.
-func runSession(src configSources, envFlag string) (*session, error) {
+func runSession(src configSources, envFlag, verb string) (*session, error) {
 	ctx := &cli.Context{
 		Globals: &cli.Globals{APIBase: src.APIBase},
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
-		Path:    []string{"veris", "run"},
+		Path:    []string{"veris", verb},
 	}
 	return newSession(ctx, envFlag, src.Sandbox)
 }
