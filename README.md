@@ -255,8 +255,11 @@ both stages, and an ambiguous name or prefix lists the candidates.
 ## Sandboxes
 
 A sandbox is one disposable deployment of an environment, alive until its TTL.
-`up`, `status` and `down` act on this folder's sandbox; `sandbox …` is the same
-set of verbs for a sandbox named by `--id`.
+`up`, `status` and `down` act on this folder's sandbox — the id is in
+`.veris/twin.local.yaml` and never typed; `sandbox …` is the same set of
+verbs for a sandbox named by `--id`. That split is what the root help is
+grouped around. The three folder verbs answer under the group too
+(`veris sandbox up`), spelled in full.
 
 `up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot
 ID|NAME] [--callback-url URL] [--timeout 300s]` takes each setting from the

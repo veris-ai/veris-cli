@@ -99,7 +99,9 @@ func sandboxBaseCommands() []*cli.Command {
 			Name:    "sandbox",
 			Summary: "Sandboxes by id: get, list, delete, reset",
 			Usage:   "veris sandbox <command> [--id ID] [flags]",
-			Help:    "The same verbs as status and down, for a sandbox named by --id (default: this folder's).",
+			Help: "The same verbs as status and down, for a sandbox named by --id (default: this folder's).\n" +
+				"up, status and down act on this folder's sandbox and live at the root; they answer here too\n" +
+				"(veris sandbox up), spelled in full.",
 			Sub: []*cli.Command{
 				{
 					Name:    "get",

@@ -87,16 +87,22 @@ func root() *cli.Command {
 		Name:    "veris",
 		Summary: "route code under test at a Veris sandbox, from login to run",
 		Usage: "veris login     [KEY] [--profile NAME] [--api-base URL] [--key-stdin]\n" +
-			"  veris env       create|list|get|use|delete\n" +
+			"\n" +
+			"  Sign in      veris login · logout · whoami · profile use|list|get|delete\n" +
+			"  Define       veris env create|list|get|use|delete · veris services\n" +
+			"\n" +
+			"  This folder's sandbox — no id typed, from .veris/twin.local.yaml:\n" +
 			"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--watch]\n" +
 			"  veris status    [--watch] [--json]\n" +
+			"  veris down      [--all]\n" +
+			"  veris run       [--fresh] [--env NAME] [--image <image>] [--cap-add <CAP>] [--expose PORT] [--require-service <n>] [--require-callback <path>] [--receipt PATH] -- <cmd>\n" +
+			"\n" +
+			"  Any sandbox, by id:\n" +
 			"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n" +
-			"  veris snapshot  create|list|get|delete\n" +
-			"  veris baseline  get|promote|set|clear|list\n" +
-			"  veris run       [--sandbox <id>] [--fresh] [--env NAME] [--image <image>] [--cap-add <CAP>] [--expose PORT] [--require-service <n>] [--require-callback <path>] [--receipt PATH] -- <cmd>\n" +
-			"  veris serve     [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]\n" +
-			"  veris check     [--expect-canary <token>] [--any-run] [--proxy <url>]\n" +
-			"  veris doctor    [--env NAME] [--json]",
+			"\n" +
+			"  Keep a world veris snapshot create|list|get|delete · veris baseline get|promote|set|clear|list\n" +
+			"  Proxy        veris serve [--sandbox <id>] [--transparent] [--print-routes] · veris check\n" +
+			"  Diagnose     veris doctor [--env NAME] [--json] · veris version",
 		Help: rootHelp,
 		Flags: func(fs *flag.FlagSet) {
 			fs.BoolVar(&showVersion, "version", false, "print the version and exit")
