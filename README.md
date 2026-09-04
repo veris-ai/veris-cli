@@ -54,7 +54,7 @@ Five commands, no ids typed:
 veris login          # pair once: a code on screen, approved in the console
 veris env create     # name the services; writes .veris/twin.yaml
 veris up             # a sandbox of that environment, waited on until routable
-veris run            # the test command through the proxy, with a receipt
+veris run -- <cmd>   # the test command through the proxy, with a receipt
 veris down           # delete the sandbox
 ```
 
@@ -80,14 +80,17 @@ Pairing this machine with Veris
 → Next: veris env create
 ```
 
-`veris env create` is an interview on a TTY (name, a searchable service
-picker, TTL, boot source, data files, test command) and flag-driven off one.
-The name and service list go to the server; everything else goes to
-`.veris/twin.yaml` in this folder, created if there is none. The first
-environment of a project is its default.
+`veris env create` asks two questions on a TTY — the name, and a searchable
+service picker — and takes both as flags off one. They are what an
+environment IS, and they go to the server; the rest of what a start-up needs
+is a flag, recorded in `.veris/twin.yaml` in this folder only when given.
+Nothing else is asked, because `up` and `run` already have an answer for it:
+without `--boot` a sandbox boots the bundle, without `--data` it seeds
+nothing, and without `--command` a run takes its command after `--`. The
+first environment of a project is its default.
 
 ```
-$ veris env create checkout-svc --services stripe,postgres --ttl 60 --command 'pytest -q'
+$ veris env create checkout-svc --services stripe,postgres
 ✓ Environment created: 4h8k2m6n0p3r7t1v5x9z2b4d6 (checkout-svc: stripe, postgres)
 ✓ Added 'checkout-svc' to .veris/twin.yaml as the default
 ✓ Added .veris/twin.local.yaml to .gitignore (per-machine; holds sandbox ids)
@@ -114,12 +117,13 @@ Starting 'checkout-svc' (checkout-svc: stripe, postgres) · boot bundle · ttl 6
 → Next: veris run
 ```
 
-The hints are for reading, not for pasting into the app. `veris run` takes the
-command from the project file, routes it at this folder's sandbox, and reports
-what the sandbox received:
+The hints are for reading, not for pasting into the app. `veris run` routes
+the command at this folder's sandbox and reports what the sandbox received.
+The command comes after `--`, or from the project file when `env create
+--command` recorded one, which is what makes a bare `veris run` work:
 
 ```
-$ veris run
+$ veris run -- pytest -q
 veris: using sandbox 7hqz4m2n9c1v5x8b3k6t0r2p4 (this folder)
 ........                                                                 [100%]
 8 passed in 4.21s
@@ -185,7 +189,8 @@ On the server an environment is only a named service set. Everything that
 makes a start-up specific — TTL, boot source, data files, callback URL, proxy
 defaults, test command — lives in a named config in `.veris/twin.yaml`, which
 is committed and found by walking up from the current directory, so a
-monorepo can carry one per service folder:
+monorepo can carry one per service folder. Every line below `id:` is
+optional, written only by the flag that names it:
 
 ```yaml
 version: 1
@@ -216,8 +221,8 @@ environments:
       command: [pytest, -q, tests/integration]
 ```
 
-`env create` writes `id`, `ttl_minutes` (only when one was given), `boot`,
-`snapshot`, `data` and `run.command`, and the `proxy:` block from `--image`,
+`env create` writes `id`, and then only what a flag gave it: `ttl_minutes`,
+`boot`, `snapshot`, `data`, `run.command`, and the `proxy:` block from `--image`,
 `--require-service`, `--require-callback`, `--expose` and `--strict` (`env
 create --help` shows the block each writes). No secrets and no sandbox ids go
 in this file. The TTL's default, minimum and maximum are the control plane's,
@@ -239,7 +244,7 @@ both stages, and an ambiguous name or prefix lists the candidates.
 
 | Command | Does |
 |---|---|
-| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block; off a TTY, no `--data` means no data files and no `--ttl` means no `ttl_minutes` is recorded. |
+| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. On a TTY it asks for the name and the services and nothing else. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block. Every setting left out is left out of the file, so `up` boots the bundle, seeds nothing, and takes the control plane's own TTL. |
 | `env list` | Two blocks: configured (this project's, `★` default, `●` in use here) and available (every server environment the key can see, which config points at it, live sandboxes). |
 | `env get [NAME\|ID]` | The resolved settings, where each came from, and the server record. |
 | `env use [NAME\|ID] [--global]` | Choose for this folder, or the profile. A picker on a TTY when NAME is omitted. |

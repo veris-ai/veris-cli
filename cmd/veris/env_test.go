@@ -410,19 +410,15 @@ func TestEnvCreateFromAdoptsAServerEnvironment(t *testing.T) {
 
 func TestEnvCreateOffATTYNamesTheMissingFlag(t *testing.T) {
 	b := newEnvBench(t)
+	// Only the two answers an environment IS made of are asked for. --ttl,
+	// --boot, --data and --command are never prompts, so a command line
+	// carrying the name and the services is complete off a TTY.
 	cases := []struct {
 		args []string
 		hint string
 	}{
 		{[]string{}, "NAME"},
 		{[]string{"ci"}, "--services"},
-		// --ttl is not asked for off a TTY either: none given means none
-		// recorded, and the control plane's own default applies.
-		{[]string{"ci", "--services", "stripe"}, "--boot"},
-		{[]string{"ci", "--services", "stripe", "--boot", "snapshot"}, "--snapshot"},
-		// --data is not asked for off a TTY: none given means none.
-		{[]string{"ci", "--services", "stripe", "--boot", "bundle"}, "--command"},
-		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle", "--data", ""}, "--command"},
 	}
 	for _, c := range cases {
 		_, stderr, code := b.run(append([]string{"env", "create"}, c.args...)...)
@@ -434,9 +430,37 @@ func TestEnvCreateOffATTYNamesTheMissingFlag(t *testing.T) {
 	if len(b.plane.created) != 0 {
 		t.Errorf("POST made: %+v", b.plane.created)
 	}
+	t.Run("the name and the services are enough off a TTY", func(t *testing.T) {
+		_, stderr, code := b.run("env", "create", "headless", "--services", "stripe")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		// Nothing was asked for, so nothing but the id is recorded: no boot,
+		// no data files, no command, no ttl.
+		p := b.loadProject()
+		want := cfg.EnvConfig{ID: p.Environments["headless"].ID}
+		if conf := p.Environments["headless"]; !reflect.DeepEqual(conf, want) {
+			t.Errorf("config %+v, want %+v", conf, want)
+		}
+		raw, err := os.ReadFile(p.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"boot:", "data:", "run:", "command:", "ttl_minutes:"} {
+			if strings.Contains(string(raw), key) {
+				t.Errorf("%s carries a %q it was never given:\n%s", p.Path, key, raw)
+			}
+		}
+	})
 	t.Run("usage errors", func(t *testing.T) {
 		_, stderr, code := b.run("env", "create", "ci", "--boot", "floppy")
 		if code != 1 || !strings.Contains(stderr, "--boot must be one of bundle, baseline, snapshot") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+		// --boot snapshot with no snapshot to boot would write a config every
+		// up refuses; it is caught here instead.
+		_, stderr, code = b.run("env", "create", "ci", "--services", "stripe", "--boot", "snapshot")
+		if code != 1 || !strings.Contains(stderr, "--boot snapshot needs --snapshot ID|NAME") {
 			t.Errorf("exit %d:\n%s", code, stderr)
 		}
 		_, stderr, code = b.run("env", "create", "ci", "--command", "pytest 'unterminated")
@@ -448,9 +472,10 @@ func TestEnvCreateOffATTYNamesTheMissingFlag(t *testing.T) {
 
 func TestEnvCreateInterview(t *testing.T) {
 	b := newEnvBench(t)
-	// name, services, TTL (blank: none recorded), boot (2 = baseline),
-	// data, command, default (blank keeps yes: it is the first environment).
-	stdout, stderr, code := b.runTTY("staging-like\nstripe,postgres\n\n2\ndata/dev-customers.json\npytest -q\n\n", "env", "create")
+	// name, services, TTL (blank: none recorded), default (blank keeps yes:
+	// it is the first environment). Four questions, and the two in the
+	// middle are the only ones with a default worth leaning on.
+	stdout, stderr, code := b.runTTY("staging-like\nstripe,postgres\n\n\n", "env", "create")
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s%s", code, stdout, stderr)
 	}
@@ -460,16 +485,20 @@ func TestEnvCreateInterview(t *testing.T) {
 		"1) ◻ stripe  Stripe payments API  api.stripe.com",
 		"2) ◻ postgres  Postgres data plane (DSN)  —",
 		"? Sandbox TTL in minutes (blank for the control plane's default): ",
-		"? Boot from:",
-		"2) baseline  this environment's promoted snapshot (none yet)",
-		"? Data files to add after boot (blank for none): ",
-		"? Test command (runs through the proxy): ",
 		"Make 'staging-like' this project's default environment? [Y/n] ",
 		"✓ Environment created: "+b.plane.envs[0].ID+" (staging-like: stripe, postgres)",
 		"✓ Added 'staging-like' to .veris/twin.yaml as the default")
+	// Nothing about booting, seeding or a test command was asked, so nothing
+	// about them is recorded: up boots the bundle and run takes its command
+	// after --.
+	for _, gone := range []string{"Boot from:", "Data files", "Test command"} {
+		if strings.Contains(stderr, gone) {
+			t.Errorf("the interview still asks %q:\n%s", gone, stderr)
+		}
+	}
 	p := b.loadProject()
 	conf := p.Environments["staging-like"]
-	want := cfg.EnvConfig{ID: b.plane.envs[0].ID, Boot: "baseline", Data: []string{"data/dev-customers.json"}, Run: cfg.RunConfig{Command: []string{"pytest", "-q"}}}
+	want := cfg.EnvConfig{ID: b.plane.envs[0].ID}
 	if p.Default != "staging-like" || !reflect.DeepEqual(conf, want) {
 		t.Errorf("default %q config %+v, want %+v", p.Default, conf, want)
 	}
@@ -481,7 +510,7 @@ func TestEnvCreateInterview(t *testing.T) {
 	}
 
 	t.Run("a TTL that is not a number is warned about and recorded as none, and the default question leans to no once there is a default", func(t *testing.T) {
-		_, stderr, code := b.runTTY("abc\ny\n", "env", "create", "ci", "--services", "stripe", "--boot", "bundle", "--data", "", "--command", "")
+		_, stderr, code := b.runTTY("abc\ny\n", "env", "create", "ci", "--services", "stripe")
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
@@ -495,7 +524,7 @@ func TestEnvCreateInterview(t *testing.T) {
 	})
 
 	t.Run("a number is recorded as given", func(t *testing.T) {
-		_, stderr, code := b.runTTY("30\nn\n", "env", "create", "perf", "--services", "stripe", "--boot", "bundle", "--data", "", "--command", "")
+		_, stderr, code := b.runTTY("30\nn\n", "env", "create", "perf", "--services", "stripe")
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
@@ -505,7 +534,7 @@ func TestEnvCreateInterview(t *testing.T) {
 	})
 
 	t.Run("no keeps the default where it was", func(t *testing.T) {
-		_, stderr, code := b.runTTY("n\n", "env", "create", "qa", "--services", "stripe", "--ttl", "9", "--boot", "bundle", "--data", "", "--command", "")
+		_, stderr, code := b.runTTY("n\n", "env", "create", "qa", "--services", "stripe", "--ttl", "9")
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
@@ -515,7 +544,7 @@ func TestEnvCreateInterview(t *testing.T) {
 	})
 
 	t.Run("no services picked is refused", func(t *testing.T) {
-		_, stderr, code := b.runTTY("\n", "env", "create", "empty", "--ttl", "9", "--boot", "bundle", "--data", "", "--command", "")
+		_, stderr, code := b.runTTY("\n", "env", "create", "empty", "--ttl", "9")
 		if code != 1 {
 			t.Errorf("exit %d, want 1", code)
 		}
@@ -524,8 +553,8 @@ func TestEnvCreateInterview(t *testing.T) {
 }
 
 // The proxy flags land in the config's proxy: block, never asked for and
-// never hand-edited; off a TTY a missing --data means no data files rather
-// than a prompt nobody can answer.
+// never hand-edited; a missing --data means no data files, on a TTY or off
+// one, since nothing about seeding is a question any more.
 func TestEnvCreateProxyFlagsAndOptionalData(t *testing.T) {
 	b := newEnvBench(t)
 	stdout, stderr, code := b.run("env", "create", "ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle", "--command", "pytest -q",
@@ -595,7 +624,7 @@ func TestEnvCreateProxyFlagsAndOptionalData(t *testing.T) {
 	t.Run("the help documents the block and the flags", func(t *testing.T) {
 		stdout, _, _ := b.run("env", "create", "--help")
 		wantLines(t, stdout,
-			"no --data means no data files",
+			"recorded only when given",
 			"      proxy:\n",
 			"        require_service: [stripe:2]",
 			"--require-service NAME[:COUNT]",

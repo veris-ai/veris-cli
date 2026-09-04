@@ -214,7 +214,8 @@ func cmdRun(args []string) error {
 	if len(argv) == 0 && *image == "" {
 		if envName != "" {
 			return fmt.Errorf("run needs a command (none configured for '%s'): "+
-				"pass one after --, or set run.command in %s", envName, s.res.Project.Path)
+				"pass one after --, or record one as run.command in %s "+
+				"(veris env create --command writes it)", envName, s.res.Project.Path)
 		}
 		return errors.New("run needs a command: veris run [--sandbox <id>] -- <cmd> [args...]\n" +
 			"or name an image and let its own entrypoint run: veris run --image <image>")

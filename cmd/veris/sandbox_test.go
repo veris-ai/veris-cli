@@ -441,7 +441,7 @@ func TestUpProvisionsWaitsProbesAndSeeds(t *testing.T) {
 		"✓ Added data/customers.json: stripe customers 1, payment_methods 1\n",
 		"✓ Up: "+sbID+" is this folder's sandbox (expires "+expires.Local().Format("15:04 MST")+")\n",
 		"→ https://studio.example/sandboxes/"+sbID+"\n",
-		"→ Next: veris run\n",
+		"→ Next: veris run -- <your test command>\n",
 	)
 	if strings.Contains(stderr, "not ignored by git") {
 		t.Errorf("a temp dir is no repository; no gitignore warning expected:\n%s", stderr)
@@ -459,6 +459,40 @@ func TestUpProvisionsWaitsProbesAndSeeds(t *testing.T) {
 	}
 	if ptr := sbPointer(t, b); ptr == nil || ptr.ID != sbID || ptr.EnvironmentID != ciID {
 		t.Errorf("local pointer = %+v, want %s in %s", ptr, sbID, ciID)
+	}
+}
+
+// The next-step line owes the reader a command when the environment records
+// none: a bare `veris run` would be refused, and a hint that is refused is
+// worse than no hint.
+func TestUpNamesTheCommandRunStillNeeds(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	expires := time.Now().Add(30 * time.Minute)
+	plane.script(func(p *sandboxPlane) {
+		p.answer = func(int) *api.Sandbox { return readySandbox(twins.services(false), expires) }
+	})
+	b.projectFile(cfg.Project{
+		Project: "proj",
+		Default: "ci",
+		Environments: map[string]cfg.EnvConfig{
+			"ci":     {ID: ciID},
+			"pinned": {ID: devID, Run: cfg.RunConfig{Command: []string{"pytest", "-q"}}},
+		},
+	})
+	code, _, stderr := runSandboxCLI(t, "up")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	sbInOrder(t, stderr, "\u2192 Next: veris run -- <your test command>")
+
+	code, _, stderr = runSandboxCLI(t, "up", "pinned")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "\u2192 Next: veris run\n") {
+		t.Errorf("a recorded run.command still asks for one:\n%s", stderr)
 	}
 }
 

@@ -265,11 +265,23 @@ func up(ctx *cli.Context, name string, o upOptions) error {
 		s.ui.Success("Up: %s is ready (expires %s)", sb.ID, clockOf(sb.ExpiresAt))
 	}
 	studioLink(s.ui, s.consoleURL(), "sandboxes", sb.ID)
-	s.ui.Next("veris run")
+	_, _, conf, _ := s.requireEnv()
+	s.ui.Next(runHint(conf))
 	if s.ctx.Globals.JSON {
 		return printJSON(s.ctx.Stdout, sb)
 	}
 	return nil
+}
+
+// runHint is the `veris run` a next-step line should show. The environment
+// config answers for the command only when it records one; without it a bare
+// `veris run` is refused, so the hint that would be typed next has to carry
+// the command the user still owes it.
+func runHint(conf *cfg.EnvConfig) string {
+	if conf != nil && len(conf.Run.Command) > 0 {
+		return "veris run"
+	}
+	return "veris run -- <your test command>"
 }
 
 // upSandbox is up without its closing lines: resolve, create, wait, probe

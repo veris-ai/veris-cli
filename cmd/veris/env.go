@@ -19,7 +19,8 @@ import (
 // envCommand is the env group: create, list, get, use, delete. On the server
 // an environment is only a named service set; everything that makes a
 // start-up specific (TTL, boot image, data files, test command) lives in the
-// named config these verbs keep in .veris/twin.yaml.
+// named config these verbs keep in .veris/twin.yaml, put there by a flag
+// rather than by a question.
 func envCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "env",
@@ -28,7 +29,7 @@ func envCommand() *cli.Command {
 the default, and a folder can override which is in use with env use, which
 writes the gitignored .veris/twin.local.yaml. The server side of each is a
 named service set; the TTL, boot source, data files and test command are the
-project's.`,
+project's, and create records each only when a flag names it.`,
 		Sub: []*cli.Command{
 			envCreateCommand(),
 			{
@@ -63,12 +64,12 @@ func initCommand() *cli.Command {
 
 // --- env create ------------------------------------------------------------
 
-// createFlags are env create's answers as flags. A prompt asks for every one
-// left out on a TTY; off a TTY a missing one is the NoTTYError naming it --
-// except the data files, which are simply none when no --data is given, and
-// the proxy settings, which are never asked for: a run works without them,
-// and an interview that asked about ports and images would be a wall in front
-// of the first environment.
+// createFlags are env create's answers as flags. Two of them -- the name and
+// the services -- are what an environment IS, and a TTY is asked for either
+// left out. The rest describe what a sandbox of it DOES, and are recorded
+// only when a flag says so: a question about boot sources, seed files, ports
+// and images is a wall in front of the first environment, and every one of
+// them has an answer `up` and `run` reach without being told.
 type createFlags struct {
 	services string
 	from     string
@@ -112,16 +113,20 @@ func envCreateCommand() *cli.Command {
 		Summary: "Define a named environment",
 		Usage:   "veris env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force] [--json]",
 		Help: `The name and service list go to the server (POST /v1/environments), or
---from adopts an existing server environment by id. TTL, boot choice, data
-files and test command go to the named config in .veris/twin.yaml, which is
-created when the folder has none. On a TTY every answer left out is asked
-for; off a TTY the name, --services (or --from), --boot and --command must
-be flags, no --data means no data files, and no --ttl means none is
-recorded, so the control plane's own default applies. The first environment
-of a project is its default.
+--from adopts an existing server environment by id. The named config in
+.veris/twin.yaml, created when the folder has none, keeps everything else.
 
-The proxy flags are never asked for. They land in the config's proxy: block,
-which fills in whatever a veris run command line leaves out:
+Two questions are asked on a TTY: the name and the services (a searchable
+picker). Off a TTY both must be flags: the name, and --services or --from.
+
+--boot, --snapshot, --data and --command are recorded only when given, and
+nothing is written for the ones left out -- a sandbox then boots the bundle,
+seeds nothing, and veris run takes its command after --. Likewise no --ttl
+records no ttl_minutes, so the control plane's own default applies. The
+first environment of a project is its default.
+
+The proxy flags land in the config's proxy: block, which fills in whatever a
+veris run command line leaves out:
 
   environments:
     NAME:
@@ -138,7 +143,7 @@ which fills in whatever a veris run command line leaves out:
 	}
 }
 
-// bootChoices are the three boot sources, in the picker's order.
+// bootChoices are the three boot sources --boot accepts.
 var bootChoices = []string{"bundle", "baseline", "snapshot"}
 
 func validBoot(b string) bool {
@@ -208,8 +213,14 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	if f.boot != "" && !validBoot(f.boot) {
 		return &cli.UsageError{Msg: fmt.Sprintf("--boot must be one of %s, not %q", strings.Join(bootChoices, ", "), f.boot)}
 	}
-	if f.snapshot != "" && f.boot != "" && f.boot != "snapshot" {
+	if f.snapshot != "" && f.boot != "" && f.boot != bootSnapshot {
 		return &cli.UsageError{Msg: "--snapshot goes with --boot snapshot"}
+	}
+	// Recorded without one, every `up` of this environment is refused until a
+	// --snapshot is typed on the command line. Refusing here beats writing a
+	// config that cannot start.
+	if f.boot == bootSnapshot && f.snapshot == "" {
+		return &cli.UsageError{Msg: "--boot snapshot needs --snapshot ID|NAME"}
 	}
 	if f.ttl < 0 {
 		return &cli.UsageError{Msg: "--ttl must be a positive number of minutes"}
@@ -335,50 +346,17 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 		}
 	}
 
-	boot := f.boot
-	if boot == "" {
-		opt, err := s.ui.Select("Boot from:", bootOptions(env), "--boot")
-		if err != nil {
-			return err
-		}
-		boot = opt.Value
-	}
-	snapshot := f.snapshot
-	if boot == "snapshot" && snapshot == "" {
-		if snapshot, err = s.ui.Input("Snapshot id or name", "", "--snapshot"); err != nil {
-			return err
-		}
-		if snapshot == "" {
-			s.ui.Fail("Booting from a snapshot needs its id or name")
-			s.ui.Next("veris env create " + name + " --boot snapshot --snapshot ID|NAME")
-			return printed(1)
-		}
-	}
-
-	// Asked for on a TTY only: a script that names no data files means
-	// none, and a prompt it cannot answer would refuse an otherwise complete
-	// command line for a setting most environments leave empty.
+	// Boot, snapshot, data files and the test command are flags, never
+	// questions. They describe what a SANDBOX does -- which world it starts
+	// from, what is added after it boots, what runs against it -- and each
+	// has an answer `up` and `run` reach on their own, so asking here put
+	// four questions in front of the first environment that nothing needed
+	// answered. Left out, nothing is recorded: `up` boots the bundle, seeds
+	// nothing, and `run` takes its command after --.
+	boot, snapshot := f.boot, f.snapshot
 	data := f.data.vals
-	if !f.data.set && s.ui.TTY {
-		ans, err := s.ui.Input("Data files to add after boot (blank for none)", "", "--data")
-		if err != nil {
-			return err
-		}
-		data = splitList(ans)
-	}
 	if data == nil {
 		data = []string{}
-	}
-
-	if !f.command.set {
-		ans, err := s.ui.Input("Test command (runs through the proxy)", "", "--command")
-		if err != nil {
-			return err
-		}
-		if command, err = splitWords(ans); err != nil {
-			s.ui.Fail("Test command: %v", err)
-			return printed(1)
-		}
 	}
 	if command == nil {
 		command = []string{}
@@ -511,25 +489,6 @@ func unknownServices(names []string, catalog []api.CatalogService) []string {
 		}
 	}
 	return unknown
-}
-
-// bootOptions is the boot picker. env is the adopted server environment,
-// whose baseline, when it has one, is what "baseline" would boot; nil for an
-// environment about to be created, which has nothing promoted yet.
-func bootOptions(env *api.Environment) []ui.Option {
-	baseline := "this environment's promoted snapshot (none yet)"
-	if env != nil && env.Baseline != nil {
-		baseline = "this environment's promoted snapshot (" + shortID(env.Baseline.RevisionID) + ")"
-	}
-	snapshot := "pick one of this environment's snapshots"
-	if env == nil {
-		snapshot += " (none yet)"
-	}
-	return []ui.Option{
-		{Value: "bundle", Label: "bundle", Detail: "the platform image, seed profile 'default'"},
-		{Value: "baseline", Label: "baseline", Detail: baseline},
-		{Value: "snapshot", Label: "snapshot", Detail: snapshot},
-	}
 }
 
 // serverLabel renders a server environment as "name: svc, svc", or the
