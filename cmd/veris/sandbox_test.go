@@ -488,12 +488,17 @@ func TestUpFlagsBeatTheConfigAndJSONGoesToStdout(t *testing.T) {
 	}
 	sbInOrder(t, stderr, "Starting 'ci' (checkout-ci: stripe, postgres) · boot bundle · ttl 5 min", "✓ Up: "+sbID)
 
-	// dev's ttl comes from its config; nothing in ci's config means 120.
+	// dev's ttl comes from its config; nothing in ci's config means the
+	// request carries no ttl_minutes at all and the sandbox lives as long
+	// as the control plane says, since the CLI keeps no default of its own.
 	if code, _, stderr = runSandboxCLI(t, "up", "dev"); code != 0 || !strings.Contains(stderr, "· ttl 240 min") {
 		t.Errorf("exit %d, want dev's ttl 240:\n%s", code, stderr)
 	}
-	if code, _, stderr = runSandboxCLI(t, "up", "ci"); code != 0 || !strings.Contains(stderr, "· ttl 120 min") {
-		t.Errorf("exit %d, want the default ttl 120:\n%s", code, stderr)
+	if code, _, stderr = runSandboxCLI(t, "up", "ci"); code != 0 || !strings.Contains(stderr, "· ttl from the control plane") {
+		t.Errorf("exit %d, want no ttl of the CLI's own:\n%s", code, stderr)
+	}
+	if created = plane.createdReq(); created == nil || created.TTLMinutes != nil {
+		t.Errorf("create request = %+v, want no ttl_minutes at all", created)
 	}
 	// --env is the positional's alias; naming two environments is a mistake.
 	if code, _, stderr = runSandboxCLI(t, "up", "--env", "ci"); code != 0 || !strings.Contains(stderr, "Starting 'ci' ") {
@@ -744,7 +749,7 @@ func TestUpBootSources(t *testing.T) {
 		}
 		sbInOrder(t, stderr,
 			"! 2 snapshots are named 'nightly'; using the newest, "+newer+" (",
-			"· boot snapshot "+shortID(newer)+" · ttl 120 min")
+			"· boot snapshot "+shortID(newer)+" · ttl from the control plane")
 		if got := snapshotSent(t); got != newer {
 			t.Errorf("snapshot_id = %s, want %s", got, newer)
 		}

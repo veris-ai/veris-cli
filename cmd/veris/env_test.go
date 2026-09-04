@@ -416,11 +416,12 @@ func TestEnvCreateOffATTYNamesTheMissingFlag(t *testing.T) {
 	}{
 		{[]string{}, "NAME"},
 		{[]string{"ci"}, "--services"},
-		{[]string{"ci", "--services", "stripe"}, "--ttl"},
-		{[]string{"ci", "--services", "stripe", "--ttl", "20"}, "--boot"},
-		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "snapshot"}, "--snapshot"},
+		// --ttl is not asked for off a TTY either: none given means none
+		// recorded, and the control plane's own default applies.
+		{[]string{"ci", "--services", "stripe"}, "--boot"},
+		{[]string{"ci", "--services", "stripe", "--boot", "snapshot"}, "--snapshot"},
 		// --data is not asked for off a TTY: none given means none.
-		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle"}, "--command"},
+		{[]string{"ci", "--services", "stripe", "--boot", "bundle"}, "--command"},
 		{[]string{"ci", "--services", "stripe", "--ttl", "20", "--boot", "bundle", "--data", ""}, "--command"},
 	}
 	for _, c := range cases {
@@ -447,8 +448,8 @@ func TestEnvCreateOffATTYNamesTheMissingFlag(t *testing.T) {
 
 func TestEnvCreateInterview(t *testing.T) {
 	b := newEnvBench(t)
-	// name, services, TTL (blank keeps 240), boot (2 = baseline), data,
-	// command, default (blank keeps yes: it is the first environment).
+	// name, services, TTL (blank: none recorded), boot (2 = baseline),
+	// data, command, default (blank keeps yes: it is the first environment).
 	stdout, stderr, code := b.runTTY("staging-like\nstripe,postgres\n\n2\ndata/dev-customers.json\npytest -q\n\n", "env", "create")
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s%s", code, stdout, stderr)
@@ -458,7 +459,7 @@ func TestEnvCreateInterview(t *testing.T) {
 		"? Select services:",
 		"1) ◻ stripe  Stripe payments API  api.stripe.com",
 		"2) ◻ postgres  Postgres data plane (DSN)  —",
-		"? Sandbox TTL in minutes (240): ",
+		"? Sandbox TTL in minutes (blank for the control plane's default): ",
 		"? Boot from:",
 		"2) baseline  this environment's promoted snapshot (none yet)",
 		"? Data files to add after boot (blank for none): ",
@@ -468,20 +469,38 @@ func TestEnvCreateInterview(t *testing.T) {
 		"✓ Added 'staging-like' to .veris/twin.yaml as the default")
 	p := b.loadProject()
 	conf := p.Environments["staging-like"]
-	want := cfg.EnvConfig{ID: b.plane.envs[0].ID, TTLMinutes: 240, Boot: "baseline", Data: []string{"data/dev-customers.json"}, Run: cfg.RunConfig{Command: []string{"pytest", "-q"}}}
+	want := cfg.EnvConfig{ID: b.plane.envs[0].ID, Boot: "baseline", Data: []string{"data/dev-customers.json"}, Run: cfg.RunConfig{Command: []string{"pytest", "-q"}}}
 	if p.Default != "staging-like" || !reflect.DeepEqual(conf, want) {
 		t.Errorf("default %q config %+v, want %+v", p.Default, conf, want)
 	}
+	// A blank answer records nothing at all: the file has no ttl_minutes,
+	// so every up of this environment takes the TTL the control plane
+	// hands out rather than a number this CLI made up.
+	if raw, err := os.ReadFile(p.Path); err != nil || strings.Contains(string(raw), "ttl_minutes") {
+		t.Errorf("%s carries a ttl_minutes: %v\n%s", p.Path, err, raw)
+	}
 
-	t.Run("a bad TTL is asked again and the default question leans to no once there is a default", func(t *testing.T) {
-		_, stderr, code := b.runTTY("abc\n30\ny\n", "env", "create", "ci", "--services", "stripe", "--boot", "bundle", "--data", "", "--command", "")
+	t.Run("a TTL that is not a number is warned about and recorded as none, and the default question leans to no once there is a default", func(t *testing.T) {
+		_, stderr, code := b.runTTY("abc\ny\n", "env", "create", "ci", "--services", "stripe", "--boot", "bundle", "--data", "", "--command", "")
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
-		wantLines(t, stderr, "! 'abc' is not a number of minutes", "Make 'ci' this project's default environment? [y/N] ")
+		wantLines(t, stderr,
+			"! 'abc' is not a number of minutes; recording none (the control plane's default applies)",
+			"Make 'ci' this project's default environment? [y/N] ")
 		p := b.loadProject()
-		if p.Default != "ci" || p.Environments["ci"].TTLMinutes != 30 {
+		if p.Default != "ci" || p.Environments["ci"].TTLMinutes != 0 {
 			t.Errorf("default %q ttl %d", p.Default, p.Environments["ci"].TTLMinutes)
+		}
+	})
+
+	t.Run("a number is recorded as given", func(t *testing.T) {
+		_, stderr, code := b.runTTY("30\nn\n", "env", "create", "perf", "--services", "stripe", "--boot", "bundle", "--data", "", "--command", "")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if ttl := b.loadProject().Environments["perf"].TTLMinutes; ttl != 30 {
+			t.Errorf("ttl %d, want 30", ttl)
 		}
 	})
 
@@ -992,7 +1011,7 @@ func TestEnvGet(t *testing.T) {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
 		out := squash(stderr)
-		wantLines(t, out, "Environment ci ("+ciID+") argument", "TTL 120 min default", "Boot bundle default", "Baseline none (boots the bundle)")
+		wantLines(t, out, "Environment ci ("+ciID+") argument", "TTL — default", "Boot bundle default", "Baseline none (boots the bundle)")
 	})
 
 	t.Run("--json", func(t *testing.T) {

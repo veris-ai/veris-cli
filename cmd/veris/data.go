@@ -28,19 +28,20 @@ const (
 	cellWidth = 40
 )
 
-// sandboxDataCommand is `veris sandbox data …`: schemas, rows and adding
-// your own data to a running sandbox.
+// sandboxDataCommand is `veris sandbox data …`: schemas, rows, and adding,
+// editing and removing your own data in a running sandbox.
 func sandboxDataCommand() *cli.Command {
-	var schemaID, schemaTable, getID, addID string
+	var schemaID, schemaTable, getID, addID, setID, deleteID string
 	var limit int
 	return &cli.Command{
 		Name:    "data",
-		Summary: "A sandbox's data: schema, get, add",
+		Summary: "A sandbox's data: schema, get, add, set, delete",
 		Usage:   "veris sandbox data <command> [--id ID] [flags]",
 		Help: "schema is the shape of the rows a twin accepts (GET /veris/schema), get reads counts or rows\n" +
 			"(GET /veris/data), add posts rows of your own from a file keyed by twin name, exactly as up\n" +
-			"does with the environment's data files. Each verb acts on this folder's sandbox unless --id\n" +
-			"names another.",
+			"does with the environment's data files. set changes a row that already exists (PATCH) and\n" +
+			"delete removes one (DELETE), each named field by field on the command line. Each verb acts\n" +
+			"on this folder's sandbox unless --id names another.",
 		Sub: []*cli.Command{
 			{
 				Name:    "schema",
@@ -69,7 +70,7 @@ func sandboxDataCommand() *cli.Command {
 			},
 			{
 				Name:    "get",
-				Summary: "Row counts per table, or the rows of one table newest first",
+				Summary: "Row counts per table, or a page of one table's rows",
 				Usage:   "veris sandbox data get [NAME [TABLE]] [--limit N] [--id ID] [--json]",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&getID, "id", "", "sandbox id (default: this folder's)")
@@ -109,6 +110,45 @@ func sandboxDataCommand() *cli.Command {
 						return errors.New("sandbox data add needs at least one FILE")
 					}
 					return dataAdd(ctx, addID, args)
+				},
+			},
+			{
+				Name:    "set",
+				Summary: "Change a row that already exists, by its key",
+				Usage:   "veris sandbox data set NAME TABLE FIELD=VALUE… [--id ID]",
+				Help: "The row is the one the fields name, so `data set yente config id=1 dataset_scope=default`\n" +
+					"edits the config row whose id is 1 and leaves its other columns alone. Each VALUE is read\n" +
+					"as JSON and kept as the literal string when it is not one: id=1 is a number, enabled=true\n" +
+					"a boolean, x=null null, mode=permissive a string. One row at a time, and the only way to\n" +
+					"change the clock, client and auth singletons; whole files of new rows are add.",
+				Flags: func(fs *flag.FlagSet) {
+					fs.StringVar(&setID, "id", "", "sandbox id (default: this folder's)")
+				},
+				Run: func(ctx *cli.Context, args []string) error {
+					name, table, row, err := dataArgs("set", args)
+					if err != nil {
+						return err
+					}
+					return dataSet(ctx, setID, name, table, row)
+				},
+			},
+			{
+				Name:    "delete",
+				Summary: "Remove a row, by its key",
+				Usage:   "veris sandbox data delete NAME TABLE FIELD=VALUE… [--id ID] [--yes]",
+				Help: "The row is the one the fields name, as set names it, and the key alone is enough:\n" +
+					"`data delete stripe faults id=flt_1` disarms a fault. Each VALUE is read as JSON and kept\n" +
+					"as the literal string when it is not one. It asks first, since rows do not come back;\n" +
+					"--yes answers. A twin refuses to delete its singletons and says what to do instead.",
+				Flags: func(fs *flag.FlagSet) {
+					fs.StringVar(&deleteID, "id", "", "sandbox id (default: this folder's)")
+				},
+				Run: func(ctx *cli.Context, args []string) error {
+					name, table, row, err := dataArgs("delete", args)
+					if err != nil {
+						return err
+					}
+					return dataDelete(ctx, deleteID, name, table, row)
 				},
 			},
 		},
@@ -708,8 +748,11 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit int) error {
 	return nil
 }
 
-// dataRows prints one page of a table, newest first, as a table whose
-// columns are the rows' keys in the schema's order with id first.
+// dataRows prints one page of a table as a table whose columns are the
+// rows' keys in the schema's order with id first. The order is the twin's
+// own: GET /veris/data takes a table, a limit and an offset, and no sort,
+// so a row written a moment ago may be on any page. To see what a run just
+// sent, read the trace, which is ordered.
 func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string, limit int) error {
 	if svc.ControlURL == "" {
 		s.ui.Fail("%s has no control URL to read rows through (data plane; query it with your own client at %s)", svc.Name, svc.URL)
@@ -736,7 +779,7 @@ func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string
 			}
 		}
 	}
-	s.ui.Info("%s.%s · %d of %d rows (newest first)", svc.Name, table, len(page.Rows), page.Total)
+	s.ui.Info("%s.%s · %d of %d rows", svc.Name, table, len(page.Rows), page.Total)
 	if len(page.Rows) == 0 {
 		s.ui.Detail("(no rows)")
 		return nil
@@ -904,10 +947,11 @@ func dataAdd(ctx *cli.Context, idFlag string, files []string) error {
 	return nil
 }
 
-// addDelta is the parenthetical after an add: the state_version before and
+// addDelta is the parenthetical after a write: the state_version before and
 // after, and the new totals of the tables written, from the two count
 // reads. "" when either read failed, since a guessed number is worse than
-// none.
+// none. No tables (nil) is the version alone, which is what an edit that
+// changed no row count has to report.
 func addDelta(added map[string]int, before, after *twin.Counts) string {
 	if before == nil || after == nil {
 		return ""
@@ -925,4 +969,119 @@ func addDelta(added map[string]int, before, after *twin.Counts) string {
 		delta += "; " + strings.Join(parts, ", ")
 	}
 	return "   (" + delta + ")"
+}
+
+// --- data set and data delete -----------------------------------------------
+
+// dataRow is one row named on the command line: the fields as they were
+// typed, for the confirmation, and their parsed values, for the body.
+type dataRow struct {
+	spec   string
+	fields map[string]any
+}
+
+// dataArgs reads NAME TABLE FIELD=VALUE… as set and delete take them. Both
+// verbs act on one row, named by including its key among the fields.
+func dataArgs(verb string, args []string) (name, table string, row dataRow, err error) {
+	if len(args) < 3 {
+		return "", "", row, fmt.Errorf("sandbox data %s needs a twin NAME, a TABLE and at least one FIELD=VALUE", verb)
+	}
+	row = dataRow{spec: strings.Join(args[2:], " "), fields: map[string]any{}}
+	for _, arg := range args[2:] {
+		field, value, ok := strings.Cut(arg, "=")
+		if !ok || field == "" {
+			return "", "", row, fmt.Errorf("sandbox data %s takes fields as FIELD=VALUE (got %q)", verb, arg)
+		}
+		row.fields[field] = fieldValue(value)
+	}
+	return args[0], args[1], row, nil
+}
+
+// fieldValue is one VALUE typed as the twin's schema means it: JSON when it
+// parses as JSON, so id=1 is a number, enabled=true a boolean and x=null
+// null, and the literal string otherwise, so mode=permissive and an id like
+// cus_1 arrive as themselves.
+func fieldValue(v string) any {
+	var parsed any
+	if json.Unmarshal([]byte(v), &parsed) != nil {
+		return v
+	}
+	return parsed
+}
+
+// dataTwin is the sandbox and the twin one row write acts on. An unknown
+// name is twinNamed's failure; a twin with no control URL has no write
+// route at all, and its rows are the user's own SQL.
+func dataTwin(ctx *cli.Context, idFlag, name, verb string) (*session, *api.Sandbox, *twin.Client, error) {
+	s, _, sb, err := openSandboxServices(ctx, idFlag)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	svc, err := twinNamed(s, sb, name)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if svc.ControlURL == "" {
+		s.ui.Fail("%s has no control URL to %s rows through (data plane; write to it with your own client at %s)",
+			svc.Name, verb, svc.URL)
+		return nil, nil, nil, printed(1)
+	}
+	return s, sb, s.twin(svc.ControlURL), nil
+}
+
+// dataSet edits the row the fields name (PATCH /veris/data), the columns
+// given and no others:
+//
+//	✓ yente: updated config 1   (state_version 3 → 4)
+//
+// The parenthetical carries the version alone, not the table's new total:
+// an edit adds and removes nothing, so a row count would say nothing about
+// what happened. A refusal is printed reason by reason, as add's is.
+func dataSet(ctx *cli.Context, idFlag, name, table string, row dataRow) error {
+	s, _, tw, err := dataTwin(ctx, idFlag, name, "change")
+	if err != nil {
+		return err
+	}
+	bg := context.Background()
+	before, _ := tw.Counts(bg)
+	w, err := tw.Patch(bg, map[string]any{table: []any{row.fields}})
+	if err != nil {
+		return s.fail("set", table+" of "+name, err)
+	}
+	for _, warn := range w.Warnings {
+		s.ui.Warn("%s: %s", name, warn)
+	}
+	after, _ := tw.Counts(bg)
+	s.ui.Success("%s: updated %s%s", name, countsLine(w.Updated), addDelta(nil, before, after))
+	return nil
+}
+
+// dataDelete removes the row the fields name (DELETE /veris/data):
+//
+//	✓ stripe: deleted faults 1   (state_version 4 → 5; faults now 0)
+//
+// It asks first, since a deleted row does not come back and --yes is the
+// way to say so up front. A twin that will not delete a table -- the clock,
+// client, auth and delivery_attempts singletons -- answers with what to do
+// instead, and that answer is printed as it came.
+func dataDelete(ctx *cli.Context, idFlag, name, table string, row dataRow) error {
+	s, sb, tw, err := dataTwin(ctx, idFlag, name, "delete")
+	if err != nil {
+		return err
+	}
+	if err := confirm(s.ui, fmt.Sprintf("Delete the row %s from %s.%s (sandbox %s)?", row.spec, name, table, sb.ID)); err != nil {
+		return err
+	}
+	bg := context.Background()
+	before, _ := tw.Counts(bg)
+	w, err := tw.Delete(bg, map[string]any{table: []any{row.fields}})
+	if err != nil {
+		return s.fail("delete", table+" of "+name, err)
+	}
+	for _, warn := range w.Warnings {
+		s.ui.Warn("%s: %s", name, warn)
+	}
+	after, _ := tw.Counts(bg)
+	s.ui.Success("%s: deleted %s%s", name, countsLine(w.Deleted), addDelta(w.Deleted, before, after))
+	return nil
 }

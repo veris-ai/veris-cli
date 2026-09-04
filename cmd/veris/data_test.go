@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -240,13 +241,13 @@ func TestSandboxDataGet(t *testing.T) {
 		}
 	})
 
-	t.Run("rows of one table, newest first, columns in schema order", func(t *testing.T) {
+	t.Run("rows of one table, columns in schema order", func(t *testing.T) {
 		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe", "customers", "--limit", "5")
 		if code != 0 || stdout != "" {
 			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
 		}
 		sbInOrder(t, stderr,
-			"stripe.customers · 2 of 41 rows (newest first)\n",
+			"stripe.customers · 2 of 41 rows\n",
 			"  id", "email", "name", "created", "metadata", "balance\n",
 			"  cus_2", "bob@example.com", "—", "1700000000", `{"tier":"gold"}`, "0\n",
 			"  cus_1", "ada@example.com", "Ada", "1699999999", "{}", "-5\n",
@@ -276,7 +277,7 @@ func TestSandboxDataGet(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
-		sbInOrder(t, stderr, "stripe.faults · 0 of 39 rows (newest first)\n", "  (no rows)\n")
+		sbInOrder(t, stderr, "stripe.faults · 0 of 39 rows\n", "  (no rows)\n")
 	})
 
 	t.Run("a table the twin does not have", func(t *testing.T) {
@@ -452,6 +453,172 @@ func TestSandboxDataAdd(t *testing.T) {
 		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "add")
 		if code != 1 || !strings.Contains(stderr, "veris: sandbox data add needs at least one FILE") {
 			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+}
+
+// editedRow is the one row of a table in a PATCH or DELETE body.
+func editedRow(t *testing.T, e dataEdit, table string) map[string]any {
+	t.Helper()
+	rows, ok := e.data[table].([]any)
+	if !ok || len(rows) != 1 {
+		t.Fatalf("%s %v carries no single %s row", e.method, e.data, table)
+	}
+	row, ok := rows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("%s %v is not a row object", e.method, rows[0])
+	}
+	return row
+}
+
+func TestSandboxDataSet(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newDataTwins(t)
+	dataBench(t, plane, twins.services())
+
+	t.Run("the fields name the row, and only they are sent, as a PATCH of that table", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "set", "stripe", "customers", "id=cus_1", "balance=100")
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		// The parenthetical is the version alone: an edit moves no row
+		// count, so a table total would say nothing about what happened.
+		if want := "✓ stripe: updated customers 1   (state_version 3 → 4)\n"; !strings.Contains(stderr, want) {
+			t.Errorf("want %q in:\n%s", want, stderr)
+		}
+		edits := twins.edited()
+		if len(edits) != 1 || edits[0].method != http.MethodPatch || edits[0].twin != "stripe" {
+			t.Fatalf("edits = %+v, want one PATCH to stripe", edits)
+		}
+		row := editedRow(t, edits[0], "customers")
+		if len(row) != 2 || row["id"] != "cus_1" || row["balance"] != float64(100) {
+			t.Errorf("row = %v, want the two fields named and nothing else", row)
+		}
+	})
+
+	t.Run("a value that is not JSON is sent as a string, while 1, true and null are not", func(t *testing.T) {
+		twins.script(func(f *dataTwins) { f.edits = nil })
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "set", "stripe", "customers",
+			"id=cus_1", "name=Ada", "balance=1", "delinquent=true", "email=ada@example.com",
+			"metadata=null", `address={"city": "Berlin"}`)
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		edits := twins.edited()
+		if len(edits) != 1 {
+			t.Fatalf("edits = %+v, want one", edits)
+		}
+		row := editedRow(t, edits[0], "customers")
+		for field, want := range map[string]any{
+			"id": "cus_1", "name": "Ada", "balance": float64(1), "delinquent": true,
+			"email": "ada@example.com", "metadata": nil,
+		} {
+			got, ok := row[field]
+			if !ok || got != want {
+				t.Errorf("%s = %#v (present %v), want %#v", field, got, ok, want)
+			}
+		}
+		if addr, ok := row["address"].(map[string]any); !ok || addr["city"] != "Berlin" {
+			t.Errorf("address = %#v, want the JSON object it parses as", row["address"])
+		}
+	})
+
+	t.Run("a twin the sandbox does not have", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "set", "shopify", "orders", "id=1")
+		if code != 1 || !strings.Contains(stderr, "✗ No twin named 'shopify' in sandbox "+sbID) {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("a twin with no control URL has no route to write through", func(t *testing.T) {
+		services := twins.services()
+		services[0].ControlURL = ""
+		services[0].URL = "https://api.stripe.com"
+		plane.script(func(p *sandboxPlane) {
+			p.answer = func(int) *api.Sandbox { return readySandbox(services, time.Now().Add(time.Hour)) }
+		})
+		defer plane.script(func(p *sandboxPlane) {
+			p.answer = func(int) *api.Sandbox { return readySandbox(twins.services(), time.Now().Add(time.Hour)) }
+		})
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "set", "stripe", "customers", "id=cus_1")
+		if code != 1 || !strings.Contains(stderr, "✗ stripe has no control URL to change rows through (data plane; write to it with your own client at https://api.stripe.com)") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("a missing NAME, TABLE or field", func(t *testing.T) {
+		for _, args := range [][]string{{}, {"stripe"}, {"stripe", "customers"}} {
+			code, _, stderr := runSandboxCLI(t, append([]string{"sandbox", "data", "set"}, args...)...)
+			if code != 1 || !strings.Contains(stderr, "veris: sandbox data set needs a twin NAME, a TABLE and at least one FIELD=VALUE") {
+				t.Errorf("%v: exit %d:\n%s", args, code, stderr)
+			}
+		}
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "set", "stripe", "customers", "id")
+		if code != 1 || !strings.Contains(stderr, `veris: sandbox data set takes fields as FIELD=VALUE (got "id")`) {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+}
+
+func TestSandboxDataDelete(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newDataTwins(t)
+	dataBench(t, plane, twins.services())
+
+	t.Run("it asks first, and off a TTY without --yes nothing is sent", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "delete", "stripe", "customers", "id=cus_1")
+		if code != 1 || !strings.Contains(stderr, "Pass --yes instead") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+		if got := twins.edited(); len(got) != 0 {
+			t.Errorf("a declined delete was sent: %+v", got)
+		}
+	})
+
+	t.Run("--yes answers the question and the row goes, counts and all", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "delete", "stripe", "customers", "id=cus_1", "--yes")
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		sbInOrder(t, stderr,
+			"Delete the row id=cus_1 from stripe.customers (sandbox "+sbID+")? y\n",
+			"✓ stripe: deleted customers 1   (state_version 3 → 4; customers now 40)\n")
+		edits := twins.edited()
+		if len(edits) != 1 || edits[0].method != http.MethodDelete || edits[0].twin != "stripe" {
+			t.Fatalf("edits = %+v, want one DELETE to stripe", edits)
+		}
+		if row := editedRow(t, edits[0], "customers"); len(row) != 1 || row["id"] != "cus_1" {
+			t.Errorf("row = %v, want the key alone", row)
+		}
+	})
+
+	t.Run("a twin that will not delete a singleton says what to do instead, in its own words", func(t *testing.T) {
+		twins.script(func(f *dataTwins) { f.edits = nil })
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "delete", "stripe", "clock", "id=1", "--yes")
+		if code != 1 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr,
+			"✗ Failed to delete clock of stripe: [422]\n",
+			"  clock: the clock is a singleton and cannot be deleted; reset it with PATCH (mode=live, offset_seconds=0)\n")
+		if strings.Contains(stderr, "✓") {
+			t.Errorf("nothing was deleted:\n%s", stderr)
+		}
+	})
+
+	t.Run("a twin the sandbox does not have", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "delete", "shopify", "orders", "id=1", "--yes")
+		if code != 1 || !strings.Contains(stderr, "✗ No twin named 'shopify' in sandbox "+sbID) {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("a missing NAME, TABLE or field", func(t *testing.T) {
+		for _, args := range [][]string{{}, {"stripe"}, {"stripe", "customers"}} {
+			code, _, stderr := runSandboxCLI(t, append([]string{"sandbox", "data", "delete"}, args...)...)
+			if code != 1 || !strings.Contains(stderr, "veris: sandbox data delete needs a twin NAME, a TABLE and at least one FIELD=VALUE") {
+				t.Errorf("%v: exit %d:\n%s", args, code, stderr)
+			}
 		}
 	})
 }

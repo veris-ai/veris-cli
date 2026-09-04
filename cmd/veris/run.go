@@ -577,7 +577,7 @@ func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
 		fatal = reportUnmetAndTrust(os.Stderr, unmet, *engine, trustAdvice{})
 	}
 	// Then the sandbox's own account, judged with the same requirements.
-	l, v := p.finish(bg, os.Stderr, engine, o.reqs, o.callbackReqs, o.fresh, o.quiet)
+	l, v := p.finish(bg, os.Stderr, engine, o.reqs, o.callbackReqs, o.fresh, o.quiet, int(status))
 	if shutErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"veris: the proxy did not shut down cleanly (%v), so this receipt may be short\n",
@@ -645,7 +645,7 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 		// The containers never ran: nothing to read after.
 		return err
 	}
-	l, v := p.finish(bg, os.Stderr, engine, reqs, callbackReqs, fresh, quiet)
+	l, v := p.finish(bg, os.Stderr, engine, reqs, callbackReqs, fresh, quiet, int(status))
 	// Same ranking as the host tier: unmet first, then the command's own
 	// code, then indeterminate.
 	code := int(status)

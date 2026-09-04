@@ -458,7 +458,7 @@ func TestLedgerCapIsAFloorAndUndecidedAssertionsAreIndeterminate(t *testing.T) {
 	got := assertLedger(l, p.marks, []requirement{
 		{kind: "service", name: "stripe", count: 1},
 		{kind: "service", name: "stripe", count: 2000},
-	}, nil, false)
+	}, nil, false, 0)
 	if len(got) != 2 || !got[0].OK || got[0].Indeterminate {
 		t.Errorf("stripe:1 under a cap of 1000 is met: %+v", got)
 	}
@@ -505,7 +505,7 @@ func TestLedgerDeliveriesAndCallbackAssertions(t *testing.T) {
 		{kind: "callback", name: "/hooks/stripe", count: 3},
 		{kind: "callback", name: "*", count: 1},
 		{kind: "callback", name: "/hooks/other", count: 1},
-	}, false)
+	}, false, 0)
 	want := []struct {
 		ok  bool
 		got int64
@@ -535,7 +535,7 @@ func TestLedgerAssertionOutcomes(t *testing.T) {
 		var out strings.Builder
 		v := printVerdict(&out, &ledger{Twins: []*ledgerTwin{{Name: "stripe"}}},
 			assertLedger(&ledger{Twins: []*ledgerTwin{{Name: "stripe"}}}, marks,
-				[]requirement{{kind: "service", name: "stripe", count: 1}}, nil, false), nil, false)
+				[]requirement{{kind: "service", name: "stripe", count: 1}}, nil, false, 0), nil, false)
 		if !v.Fatal || v.Indeterminate {
 			t.Errorf("verdict = %+v, want fatal", v)
 		}
@@ -546,7 +546,7 @@ func TestLedgerAssertionOutcomes(t *testing.T) {
 	})
 	t.Run("met, and the ledgers compared", func(t *testing.T) {
 		var out strings.Builder
-		v := printVerdict(&out, l, assertLedger(l, marks, []requirement{{kind: "service", name: "stripe", count: 5}}, nil, false), engine, false)
+		v := printVerdict(&out, l, assertLedger(l, marks, []requirement{{kind: "service", name: "stripe", count: 5}}, nil, false, 0), engine, false)
 		if v.Fatal || v.Indeterminate {
 			t.Errorf("verdict = %+v", v)
 		}
@@ -574,25 +574,25 @@ func TestLedgerAssertionOutcomes(t *testing.T) {
 		}
 	})
 	t.Run("host requirements are the engine's alone", func(t *testing.T) {
-		if got := assertLedger(l, marks, []requirement{{kind: "host", name: "api.stripe.com", count: 1}}, nil, false); len(got) != 0 {
+		if got := assertLedger(l, marks, []requirement{{kind: "host", name: "api.stripe.com", count: 1}}, nil, false, 0); len(got) != 0 {
 			t.Errorf("a host requirement judged on the ledger: %+v", got)
 		}
 	})
 	t.Run("a twin that keeps no log is the engine's alone", func(t *testing.T) {
 		// The ledger never observed postgres: neither refuted (exit 3) nor
 		// undecided (exit 4), just not its to judge.
-		if got := assertLedger(l, marks, []requirement{{kind: "service", name: "postgres", count: 1}}, nil, false); len(got) != 0 {
+		if got := assertLedger(l, marks, []requirement{{kind: "service", name: "postgres", count: 1}}, nil, false, 0); len(got) != 0 {
 			t.Errorf("a requirement on a twin without a log judged on the ledger: %+v", got)
 		}
 		// A twin the sandbox does not have at all is still counted 0.
-		if got := assertLedger(l, marks, []requirement{{kind: "service", name: "shopify", count: 1}}, nil, false); len(got) != 1 || got[0].OK || got[0].Indeterminate {
+		if got := assertLedger(l, marks, []requirement{{kind: "service", name: "shopify", count: 1}}, nil, false, 0); len(got) != 1 || got[0].OK || got[0].Indeterminate {
 			t.Errorf("an unknown twin: %+v", got)
 		}
 	})
 	t.Run("an unreadable twin is indeterminate, exit 4", func(t *testing.T) {
 		broken := &ledger{Unreadable: []string{"stripe: [500] the log is unavailable"}}
 		var out strings.Builder
-		v := printVerdict(&out, broken, assertLedger(broken, marks, []requirement{{kind: "service", name: "stripe", count: 1}}, nil, false), engine, false)
+		v := printVerdict(&out, broken, assertLedger(broken, marks, []requirement{{kind: "service", name: "stripe", count: 1}}, nil, false, 0), engine, false)
 		if v.Fatal || !v.Indeterminate {
 			t.Errorf("verdict = %+v, want indeterminate", v)
 		}
@@ -601,13 +601,13 @@ func TestLedgerAssertionOutcomes(t *testing.T) {
 		}
 		// A requirement on another, readable twin is decided as usual.
 		if got := assertLedger(&ledger{Twins: l.Twins, Unreadable: broken.Unreadable}, marks,
-			[]requirement{{kind: "service", name: "stripe", count: 1}}, nil, false); len(got) != 1 || !got[0].OK {
+			[]requirement{{kind: "service", name: "stripe", count: 1}}, nil, false, 0); len(got) != 1 || !got[0].OK {
 			t.Errorf("stripe readable beside an unreadable twin: %+v", got)
 		}
 	})
 	t.Run("a fresh run asserts a non-empty ledger by default", func(t *testing.T) {
 		empty := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Control: 4}}}
-		got := assertLedger(empty, marks, nil, nil, true)
+		got := assertLedger(empty, marks, nil, nil, true, 0)
 		if len(got) != 1 || got[0].Kind != "ledger" || got[0].OK {
 			t.Fatalf("fresh default = %+v", got)
 		}
@@ -620,17 +620,17 @@ func TestLedgerAssertionOutcomes(t *testing.T) {
 		}
 		// Explicit requirements take the judgement over; traffic satisfies it;
 		// attaching asserts nothing.
-		if got := assertLedger(empty, marks, []requirement{{kind: "service", name: "stripe", count: 1}}, nil, true); len(got) != 1 || got[0].Kind != "service" {
+		if got := assertLedger(empty, marks, []requirement{{kind: "service", name: "stripe", count: 1}}, nil, true, 0); len(got) != 1 || got[0].Kind != "service" {
 			t.Errorf("explicit requirements must own the fresh verdict: %+v", got)
 		}
-		if got := assertLedger(l, marks, nil, nil, true); len(got) != 1 || !got[0].OK {
+		if got := assertLedger(l, marks, nil, nil, true, 0); len(got) != 1 || !got[0].OK {
 			t.Errorf("a non-empty ledger meets the fresh default: %+v", got)
 		}
-		if got := assertLedger(empty, marks, nil, nil, false); len(got) != 0 {
+		if got := assertLedger(empty, marks, nil, nil, false, 0); len(got) != 0 {
 			t.Errorf("attaching must assert nothing: %+v", got)
 		}
 		// Unreadable and empty: undecidable rather than refuted.
-		if got := assertLedger(nil, nil, nil, nil, true); len(got) != 1 || !got[0].Indeterminate {
+		if got := assertLedger(nil, nil, nil, nil, true, 0); len(got) != 1 || !got[0].Indeterminate {
 			t.Errorf("no ledger at all: %+v", got)
 		}
 	})
@@ -751,7 +751,7 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 
 	t.Run("the ledger met it and the engine saw less", func(t *testing.T) {
 		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 5}}}
-		got := assertLedger(l, marks, req("stripe", 5), nil, false)
+		got := assertLedger(l, marks, req("stripe", 5), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || !got[0].OK || got[0].Source != "ledger" || got[0].met() != "required stripe ≥5: saw 5 (sandbox ledger; the engine saw 3)" {
 			t.Errorf("%+v: %s", got, got[0].met())
@@ -759,7 +759,7 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 	})
 	t.Run("the engine met it and the ledger recorded less", func(t *testing.T) {
 		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 1}}}
-		got := assertLedger(l, marks, req("stripe", 2), nil, false)
+		got := assertLedger(l, marks, req("stripe", 2), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || !got[0].OK || got[0].Got != 3 || got[0].Source != "engine" || got[0].met() != "required stripe ≥2: saw 3 (engine; the sandbox ledger recorded 1)" {
 			t.Errorf("%+v: %s", got, got[0].met())
@@ -767,7 +767,7 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 	})
 	t.Run("both agree: no source named", func(t *testing.T) {
 		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3}}}
-		got := assertLedger(l, marks, req("stripe", 3), nil, false)
+		got := assertLedger(l, marks, req("stripe", 3), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || !got[0].OK || got[0].Source != "" || got[0].met() != "required stripe ≥3: saw 3" {
 			t.Errorf("%+v: %s", got, got[0].met())
@@ -775,7 +775,7 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 	})
 	t.Run("neither shows it", func(t *testing.T) {
 		l := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3}}}
-		got := assertLedger(l, marks, req("stripe", 4), nil, false)
+		got := assertLedger(l, marks, req("stripe", 4), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || got[0].OK || got[0].Indeterminate || got[0].Got != 3 {
 			t.Errorf("%+v", got)
@@ -783,12 +783,12 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 	})
 	t.Run("an unproxied twin is the ledger's alone, whatever the engine says", func(t *testing.T) {
 		l := &ledger{Twins: []*ledgerTwin{{Name: "yente", Count: 4, NotProxied: true}}}
-		got := assertLedger(l, marks, req("yente", 1), nil, false)
+		got := assertLedger(l, marks, req("yente", 1), nil, false, 0)
 		vouch(got, &proxy.Receipt{ByService: map[string]int64{"yente": 0}})
 		if len(got) != 1 || !got[0].OK || !got[0].NotProxied || got[0].met() != "required yente ≥1: saw 4 (sandbox ledger; not proxied)" {
 			t.Errorf("%+v: %s", got, got[0].met())
 		}
-		got = assertLedger(&ledger{Twins: []*ledgerTwin{{Name: "yente", NotProxied: true}}}, marks, req("yente", 1), nil, false)
+		got = assertLedger(&ledger{Twins: []*ledgerTwin{{Name: "yente", NotProxied: true}}}, marks, req("yente", 1), nil, false, 0)
 		vouch(got, &proxy.Receipt{ByService: map[string]int64{"yente": 9}})
 		if len(got) != 1 || got[0].OK || got[0].Source != "" {
 			t.Errorf("the engine's count of an unproxied twin is no evidence: %+v", got)
@@ -796,12 +796,12 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 	})
 	t.Run("an unreadable ledger: the engine vouches, or refutes", func(t *testing.T) {
 		broken := &ledger{Unreadable: []string{"stripe: [500] the log is unavailable"}}
-		got := assertLedger(broken, marks, req("stripe", 1), nil, false)
+		got := assertLedger(broken, marks, req("stripe", 1), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || !got[0].OK || got[0].Indeterminate || got[0].met() != "required stripe ≥1: saw 3 (engine; stripe's ledger could not be read)" {
 			t.Errorf("%+v: %s", got, got[0].met())
 		}
-		got = assertLedger(broken, marks, req("stripe", 4), nil, false)
+		got = assertLedger(broken, marks, req("stripe", 4), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || got[0].OK || got[0].Indeterminate ||
 			got[0].unmet() != "the run required service stripe at least 4 time(s) but the engine saw it 3 time(s) and stripe's ledger could not be read" {
@@ -809,13 +809,13 @@ func TestVouchMergesTheEngineIntoTheVerdict(t *testing.T) {
 		}
 		// Read to the cap, rows may yet exist: undecided stays undecided.
 		capped := &ledger{Twins: []*ledgerTwin{{Name: "stripe", Count: 3, Capped: true}}}
-		got = assertLedger(capped, marks, req("stripe", 4), nil, false)
+		got = assertLedger(capped, marks, req("stripe", 4), nil, false, 0)
 		vouch(got, engine)
 		if len(got) != 1 || !got[0].Indeterminate {
 			t.Errorf("a capped ledger is not refuted by the engine: %+v", got)
 		}
 		// Without the engine's receipt nothing changes.
-		got = assertLedger(broken, marks, req("stripe", 1), nil, false)
+		got = assertLedger(broken, marks, req("stripe", 1), nil, false, 0)
 		vouch(got, nil)
 		if len(got) != 1 || !got[0].Indeterminate {
 			t.Errorf("%+v", got)
@@ -849,6 +849,34 @@ func TestRunRequireUnmetOutranksAFailingChild(t *testing.T) {
 	wantExit(t, err, exitRequirementUnmet)
 	if !strings.Contains(stderr, "veris: ✗ the run required service stripe at least 1 time(s) but the sandbox received it 0 time(s)\n") {
 		t.Errorf("stderr lacks the unmet line:\n%s", stderr)
+	}
+	// And the hint under it names the command's own failure, not a base
+	// URL: the command exited, so its output is where the cause is. A
+	// measured run whose real cause was "No module named pytest" three
+	// lines above was sent at STRIPE_API_BASE by the old wording, which is
+	// the one change every skill forbids.
+	if !strings.Contains(stderr, "the command exited 7: read its own output first") {
+		t.Errorf("the hint should name the command's exit first:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "overridden in your test setup") {
+		t.Errorf("a failing command must not be blamed on a base URL:\n%s", stderr)
+	}
+}
+
+// The mirror of it: a command that SUCCEEDED and still sent nothing is
+// exactly when a base URL pointed somewhere else is the likely cause, so
+// the env hint is named there and only there.
+func TestRunRequireUnmetAfterASucceedingCommandStillAsksAboutTheBaseURL(t *testing.T) {
+	_, _, twins := ledgerBench(t)
+	twins.script(func(f *ledgerTwins) { f.record = false })
+	argv := child(t, "silent")
+	err, stderr := runLine(t, append([]string{"--sandbox", sbID, "--listen", "127.0.0.1:0", "--require-service", "stripe", "--"}, argv...)...)
+	wantExit(t, err, exitRequirementUnmet)
+	if !strings.Contains(stderr, "your tests never touched the sandbox (is STRIPE_API_BASE overridden in your test setup?)") {
+		t.Errorf("stderr lacks the base-URL hint:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "read its own output first") {
+		t.Errorf("a command that exited 0 has no failure to read:\n%s", stderr)
 	}
 }
 
