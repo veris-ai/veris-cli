@@ -15,6 +15,10 @@ jobs:
       - run: gofmt -l . | tee /dev/stderr | (! read)
       - run: go vet ./...
       - run: go test -race ./...
+      # The release version is decided by a shell script from commit
+      # subjects, pushed as a tag and shipped to clients with nobody reading
+      # it first. It is held to examples like anything else here.
+      - run: bash scripts/next-version-test.sh
       # The Go tests use Go's TLS stack, which is more forgiving than most.
       # The e2e run proves the chain is accepted by OpenSSL, Python and Node.
       - run: make e2e

@@ -19,8 +19,12 @@ lint:
 
 # Every target is CGO_ENABLED=0, so each artifact is a single static binary
 # that drops into any image, including Alpine and distroless.
+# Emptied first: `files: dist/*` in the release attaches whatever is in here,
+# and a binary left from an earlier build under an older name would ship
+# beside the real ones. CI starts from a fresh checkout and never saw this;
+# a laptop does.
 dist:
-	@mkdir -p dist
+	@rm -rf dist && mkdir -p dist
 	@for p in $(PLATFORMS); do \
 		os=$${p%/*}; arch=$${p#*/}; ext=""; \
 		[ "$$os" = "windows" ] && ext=".exe"; \

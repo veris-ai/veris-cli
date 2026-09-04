@@ -1,21 +1,167 @@
-# Tag vX.Y.Z -> build the 5 static binaries -> attach them to a GitHub
-# release. scripts/install.sh downloads from here.
+# Release, decided by the commits since the last one.
+#
+# This is the primary way a version ships. Nobody picks the number and nobody
+# pushes the tag: `ci` passing on main is the trigger, the commit subjects
+# since the last tag decide the bump (scripts/next-version.sh), and a run that
+# finds nothing releasable ends without cutting anything.
+#
+# Why workflow_run rather than a job inside ci.yml: a release must happen only
+# when the whole of ci has passed, and only for main. workflow_run gives that
+# in one condition, and keeps the pull-request path — which must never
+# release — from having to be excluded job by job.
+#
+# Why this workflow tags AND publishes, instead of pushing a tag and letting
+# the old tag-triggered jobs run: a tag pushed with GITHUB_TOKEN raises no
+# events. That is GitHub refusing to let a workflow start another one, and it
+# is not negotiable, so a release that pushed a tag and stopped would attach
+# no binaries and publish no image. Both are done here, and image.yml is
+# CALLED rather than duplicated.
+#
+# The escape hatches stay: a person can still push a tag by hand (which does
+# raise events, so image.yml's own tags: trigger picks it up), and
+# workflow_dispatch forces a bump the commits did not ask for — which is how
+# 1.0.0 gets cut, since a script reading subjects has no business declaring a
+# project stable.
 name: release
+
 on:
-  push:
-    tags: ["v*"]
-permissions:
-  contents: write
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Force a bump the commits did not ask for.
+        type: choice
+        options: [major, minor, patch]
+        required: true
+
+concurrency:
+  # Never cancel a release half-done: a cancelled run can leave a tag with no
+  # binaries behind it. Queue instead.
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  release:
+  version:
+    # Only a green ci, only on main, and never for a pull request. The
+    # workflow_run event carries the branch that ci ran on.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.next.outputs.release }}
+      version: ${{ steps.next.outputs.version }}
+      previous: ${{ steps.next.outputs.previous }}
+      bump: ${{ steps.next.outputs.bump }}
+      sha: ${{ steps.sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The commit ci actually passed on, not whatever main has moved to
+          # since. Releasing a commit nothing verified is the one outcome
+          # this whole arrangement exists to prevent.
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          # Every tag and the full history: the version is computed from both.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide the version
+        id: next
+        run: |
+          set -euo pipefail
+          scripts/next-version.sh | tee -a "$GITHUB_OUTPUT"
+
+      - name: Force the bump a dispatch asked for
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          prev="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+          IFS=. read -r ma mi pa <<<"${prev#v}"
+          case "${{ inputs.bump }}" in
+            major) ma=$((ma + 1)); mi=0; pa=0 ;;
+            minor) mi=$((mi + 1)); pa=0 ;;
+            patch) pa=$((pa + 1)) ;;
+          esac
+          {
+            echo "release=true"
+            echo "bump=${{ inputs.bump }} (forced)"
+            echo "previous=$prev"
+            echo "version=v${ma}.${mi}.${pa}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Say so when nothing is releasable
+        if: steps.next.outputs.release == 'false' && github.event_name != 'workflow_dispatch'
+        run: |
+          {
+            echo "### No release"
+            echo
+            echo "Nothing since \`${{ steps.next.outputs.previous }}\` changes what a user of the binary can observe."
+            echo "docs, chore, ci, test, refactor, style and build do not earn a version."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: make dist
+
+      # The binaries BEFORE the tag. A build that fails after tagging leaves a
+      # version nobody can download and a number that can never be reused.
+      - run: make dist VERSION=${{ needs.version.outputs.version }}
+
+      - name: Tag
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.version.outputs.version }}" \
+            -m "${{ needs.version.outputs.version }}" \
+            -m "${{ needs.version.outputs.bump }} since ${{ needs.version.outputs.previous }}"
+          git push origin "${{ needs.version.outputs.version }}"
+
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.version }}
           files: dist/*
           generate_release_notes: true
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ needs.version.outputs.version }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| bump | ${{ needs.version.outputs.bump }} |"
+            echo "| previous | ${{ needs.version.outputs.previous }} |"
+            echo "| commit | \`${{ needs.version.outputs.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Called, not triggered: see the note at the top about GITHUB_TOKEN and tags.
+  image:
+    needs: [version, publish]
+    if: needs.version.outputs.release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
