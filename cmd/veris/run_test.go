@@ -47,6 +47,25 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "fail":
 		os.Exit(7)
+	case "yente":
+		// The client of a twin the proxy does not route: it reads the base
+		// URL the run handed it and calls the twin directly, off the proxy
+		// (a loopback address is never proxied) -- and calls stripe through
+		// the proxy too, so both ledgers have something to compare.
+		base := os.Getenv("YENTE_API_BASE")
+		if base == "" {
+			fmt.Fprintln(os.Stderr, "child: YENTE_API_BASE is not set")
+			os.Exit(8)
+		}
+		for _, u := range []string{base + "/search/default?q=x", "http://api.stripe.com/v1/charges"} {
+			resp, err := http.Get(u)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "child:", err)
+				os.Exit(9)
+			}
+			resp.Body.Close()
+		}
+		os.Exit(0)
 	case "fakeserve":
 		// The serve the host tier composes for --expose, faked: it writes
 		// the same files, answers the same endpoint and stops on the same

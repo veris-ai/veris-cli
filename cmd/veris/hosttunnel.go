@@ -545,11 +545,19 @@ func runHostExposed(o localRun) error {
 	// The sandbox side: the watermark once the proxy is live and before the
 	// child starts, exactly as the in-process tier takes it.
 	bg := context.Background()
-	p := newProof(bg, ledgerSandbox(o.sources), o.client)
+	p := newProof(bg, ledgerSandbox(o.sources), o.client, o.sources.Overrides)
 	p.watermark(bg, os.Stderr, o.quiet)
 	started := time.Now()
 
-	status, runErr := superviseEnv(mergeEnv(os.Environ(), ht.childEnv(o.java)), o.argv)
+	// serve's environment file already carries what its config hands over;
+	// the handoff is layered again from the sandbox's description so the
+	// run says what was handed, then -e last so the user's own value wins.
+	handed := handoffs(p.sandboxServices(), o.sources.Overrides, o.userEnv)
+	announceHandoffs(os.Stderr, handed)
+	env := mergeEnv(os.Environ(), ht.childEnv(o.java))
+	env = mergeEnv(env, handedVars(handed))
+	env = mergeEnv(env, userEnvVars(o.userEnv))
+	status, runErr := superviseEnv(env, o.argv)
 	finished := time.Now()
 	if o.fresh {
 		defer holdSignals()()

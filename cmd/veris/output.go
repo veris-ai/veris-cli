@@ -161,6 +161,24 @@ func shortID(id string) string {
 	return string(r[:8]) + "…"
 }
 
+// idPrefix is the prefix s names when it is a shortened id: what a table
+// prints (the first characters and an ellipsis, in either spelling) or a
+// bare prefix typed by hand, lowercase letters and digits as the server
+// mints them. "" when s is not shaped like part of an id, so a name with a
+// dash or a capital in it is never matched against the ids.
+func idPrefix(s string) string {
+	p := strings.TrimSuffix(strings.TrimSuffix(s, "…"), "...")
+	if p == "" {
+		return ""
+	}
+	for _, c := range p {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return ""
+		}
+	}
+	return p
+}
+
 // looksLikeID reports whether s has the shape of a control-plane id: the
 // server mints 25 characters of lowercase letters and digits. It tells a
 // pasted id from an environment name the project file does not know.

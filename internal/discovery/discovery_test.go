@@ -359,3 +359,58 @@ func TestADatabaseOnlySandboxStillYieldsAConfig(t *testing.T) {
 			len(cfg.Services), len(cfg.PassEnv))
 	}
 }
+
+// An http twin with no hostname to intercept -- no route from the control
+// plane, none in the table -- is the DSN case again: handed over under its
+// env hint rather than silently left unreachable. One with no hint is still
+// only reported, as before.
+func TestAnHTTPTwinWithNoRouteIsHandedOverLikeADSN(t *testing.T) {
+	snapshot := &Snapshot{
+		SandboxID: "sbx_yente", EnvironmentID: "env_y",
+		Services: []Service{
+			{Name: "stripe", URL: "http://gw/s/sbx_yente/stripe", EnvHint: "STRIPE_API_BASE"},
+			{Name: "yente", URL: "http://gw/s/sbx_yente/yente", EnvHint: "YENTE_API_BASE"},
+			{Name: "nameless", URL: "http://gw/s/sbx_yente/nameless"},
+		},
+	}
+	cfg, skipped, err := ToConfig(snapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Services) != 1 || cfg.Services[0].Name != "stripe" {
+		t.Errorf("routed services = %+v, want stripe alone", cfg.Services)
+	}
+	if len(cfg.PassEnv) != 1 || cfg.PassEnv[0].Name != "YENTE_API_BASE" ||
+		cfg.PassEnv[0].Value != "http://gw/s/sbx_yente/yente" || cfg.PassEnv[0].Service != "yente" {
+		t.Fatalf("pass_env = %+v, want yente's URL under YENTE_API_BASE", cfg.PassEnv)
+	}
+	reasons := map[string]string{}
+	for _, s := range skipped {
+		reasons[s.Service] = s.Reason
+	}
+	if !strings.Contains(reasons["yente"], "handed to the command as $YENTE_API_BASE") {
+		t.Errorf("yente's note %q never names $YENTE_API_BASE", reasons["yente"])
+	}
+	if !strings.HasPrefix(reasons["nameless"], "no route:") {
+		t.Errorf("a twin with no hint is reported, not handed: %q", reasons["nameless"])
+	}
+
+	// The same rule, asked about one service at a time.
+	for _, c := range []struct {
+		svc  Service
+		want bool
+	}{
+		{Service{Name: "stripe", URL: "http://gw/stripe"}, false},
+		{Service{Name: "yente", URL: "http://gw/yente"}, true},
+		{Service{Name: "postgres", URL: "postgres://u:p@h/db"}, true},
+		{Service{Name: "yente", URL: "http://gw/yente", Routes: []routes.Entry{{Host: "api.yente.test"}}}, false},
+	} {
+		if got := NotProxied(c.svc, nil); got != c.want {
+			t.Errorf("NotProxied(%s %s) = %v, want %v", c.svc.Name, c.svc.URL, got, c.want)
+		}
+	}
+	// A --route override makes an otherwise unroutable twin proxied.
+	if NotProxied(Service{Name: "yente", URL: "http://gw/yente"}, map[string][]routes.Entry{"yente": {{Host: "api.yente.test"}}}) {
+		t.Error("an override supplies the hostname, so yente is proxied")
+	}
+}

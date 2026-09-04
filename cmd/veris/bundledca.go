@@ -1,7 +1,8 @@
 package main
 
-// --patch-bundled-cas (experimental): the over-mount that closes the failure
-// mode tlsreject.go can only diagnose. An SDK shipping its own CA bundle
+// --patch-bundled-cas: the over-mount that closes the failure mode
+// tlsreject.go can only diagnose, and the default for an SDK that bundles
+// its own CA. An SDK shipping its own CA bundle
 // reads no environment variable, so the containerised run finds each known
 // bundle in the image and the user's -v mounts, appends the Veris CA to a
 // COPY, and bind-mounts the copy read-only over the original's exact path.

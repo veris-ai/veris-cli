@@ -5,10 +5,47 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/veris-ai/veris-cli/internal/api"
+	"github.com/veris-ai/veris-cli/internal/config"
 )
+
+// The handoff for the twins the proxy does not route reaches the workload
+// as -e entries, ahead of the user's own so those still win, and the list
+// itself never carries a variable the user named.
+func TestTheHandoffReachesTheWorkloadBehindTheUsersOwnVariables(t *testing.T) {
+	services := []api.ServiceInfo{
+		{Name: "stripe", URL: "http://gw/s/sbx_1/stripe", ControlURL: "http://gw/s/sbx_1/stripe", EnvHint: "STRIPE_API_BASE"},
+		{Name: "postgres", URL: "postgresql://u:p@h:5432/db", EnvHint: "DATABASE_URL"},
+		{Name: "yente", URL: "http://gw/s/sbx_1/yente", ControlURL: "http://gw/s/sbx_1/yente", EnvHint: "YENTE_API_BASE"},
+		{Name: "nameless", URL: "http://gw/s/sbx_1/nameless"},
+	}
+	handed := handoffs(services, nil, []string{"DATABASE_URL=postgresql://mine", "DEBUG"})
+	want := []config.PassEnvVar{{Name: "YENTE_API_BASE", Value: "http://gw/s/sbx_1/yente", Service: "yente"}}
+	if !reflect.DeepEqual(handed, want) {
+		t.Fatalf("handoffs = %+v, want %+v (stripe is proxied, DATABASE_URL is the user's, nameless has no hint)", handed, want)
+	}
+
+	spec := dockerRun{Image: "img:test", ProxyImage: "proxy:test", Sandbox: "sbx_1",
+		Handoff: handed, EnvVars: []string{"DATABASE_URL=postgresql://mine", "DEBUG"}}
+	args := workloadArgs(spec, "veris-proxy-1", "veris-workload-1", "/share", nil, false)
+	yente := slices.Index(args, "YENTE_API_BASE=http://gw/s/sbx_1/yente")
+	mine := slices.Index(args, "DATABASE_URL=postgresql://mine")
+	image := slices.Index(args, "img:test")
+	if yente < 1 || args[yente-1] != "-e" || mine < 0 || !(yente < mine && mine < image) {
+		t.Fatalf("want -e YENTE_API_BASE=… before the user's -e, before the image; got %q", args)
+	}
+
+	var out bytes.Buffer
+	announceHandoffs(&out, handed)
+	if out.String() != "veris: yente: not proxied; handed YENTE_API_BASE=http://gw/s/sbx_1/yente\n" {
+		t.Errorf("announced:\n%s", out.String())
+	}
+}
 
 func TestFetchSandboxIDReadsTheStatusEndpoint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

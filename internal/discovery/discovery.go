@@ -339,6 +339,22 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 			delete(unclaimed, svc.Name)
 		}
 		if len(entries) == 0 {
+			// An http twin no source has a hostname for -- a data plane like
+			// yente, whose oracle is a locally run instance nobody calls over
+			// the internet -- is the DSN case again: nothing to intercept, and
+			// client code that reads its base URL from an environment
+			// variable in production. Handed over under that name, as the
+			// DSN is; without a name there is nothing to hand it as.
+			if svc.EnvHint != "" {
+				cfg.PassEnv = append(cfg.PassEnv, config.PassEnvVar{
+					Name: svc.EnvHint, Value: svc.URL, Service: svc.Name,
+				})
+				skipped = append(skipped, Unroutable{svc.Name,
+					"not proxied (no hostname to intercept: the control plane " +
+						"served no route and this binary's table has none); " +
+						"handed to the command as $" + svc.EnvHint})
+				continue
+			}
 			skipped = append(skipped, Unroutable{svc.Name,
 				"no route: the control plane served none and this binary's " +
 					"table has no measured hostname for it (--route " +
@@ -378,6 +394,22 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 		return nil, skipped, fmt.Errorf("the derived config is not valid: %w", err)
 	}
 	return cfg, skipped, nil
+}
+
+// NotProxied reports whether the proxy has no hostname to intercept for svc:
+// a wire protocol it does not speak (a postgres DSN), or an http twin no
+// source -- an override, the control plane, the embedded table -- has a
+// route for (yente). Such a twin's traffic never passes the proxy, so it
+// reaches the sandbox only if the command is handed the twin's URL under its
+// env hint, and only the sandbox's own ledger can count what arrived. It is
+// the decision ToConfig makes, exposed so the CLI can make the same one on a
+// sandbox described by the control plane.
+func NotProxied(svc Service, overrides map[string][]routes.Entry) bool {
+	if !isHTTP(svc.URL) {
+		return true
+	}
+	entries, _ := routesFor(svc, overrides)
+	return len(entries) == 0
 }
 
 // routesFor picks one source of routes for a service and names it. The

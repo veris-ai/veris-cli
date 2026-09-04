@@ -19,6 +19,7 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/discovery"
 	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/routes"
 	"github.com/veris-ai/veris-cli/internal/twin"
 )
 
@@ -61,6 +62,12 @@ type twinMark struct {
 	// plane handed to the app), or a control plane whose /veris/requests is
 	// absent (the postgres twin). It prints as "—" and asserts nothing.
 	noLog bool
+	// notProxied is a twin the engine does not route (a DSN, or an http
+	// twin with no hostname to intercept, such as yente): it is reached by
+	// the handed env hint instead, so its traffic never passes the engine,
+	// the engine's count of it is no evidence either way, and the sandbox
+	// ledger answers for it alone.
+	notProxied bool
 	// err is a watermark that could not be taken; without a mark, "since the
 	// watermark" is undefined and the twin's ledger is unreadable.
 	err error
@@ -77,7 +84,11 @@ type ledgerTwin struct {
 	Control int64 `json:"-"`
 	// Capped is a read that filled the page: Count is a floor.
 	Capped bool `json:"capped,omitempty"`
-	err    error
+	// NotProxied is a twin the engine does not route (twinMark.notProxied):
+	// its count is left out of the two-ledger comparison, which the
+	// engine's 0 against it would otherwise always fail.
+	NotProxied bool `json:"not_proxied,omitempty"`
+	err        error
 }
 
 // delivery is one line of the deliveries block: the twin's outbound
@@ -158,6 +169,9 @@ type proof struct {
 	marks   []twinMark
 	start   time.Time
 	twinFor func(controlURL string) *twin.Client
+	// overrides is the run's --route, so a twin routed only by an override
+	// counts as proxied here as it does in the engine.
+	overrides map[string][]routes.Entry
 }
 
 // ledgerSandbox is the sandbox id a run's ledger belongs to, following
@@ -179,12 +193,14 @@ func ledgerSandbox(src configSources) string {
 // newProof describes the sandbox the run routes at, from the control plane,
 // so the twins' control URLs are known. nil when there is no sandbox; a
 // proof with readErr when there is one that cannot be read, so the run can
-// say the ledger was unreadable rather than silently print none.
-func newProof(ctx context.Context, sandboxID string, c *api.Client) *proof {
+// say the ledger was unreadable rather than silently print none. overrides
+// is the run's --route, which decides with the sandbox's own routes which
+// twins the engine proxies.
+func newProof(ctx context.Context, sandboxID string, c *api.Client, overrides map[string][]routes.Entry) *proof {
 	if sandboxID == "" {
 		return nil
 	}
-	p := &proof{sandboxID: sandboxID, twinFor: twin.New}
+	p := &proof{sandboxID: sandboxID, twinFor: twin.New, overrides: overrides}
 	if c == nil || c.Key == "" {
 		p.readErr = fmt.Errorf("no API key to read sandbox %s with (log in, or set %s)", sandboxID, discovery.EnvAPIKey)
 		return p
@@ -226,7 +242,8 @@ func (p *proof) watermark(ctx context.Context, w io.Writer, quiet bool) {
 	}
 	p.start = time.Now()
 	for _, svc := range p.services {
-		m := twinMark{name: svc.Name, controlURL: svc.ControlURL, envHint: svc.EnvHint}
+		m := twinMark{name: svc.Name, controlURL: svc.ControlURL, envHint: svc.EnvHint,
+			notProxied: notProxied(svc, p.overrides)}
 		if svc.ControlURL == "" {
 			m.noLog = true
 			p.marks = append(p.marks, m)
@@ -299,7 +316,7 @@ func (p *proof) read(ctx context.Context) *ledger {
 			l.Unreadable = append(l.Unreadable, fmt.Sprintf("%s: %v", m.name, err))
 			continue
 		}
-		t := &ledgerTwin{Name: m.name, Capped: capped}
+		t := &ledgerTwin{Name: m.name, Capped: capped, NotProxied: m.notProxied}
 		for _, r := range rows {
 			switch r.Tier {
 			case twin.TierControl:
@@ -478,6 +495,9 @@ func printLedger(w io.Writer, l *ledger) {
 			if t.Faults > 0 {
 				line += fmt.Sprintf("   (%d fault)", t.Faults)
 			}
+			if t.NotProxied {
+				line += "   (not proxied)"
+			}
 			fmt.Fprintln(w, line)
 		}
 		if n := l.control(); n > 0 {
@@ -517,13 +537,28 @@ type assertion struct {
 	Kind   string `json:"kind"`
 	Target string `json:"target"`
 	Want   int64  `json:"want"`
-	Got    int64  `json:"got"`
-	OK     bool   `json:"ok"`
+	// Got is the count the verdict rests on: the sandbox ledger's, or the
+	// engine's when the engine is the side that showed the count (vouch).
+	Got int64 `json:"got"`
+	OK  bool  `json:"ok"`
 	// Indeterminate is an assertion the ledger could not decide: the twin was
 	// unreadable, or the read was capped below the count wanted.
 	Indeterminate bool   `json:"indeterminate,omitempty"`
 	Why           string `json:"why,omitempty"`
-	hint          string
+	// Source names the side that decided a service requirement when the two
+	// ledgers did not agree on it: "ledger" or "engine". Empty when both
+	// showed the count, or when the engine's was not there to compare.
+	Source string `json:"source,omitempty"`
+	// NotProxied is a requirement on a twin the engine does not route: the
+	// sandbox ledger's alone to decide (see twinMark.notProxied).
+	NotProxied bool `json:"not_proxied,omitempty"`
+	// note is the parenthesis after a ✓ line, or the clause after an ✗ one,
+	// that says which side answered and what the other side saw.
+	note string
+	// unreadable is an indeterminate assertion whose twin's ledger was not
+	// read at all, as against one read to its cap, where rows may yet exist.
+	unreadable bool
+	hint       string
 }
 
 // assertLedger judges the run's requirements on the ledger. Service
@@ -535,7 +570,8 @@ type assertion struct {
 // ledger never observed it, and the engine's verdict on it stands alone. A
 // fresh run with no explicit service requirement asserts a non-empty
 // ledger, mirroring the engine's rule for a sandbox it deployed. A nil
-// ledger (never read) makes every assertion indeterminate.
+// ledger (never read) makes every assertion indeterminate. The engine's
+// side of a service requirement is merged in afterwards by vouch.
 func assertLedger(l *ledger, marks []twinMark, reqs, callbackReqs []requirement, freshDefault bool) []assertion {
 	var out []assertion
 	unreadable := l == nil || len(l.Unreadable) > 0
@@ -543,16 +579,16 @@ func assertLedger(l *ledger, marks []twinMark, reqs, callbackReqs []requirement,
 		if req.kind != "service" || keepsNoLog(marks, req.name) {
 			continue
 		}
-		a := assertion{Kind: "service", Target: req.name, Want: req.count}
+		a := assertion{Kind: "service", Target: req.name, Want: req.count, NotProxied: notProxiedTwin(marks, req.name)}
 		var t *ledgerTwin
 		if l != nil {
 			t = l.twin(req.name)
 		}
 		switch {
 		case l == nil:
-			a.Indeterminate, a.Why = true, "the sandbox ledger could not be read"
+			a.Indeterminate, a.unreadable, a.Why = true, true, "the sandbox ledger could not be read"
 		case t == nil && twinUnreadable(l, req.name):
-			a.Indeterminate, a.Why = true, req.name+"'s ledger could not be read"
+			a.Indeterminate, a.unreadable, a.Why = true, true, req.name+"'s ledger could not be read"
 		case t == nil:
 			a.Got = 0
 		default:
@@ -562,8 +598,17 @@ func assertLedger(l *ledger, marks []twinMark, reqs, callbackReqs []requirement,
 			}
 		}
 		a.OK = !a.Indeterminate && a.Got >= a.Want
-		if !a.OK && !a.Indeterminate {
+		if !a.OK {
+			// Kept on an indeterminate one too: vouch may turn it into a
+			// refusal, and the hint belongs under that line.
 			a.hint = serviceHint(marks, req.name, a.Got)
+		}
+		if a.OK && a.NotProxied {
+			// The engine never sees this twin's traffic, so the sandbox
+			// ledger's count is the only one there could be; the line says
+			// so, or "saw 4" beside the engine's receipt of 0 reads as a
+			// contradiction.
+			a.Source, a.note = "ledger", "sandbox ledger; not proxied"
 		}
 		out = append(out, a)
 	}
@@ -614,6 +659,59 @@ func keepsNoLog(marks []twinMark, name string) bool {
 	return false
 }
 
+// notProxiedTwin reports whether the named twin was marked as one the
+// engine does not route. A name the marks do not know is taken as proxied:
+// the engine's count of it is then the ordinary evidence.
+func notProxiedTwin(marks []twinMark, name string) bool {
+	for _, m := range marks {
+		if m.name == name {
+			return m.notProxied
+		}
+	}
+	return false
+}
+
+// vouch merges the engine's receipt into the service assertions, so each
+// requirement has one verdict whichever side saw the traffic: it passes when
+// EITHER ledger shows the count. The sandbox ledger's count stands where it
+// met the requirement; where it did not, the engine's count stands in when
+// that met it -- a twin that did not record what the proxy forwarded, or a
+// ledger that could not be read, is reported beside the ✓ rather than turned
+// into a refusal of what the proxy demonstrably delivered. Neither side
+// showing the count is unmet, exit 3: the engine refutes it even where the
+// ledger could not be read, since the proxy forwarded nothing to the twin;
+// only a ledger read to its cap stays undecided, since rows may yet exist
+// behind the cap. A twin the engine does not route is left to the ledger:
+// the engine's 0 for it is no evidence, and vouch does not touch it.
+func vouch(assertions []assertion, engine *proxy.Receipt) {
+	if engine == nil {
+		return
+	}
+	for i := range assertions {
+		a := &assertions[i]
+		if a.Kind != "service" || a.NotProxied {
+			continue
+		}
+		sent := engine.ByService[a.Target]
+		switch {
+		case a.OK:
+			if sent < a.Want {
+				a.Source, a.note = "ledger", fmt.Sprintf("sandbox ledger; the engine saw %d", sent)
+			}
+		case sent >= a.Want:
+			other := fmt.Sprintf("the sandbox ledger recorded %d", a.Got)
+			if a.Indeterminate {
+				other = a.Why
+			}
+			a.OK, a.Indeterminate, a.hint = true, false, ""
+			a.Got, a.Source, a.note = sent, "engine", "engine; "+other
+		case a.Indeterminate && a.unreadable:
+			a.Indeterminate = false
+			a.Got, a.Source, a.note = sent, "engine", a.Why
+		}
+	}
+}
+
 func twinUnreadable(l *ledger, name string) bool {
 	for _, u := range l.Unreadable {
 		if strings.HasPrefix(u, name+":") {
@@ -652,11 +750,10 @@ type verdict struct {
 //
 //	veris: ✗ the run required service stripe at least 1 time(s) but the sandbox received it 0 time(s)
 //	            — your tests never touched the sandbox (is STRIPE_API_BASE overridden in your test setup?)
-//	veris: ✓ required stripe ≥1: saw 7   ✓ ledgers agree (7 = 7)
+//	veris: ✓ required stripe ≥1: saw 7   ✓ required yente ≥1: saw 4 (sandbox ledger; not proxied)   ✓ ledgers agree (7 = 7)
 //
-// engine is nil when the engine's receipt is not available numerically (the
-// container tier reads it in another process), and the comparison is then
-// left out.
+// engine is nil when the engine's receipt is not available numerically (it
+// could not be read), and the comparison is then left out.
 func printVerdict(w io.Writer, l *ledger, assertions []assertion, engine *proxy.Receipt, quiet bool) verdict {
 	v := verdict{Assertions: assertions}
 	var oks []string
@@ -676,14 +773,16 @@ func printVerdict(w io.Writer, l *ledger, assertions []assertion, engine *proxy.
 		}
 	}
 	if l != nil && engine != nil && l.complete() {
-		// Compared over the twins the ledger holds: a twin that keeps no
-		// log has nothing to agree with, and the engine's requests to it
-		// are not a disagreement.
-		sent := engineCount(engine, l)
-		if sent == l.total() {
-			oks = append(oks, fmt.Sprintf("✓ ledgers agree (%d = %d)", sent, l.total()))
-		} else {
-			fmt.Fprintf(w, "veris: ! ledgers differ (engine %d, sandbox %d)\n", sent, l.total())
+		// Compared over the twins the ledger holds and the engine routes: a
+		// twin that keeps no log has nothing to agree with, and one the
+		// engine does not route never shows in its receipt, so neither is a
+		// disagreement. With no such twin there is nothing to compare.
+		if sent, recorded, any := comparedCounts(engine, l); any {
+			if sent == recorded {
+				oks = append(oks, fmt.Sprintf("✓ ledgers agree (%d = %d)", sent, recorded))
+			} else {
+				fmt.Fprintf(w, "veris: ! ledgers differ (engine %d, sandbox %d)\n", sent, recorded)
+			}
 		}
 	}
 	if len(oks) > 0 && !quiet {
@@ -692,15 +791,19 @@ func printVerdict(w io.Writer, l *ledger, assertions []assertion, engine *proxy.
 	return v
 }
 
-// engineCount is what the engine sent to the twins the ledger holds: the
-// receipt's per-service counts summed over them, which is the receipt's
-// Total when every twin keeps a log.
-func engineCount(engine *proxy.Receipt, l *ledger) int64 {
-	var n int64
+// comparedCounts is the two sides of the ledger comparison over the twins
+// the ledger holds and the engine routes: what the engine's receipt says it
+// sent them, and what they recorded. any is false when no twin qualifies.
+func comparedCounts(engine *proxy.Receipt, l *ledger) (sent, recorded int64, any bool) {
 	for _, t := range l.Twins {
-		n += engine.ByService[t.Name]
+		if t.NotProxied {
+			continue
+		}
+		any = true
+		sent += engine.ByService[t.Name]
+		recorded += t.Count
 	}
-	return n
+	return sent, recorded, any
 }
 
 func (a assertion) describe() string {
@@ -720,6 +823,10 @@ func (a assertion) unmet() string {
 	case "ledger":
 		return "this run deployed a sandbox and the sandbox recorded nothing since the watermark"
 	}
+	if a.Source == "engine" {
+		// Refuted by the engine over a ledger that could not be read.
+		return fmt.Sprintf("%s but the engine saw it %d time(s) and %s", a.describe(), a.Got, a.note)
+	}
 	return fmt.Sprintf("%s but the sandbox received it %d time(s)", a.describe(), a.Got)
 }
 
@@ -730,13 +837,18 @@ func (a assertion) met() string {
 	case "ledger":
 		return fmt.Sprintf("sandbox recorded %d", a.Got)
 	}
-	return fmt.Sprintf("required %s ≥%d: saw %d", a.Target, a.Want, a.Got)
+	line := fmt.Sprintf("required %s ≥%d: saw %d", a.Target, a.Want, a.Got)
+	if a.note != "" {
+		line += " (" + a.note + ")"
+	}
+	return line
 }
 
 // finish is the whole after-read: the ledger printed, the assertions judged
-// and printed, the verdict returned. engine is the run's receipt when this
-// process holds it. It is called after the engine's own receipt and unmet
-// lines, so the two sides read in the doc's order.
+// and printed, the verdict returned. engine is the run's receipt when it
+// could be read, and answers with the ledger for each service requirement
+// (vouch). It is called after the engine's own receipt and unmet lines, so
+// the two sides read in the doc's order.
 func (p *proof) finish(ctx context.Context, w io.Writer, engine *proxy.Receipt,
 	reqs, callbackReqs []requirement, freshDefault, quiet bool,
 ) (*ledger, verdict) {
@@ -745,7 +857,9 @@ func (p *proof) finish(ctx context.Context, w io.Writer, engine *proxy.Receipt,
 	}
 	if p.readErr != nil {
 		fmt.Fprintf(w, "veris: ! the sandbox ledger could not be read (%v)\n", p.readErr)
-		return nil, printVerdict(w, nil, assertLedger(nil, nil, reqs, callbackReqs, freshDefault), nil, quiet)
+		assertions := assertLedger(nil, nil, reqs, callbackReqs, freshDefault)
+		vouch(assertions, engine)
+		return nil, printVerdict(w, nil, assertions, engine, quiet)
 	}
 	l := p.read(ctx)
 	if !quiet {
@@ -756,10 +870,40 @@ func (p *proof) finish(ctx context.Context, w io.Writer, engine *proxy.Receipt,
 		}
 	}
 	assertions := assertLedger(l, p.marks, reqs, callbackReqs, freshDefault)
+	vouch(assertions, engine)
 	if !freshDefault && len(assertions) == 0 && l.total() == 0 && l.complete() && !quiet {
 		fmt.Fprintln(w, "veris: ! the sandbox recorded no service request since the watermark")
 	}
 	return l, printVerdict(w, l, assertions, engine, quiet)
+}
+
+// enginesAlone is the subset of reqs the sandbox ledger will not judge, for
+// the engine to judge by itself: every host requirement, and the service
+// requirements when there is no ledger at all (no sandbox, or no twin with
+// a log) or the twin keeps none. A service requirement the ledger judges is
+// judged once, there, with the engine's count merged in by vouch -- so the
+// engine printing its own verdict on it would be the same requirement
+// answered twice, in two voices.
+func (p *proof) enginesAlone(reqs []requirement) []requirement {
+	if p == nil || p.none {
+		return reqs
+	}
+	var out []requirement
+	for _, r := range reqs {
+		if r.kind != "service" || (p.readErr == nil && keepsNoLog(p.marks, r.name)) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// sandboxServices is the sandbox's service list as the control plane
+// described it, nil for a run with no sandbox or one that could not be read.
+func (p *proof) sandboxServices() []api.ServiceInfo {
+	if p == nil {
+		return nil
+	}
+	return p.services
 }
 
 // --- the receipt file ---------------------------------------------------------

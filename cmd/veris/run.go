@@ -23,6 +23,7 @@ import (
 	"github.com/veris-ai/veris-cli/internal/discovery"
 	"github.com/veris-ai/veris-cli/internal/procgroup"
 	"github.com/veris-ai/veris-cli/internal/proxy"
+	"github.com/veris-ai/veris-cli/internal/routes"
 	"github.com/veris-ai/veris-cli/internal/trust"
 )
 
@@ -109,9 +110,10 @@ func cmdRun(args []string) error {
 			return nil
 		})
 	patchBundledCAs := fs.Bool("patch-bundled-cas", false,
-		"experimental: find known SDK-bundled CA files (certifi, botocore, "+
-			"stripe, ...) in the image and your -v mounts, and over-mount each "+
-			"with a copy that also carries the Veris CA (with --image)")
+		"the default for an SDK that bundles its own CA (certifi, botocore, "+
+			"stripe, ...): find the known bundled CA files in the image and your "+
+			"-v mounts, and over-mount each with a copy that also carries the "+
+			"Veris CA (with --image)")
 	proxyUID := fs.Int("proxy-uid", defaultProxyUID,
 		"uid the proxy drops to, and the one the redirect exempts; your image "+
 			"must not run as it")
@@ -122,10 +124,14 @@ func cmdRun(args []string) error {
 		volumes = append(volumes, v)
 		return nil
 	})
-	fs.Func("e", "environment variable, repeatable (with --image)", func(v string) error {
-		envVars = append(envVars, v)
-		return nil
-	})
+	fs.Func("e",
+		"environment `variable` for the command as NAME=value, repeatable; one "+
+			"named here is never overwritten by a handed env hint (with --image a "+
+			"bare NAME passes the host's value, as docker run does)",
+		func(v string) error {
+			envVars = append(envVars, v)
+			return nil
+		})
 	var capAdd []string
 	fs.Func("cap-add",
 		"Linux `capability` to hand back to your container, repeatable (with "+
@@ -394,6 +400,7 @@ func cmdRun(args []string) error {
 		logFormat:      *logFormat,
 		java:           javaOptions{store: *javaStore, pass: *javaPass},
 		argv:           argv,
+		userEnv:        envVars,
 		reqs:           reqs,
 		callbackReqs:   callbackReqs,
 		quiet:          *quiet,
@@ -411,13 +418,16 @@ func cmdRun(args []string) error {
 // and the login have been merged: what runLocal needs and nothing it does
 // not.
 type localRun struct {
-	sources            configSources
-	listen, caDir      string
-	strict             bool
-	logLevel           string
-	logFormat          string
-	java               javaOptions
-	argv               []string
+	sources       configSources
+	listen, caDir string
+	strict        bool
+	logLevel      string
+	logFormat     string
+	java          javaOptions
+	argv          []string
+	// userEnv is -e as given: variables set for the command, and the names
+	// no handed env hint may overwrite.
+	userEnv            []string
 	reqs, callbackReqs []requirement
 	quiet              bool
 	// receipt is --receipt PATH, "" for none.
@@ -485,11 +495,15 @@ func runLocal(o localRun) error {
 	// The sandbox side: the watermark once the engine is live and before the
 	// child starts, so nothing the child sends lands below it.
 	bg := context.Background()
-	p := newProof(bg, ledgerSandbox(o.sources), o.client)
+	p := newProof(bg, ledgerSandbox(o.sources), o.client, o.sources.Overrides)
 	p.watermark(bg, os.Stderr, o.quiet)
 	started := time.Now()
 
-	status, runErr := supervise(running, cfg, authority, o.argv, o.java)
+	// What the engine cannot route it hands over: the config's pass-env
+	// entries, minus any the command line set itself.
+	handed := withoutUserVars(cfg.PassEnv, o.userEnv)
+	announceHandoffs(os.Stderr, handed)
+	status, runErr := supervise(running, cfg, authority, o.argv, o.java, handed, o.userEnv)
 	finished := time.Now()
 	// The child is gone; what is left is the after-read and, for a --fresh
 	// sandbox, the teardown. A second Ctrl-C in between would take the
@@ -547,7 +561,10 @@ func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
 		// MITM handshake error) -- so today this can fire only via the
 		// containerised path, and is wired here so both tiers share one
 		// verdict when that gap closes.
-		unmet := unmetRequirements(o.reqs, *engine)
+		// The engine judges alone only what the sandbox ledger will not: a
+		// service requirement the ledger judges gets one verdict there, with
+		// the engine's count merged in.
+		unmet := unmetRequirements(p.enginesAlone(o.reqs), *engine)
 		if inbound != nil {
 			if !o.quiet {
 				printInbound(os.Stderr, *inbound)
@@ -590,18 +607,30 @@ func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
 
 // runContainerisedProved is the container tier with the sandbox's ledger
 // read around it: the watermark before the containers start, the after-read
-// once they are gone. The engine's receipt is printed inside the container
-// run and is not held here numerically, so the two-ledger comparison and
-// the receipt file's engine half are the host tier's alone; the assertions
-// are judged on the ledger all the same.
+// once they are gone. The engine's receipt is read back from the proxy
+// container by the container run and handed here, so the assertions are
+// judged on both ledgers as the host tier judges them.
 func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []requirement,
 	fresh, quiet bool, receiptPath string,
 ) error {
 	bg := context.Background()
-	p := newProof(bg, spec.Sandbox, client)
+	// The container tier carries no --route: the proxy container derives the
+	// routes itself, from the sandbox alone, so the ledger reads it the same
+	// way.
+	p := newProof(bg, spec.Sandbox, client, nil)
 	p.watermark(bg, os.Stderr, quiet)
 	started := time.Now()
-	err := runContainerised(spec)
+	// The twins the proxy container cannot route are handed to the workload
+	// from here, where the sandbox's description is known, so a runner image
+	// need not be current for the handoff to happen; a -e of the user's is
+	// their explicit answer and is left alone.
+	spec.Handoff = handoffs(p.sandboxServices(), nil, spec.EnvVars)
+	announceHandoffs(os.Stderr, spec.Handoff)
+	// The container run judges on the engine alone what the ledger will not
+	// judge; the rest is judged once, below, with the engine's count merged.
+	reqs := spec.Requirements
+	spec.Requirements = p.enginesAlone(reqs)
+	engine, err := runContainerised(spec)
 	finished := time.Now()
 	if fresh {
 		// As in runLocal: nothing must interrupt the after-read and the
@@ -613,7 +642,7 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 		// The containers never ran: nothing to read after.
 		return err
 	}
-	l, v := p.finish(bg, os.Stderr, nil, spec.Requirements, callbackReqs, fresh, quiet)
+	l, v := p.finish(bg, os.Stderr, engine, reqs, callbackReqs, fresh, quiet)
 	// Same ranking as the host tier: unmet first, then the command's own
 	// code, then indeterminate.
 	code := int(status)
@@ -624,11 +653,96 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 	case v.Indeterminate:
 		code = exitIndeterminate
 	}
-	writeReceipt(os.Stderr, receiptPath, p, l, nil, v.Assertions, started, finished, code)
+	writeReceipt(os.Stderr, receiptPath, p, l, engine, v.Assertions, started, finished, code)
 	if code != 0 {
 		return exitCode(code)
 	}
 	return nil
+}
+
+// notProxied is discovery's rule -- no hostname the engine intercepts -- on
+// a service as the control plane describes it to the CLI.
+func notProxied(svc api.ServiceInfo, overrides map[string][]routes.Entry) bool {
+	return discovery.NotProxied(discovery.Service{
+		Name: svc.Name, URL: svc.URL, EnvHint: svc.EnvHint, Routes: svc.Routes,
+	}, overrides)
+}
+
+// handoffs is what a run hands the command for the sandbox's twins the
+// engine does not route: each one's env hint set to its URL, exactly as the
+// proxy's own config hands a database DSN over (discovery.ToConfig), so a
+// yente or a postgres is reached without the code under test being told
+// anything but the variable it already reads. A variable the command line
+// set with -e is the user's explicit answer and is never overwritten; a twin
+// with no hint has no name to be handed under.
+func handoffs(services []api.ServiceInfo, overrides map[string][]routes.Entry, userEnv []string) []config.PassEnvVar {
+	set := userSetVars(userEnv)
+	var out []config.PassEnvVar
+	for _, svc := range services {
+		if svc.EnvHint == "" || svc.URL == "" || set[svc.EnvHint] || !notProxied(svc, overrides) {
+			continue
+		}
+		out = append(out, config.PassEnvVar{Name: svc.EnvHint, Value: svc.URL, Service: svc.Name})
+	}
+	return out
+}
+
+// withoutUserVars is vars minus every one the command line set with -e.
+func withoutUserVars(vars []config.PassEnvVar, userEnv []string) []config.PassEnvVar {
+	set := userSetVars(userEnv)
+	var out []config.PassEnvVar
+	for _, v := range vars {
+		if !set[v.Name] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// userSetVars is the set of names -e named, with or without a value.
+func userSetVars(userEnv []string) map[string]bool {
+	set := make(map[string]bool, len(userEnv))
+	for _, e := range userEnv {
+		name, _, _ := strings.Cut(e, "=")
+		set[name] = true
+	}
+	return set
+}
+
+// handedVars is a handoff in the shape mergeEnv layers over the child's
+// environment.
+func handedVars(handed []config.PassEnvVar) []trust.Var {
+	var out []trust.Var
+	for _, h := range handed {
+		out = append(out, trust.Var{Name: h.Name, Value: h.Value,
+			Reason: h.Service + " is not proxied; its URL is handed over rather than routed"})
+	}
+	return out
+}
+
+// userEnvVars is -e in the shape mergeEnv layers over the child's
+// environment. A bare NAME sets nothing here: the host tier's child inherits
+// the host's variables anyway, which is what docker's form means.
+func userEnvVars(userEnv []string) []trust.Var {
+	var out []trust.Var
+	for _, e := range userEnv {
+		if name, value, ok := strings.Cut(e, "="); ok {
+			out = append(out, trust.Var{Name: name, Value: value, Reason: "set with -e"})
+		}
+	}
+	return out
+}
+
+// announceHandoffs says on stderr what the command was handed and why:
+//
+//	veris: yente: not proxied; handed YENTE_API_BASE=https://…
+//
+// One line per variable, quiet or not, since it is a routing decision the
+// receipt cannot show -- the twin's traffic never passes the engine.
+func announceHandoffs(w io.Writer, handed []config.PassEnvVar) {
+	for _, h := range handed {
+		fmt.Fprintf(w, "veris: %s: not proxied; handed %s=%s\n", h.Service, h.Name, h.Value)
+	}
 }
 
 // finishFresh tears down the sandbox a --fresh run made, whatever the run
@@ -646,9 +760,11 @@ type javaOptions struct{ store, pass string }
 
 // supervise runs the child with the interception environment and returns its
 // exit status. A non-nil error means the child could not be run at all, which
-// is different from the child running and failing.
+// is different from the child running and failing. handed is what the engine
+// cannot route and hands over instead (the config's pass-env, minus what -e
+// named); userEnv is -e itself, layered last so it wins over everything.
 func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
-	argv []string, java javaOptions,
+	argv []string, java javaOptions, handed []config.PassEnvVar, userEnv []string,
 ) (int, error) {
 	proxyURL := running.ProxyURL()
 
@@ -672,9 +788,9 @@ func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
 		CanaryToken:         cfg.CanaryToken,
 		NoProxy:             cfg.AllowPassthrough,
 		NodeAcceptsEnvProxy: nodeAcceptsEnvProxy(),
-		PassThrough:         passThrough(cfg),
+		PassThrough:         passThroughVars(handed),
 	}))
-	return superviseEnv(env, argv)
+	return superviseEnv(mergeEnv(env, userEnvVars(userEnv)), argv)
 }
 
 // superviseEnv runs the child with env as its whole environment and returns

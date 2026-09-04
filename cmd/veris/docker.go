@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/veris-ai/veris-cli/internal/bundlescan"
+	"github.com/veris-ai/veris-cli/internal/config"
 	"github.com/veris-ai/veris-cli/internal/discovery"
 	"github.com/veris-ai/veris-cli/internal/proxy"
 )
@@ -44,8 +45,12 @@ type dockerRun struct {
 	Config     string
 	Volumes    []string
 	EnvVars    []string
-	Workdir    string
-	Argv       []string
+	// Handoff is what the workload is handed for the sandbox's twins the
+	// proxy does not route (handoffs): each one's env hint set to its URL,
+	// as -e entries placed before the user's own so those still win.
+	Handoff []config.PassEnvVar
+	Workdir string
+	Argv    []string
 
 	// CapAdd is handed back to the workload container after --cap-drop=ALL,
 	// one --cap-add per entry, already validated by parseCapability. Never
@@ -65,8 +70,9 @@ type dockerRun struct {
 	TTLMinutes     int
 	CallbackReqs   []requirement
 
-	// PatchBundledCAs (experimental) over-mounts known SDK-bundled CA files
-	// with copies that also carry the Veris CA. See bundledca.go.
+	// PatchBundledCAs over-mounts known SDK-bundled CA files with copies
+	// that also carry the Veris CA: the default for an SDK that bundles its
+	// own. See bundledca.go.
 	PatchBundledCAs bool
 
 	ProxyUID  int
@@ -77,14 +83,19 @@ type dockerRun struct {
 	LogFormat string
 }
 
-func runContainerised(spec dockerRun) error {
+// runContainerised is the container tier from network create to teardown.
+// The engine's receipt is returned once it has been read back from the proxy
+// container, beside whatever the run's exit is, so the caller can judge the
+// requirements on both ledgers; nil when the containers never ran or the
+// receipt could not be read.
+func runContainerised(spec dockerRun) (*proxy.Receipt, error) {
 	if _, err := exec.LookPath("docker"); err != nil {
-		return errors.New("--image needs docker on PATH")
+		return nil, errors.New("--image needs docker on PATH")
 	}
 
 	share, err := os.MkdirTemp("", "veris-share-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Not deferred: --keep-proxy leaves a container with this directory
 	// mounted, so teardown below decides whether it may go. Until teardown is
@@ -92,7 +103,7 @@ func runContainerised(spec dockerRun) error {
 	// The workload container runs as its own user and has to read these.
 	if err := os.Chmod(share, 0o755); err != nil {
 		_ = os.RemoveAll(share)
-		return err
+		return nil, err
 	}
 
 	name := fmt.Sprintf("veris-proxy-%d", os.Getpid())
@@ -104,7 +115,7 @@ func runContainerised(spec dockerRun) error {
 	network := fmt.Sprintf("veris-net-%d", os.Getpid())
 	if err := dockerQuiet("network", "create", network); err != nil {
 		_ = os.RemoveAll(share)
-		return fmt.Errorf("create docker network: %w", err)
+		return nil, fmt.Errorf("create docker network: %w", err)
 	}
 
 	// Teardown runs on every path out, including a signal: a leaked proxy
@@ -166,13 +177,13 @@ func runContainerised(spec dockerRun) error {
 	}()
 
 	if err := refuseExemptWorkloadUID(spec.Image, spec.ProxyUID); err != nil {
-		return err
+		return nil, err
 	}
 	if err := ensureProxyImage(spec.ProxyImage, spec.Quiet); err != nil {
-		return err
+		return nil, err
 	}
 	if err := startProxyContainer(spec, name, network, share); err != nil {
-		return err
+		return nil, err
 	}
 
 	// --environment deploys a sandbox INSIDE the container before the marker is
@@ -187,14 +198,14 @@ func runContainerised(spec dockerRun) error {
 		readyBudget = 9 * time.Minute
 	}
 	if err := waitForReady(share, name, readyBudget); err != nil {
-		return err
+		return nil, err
 	}
 	// Read only after readiness: a container that crashed on startup surfaces
 	// as waitForReady's exited-with-these-logs error, not as an inscrutable
 	// failure to read a published port from a container that no longer exists.
 	statusURL, err := proxyStatusURL(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Which sandbox the run is routed at, read back from the proxy rather
 	// than assumed: with --environment it was deployed inside the container
@@ -217,13 +228,13 @@ func runContainerised(spec dockerRun) error {
 	var unknownBundles []string
 	if spec.PatchBundledCAs {
 		if overlays, unknownBundles, err = bundledCAOverlays(spec, share, name); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	status, runErr := runWorkload(spec, name, workload, share, overlays)
 	if runErr != nil {
-		return runErr
+		return nil, runErr
 	}
 
 	receipt, rErr := fetchReceipt(statusURL)
@@ -232,9 +243,9 @@ func runContainerised(spec dockerRun) error {
 			"veris: could not read the receipt (%v), so what the sandbox "+
 				"received is unknown\n", rErr)
 		if status == 0 {
-			return exitCode(exitIndeterminate)
+			return nil, exitCode(exitIndeterminate)
 		}
-		return exitCode(status)
+		return nil, exitCode(status)
 	}
 	if !spec.Quiet {
 		printReceipt(os.Stderr, receipt)
@@ -253,9 +264,9 @@ func runContainerised(spec dockerRun) error {
 			// A workload that already failed keeps its own status; only an
 			// otherwise-successful run becomes indeterminate.
 			if status != 0 {
-				return exitCode(status)
+				return &receipt, exitCode(status)
 			}
-			return exitCode(exitIndeterminate)
+			return &receipt, exitCode(exitIndeterminate)
 		}
 		if !spec.Quiet {
 			printInbound(os.Stderr, inbound)
@@ -268,12 +279,12 @@ func runContainerised(spec dockerRun) error {
 		UnknownBundles: unknownBundles,
 	})
 	if status != 0 {
-		return exitCode(status)
+		return &receipt, exitCode(status)
 	}
 	if fatal {
-		return exitCode(exitRequirementUnmet)
+		return &receipt, exitCode(exitRequirementUnmet)
 	}
-	return nil
+	return &receipt, nil
 }
 
 // ensureProxyImage pulls the proxy's own image when it is absent, with the
@@ -597,6 +608,11 @@ func workloadArgs(spec dockerRun, proxyName, name, share string,
 		// workload could edit its own trust roots through /veris-share.
 		args = append(args, "-v",
 			filepath.Join(share, bundlesSubdir)+":/veris-share/"+bundlesSubdir+":ro")
+	}
+	// The handoff before the user's own -e: docker lets a later -e win, so
+	// even a name handoffs did not know to skip stays the user's.
+	for _, h := range spec.Handoff {
+		args = append(args, "-e", h.Name+"="+h.Value)
 	}
 	for _, e := range spec.EnvVars {
 		args = append(args, "-e", e)
