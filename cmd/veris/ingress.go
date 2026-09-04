@@ -111,6 +111,12 @@ func startIngress(
 				InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
 			}))
 		}
+		if len(in.clients) > 0 {
+			if _, err := in.clients[0].ProbeResolved(ctx); err != nil {
+				_ = in.Stop(context.Background())
+				return nil, fmt.Errorf("confirm callback hostname before starting the app: %w", err)
+			}
+		}
 		// The sandbox may already have probed us at creation, and that is not a
 		// callback the run produced.
 		in.Inbound.Baseline()
@@ -200,6 +206,9 @@ func (in *ingress) register(ctx context.Context, cfg *config.Config) error {
 		}
 		state, err := c.Register(ctx, in.URL)
 		if err != nil {
+			if errors.Is(err, callback.ErrDNSNotReady) {
+				return err
+			}
 			lastErr = err
 			continue
 		}

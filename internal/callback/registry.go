@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,7 +138,46 @@ func (c *Client) Register(ctx context.Context, url string) (ProbeState, error) {
 	if err := c.patch(ctx, url); err != nil {
 		return ProbeState{}, err
 	}
-	return c.Probe(ctx)
+	return c.ProbeResolved(ctx)
+}
+
+// ErrDNSNotReady means the sandbox still cannot resolve the callback hostname.
+// Trying another service in the same sandbox must not turn this into readiness.
+var ErrDNSNotReady = errors.New("sandbox cannot resolve the callback hostname")
+
+// ProbeResolved waits out DNS propagation before the workload can emit its first
+// webhook. It does not wait for the app: an HTTP response (including the proxy's
+// origin-not-listening 502) is enough to leave DNS readiness to the ordinary
+// callback checks. Resolution is tested from the sandbox, not the laptop.
+func (c *Client) ProbeResolved(ctx context.Context) (ProbeState, error) {
+	return c.probeResolved(ctx, time.Minute, 2*time.Second)
+}
+
+func (c *Client) probeResolved(ctx context.Context, budget, interval time.Duration) (ProbeState, error) {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	waitingForDNS := false
+	for {
+		state, err := c.Probe(ctx)
+		if err != nil {
+			if waitingForDNS && ctx.Err() != nil {
+				return state, fmt.Errorf("%w after waiting for DNS propagation: %w", ErrDNSNotReady, ctx.Err())
+			}
+			return ProbeState{}, err
+		}
+		result := state.LastProbeResult
+		if result["outcome"] != "connect_error" || result["error"] != "gaierror" {
+			return state, nil
+		}
+		waitingForDNS = true
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return state, fmt.Errorf("%w after waiting for DNS propagation: %w", ErrDNSNotReady, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // Clear unregisters the URL, so the next run does not inherit a dead hostname

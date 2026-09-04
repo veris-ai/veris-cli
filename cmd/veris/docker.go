@@ -194,6 +194,11 @@ func runContainerised(spec dockerRun) (*proxy.Receipt, error) {
 	// written, and that is allowed minutes for scheduling and image pulls. A
 	// ninety-second budget would kill healthy deployments as startup failures.
 	readyBudget := 90 * time.Second
+	if spec.Expose > 0 {
+		// Tunnel allocation and sandbox-side DNS propagation each have their
+		// own one-minute budget before the workload may start.
+		readyBudget = 3 * time.Minute
+	}
 	if spec.Environment != "" {
 		// Comfortably above the worst case a healthy deploy can hit: quick
 		// tunnel up to 60s, WaitReady up to 5min, plus creation, CA setup and
