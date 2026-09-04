@@ -468,7 +468,7 @@ func TestSandboxServicesGet(t *testing.T) {
 			"    customers        41\n",
 			"    faults           0\n",
 			"    payment_methods  13\n",
-			"→ veris sandbox data get stripe TABLE   (rows, newest first)\n",
+			"→ veris sandbox data get stripe TABLE   (a page of rows)\n",
 			"→ veris sandbox services manual stripe   (the twin's testing notes)\n")
 		if strings.Contains(stderr, "clock") || strings.Contains(stderr, "auth") {
 			t.Errorf("the singletons must be hidden:\n%s", stderr)

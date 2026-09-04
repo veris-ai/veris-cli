@@ -70,7 +70,7 @@ func sandboxDataCommand() *cli.Command {
 			},
 			{
 				Name:    "get",
-				Summary: "Row counts per table, or the rows of one table newest first",
+				Summary: "Row counts per table, or a page of one table's rows",
 				Usage:   "veris sandbox data get [NAME [TABLE]] [--limit N] [--id ID] [--json]",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&getID, "id", "", "sandbox id (default: this folder's)")
@@ -748,8 +748,11 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit int) error {
 	return nil
 }
 
-// dataRows prints one page of a table, newest first, as a table whose
-// columns are the rows' keys in the schema's order with id first.
+// dataRows prints one page of a table as a table whose columns are the
+// rows' keys in the schema's order with id first. The order is the twin's
+// own: GET /veris/data takes a table, a limit and an offset, and no sort,
+// so a row written a moment ago may be on any page. To see what a run just
+// sent, read the trace, which is ordered.
 func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string, limit int) error {
 	if svc.ControlURL == "" {
 		s.ui.Fail("%s has no control URL to read rows through (data plane; query it with your own client at %s)", svc.Name, svc.URL)
@@ -776,7 +779,7 @@ func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string
 			}
 		}
 	}
-	s.ui.Info("%s.%s · %d of %d rows (newest first)", svc.Name, table, len(page.Rows), page.Total)
+	s.ui.Info("%s.%s · %d of %d rows", svc.Name, table, len(page.Rows), page.Total)
 	if len(page.Rows) == 0 {
 		s.ui.Detail("(no rows)")
 		return nil

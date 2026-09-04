@@ -241,13 +241,13 @@ func TestSandboxDataGet(t *testing.T) {
 		}
 	})
 
-	t.Run("rows of one table, newest first, columns in schema order", func(t *testing.T) {
+	t.Run("rows of one table, columns in schema order", func(t *testing.T) {
 		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe", "customers", "--limit", "5")
 		if code != 0 || stdout != "" {
 			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
 		}
 		sbInOrder(t, stderr,
-			"stripe.customers · 2 of 41 rows (newest first)\n",
+			"stripe.customers · 2 of 41 rows\n",
 			"  id", "email", "name", "created", "metadata", "balance\n",
 			"  cus_2", "bob@example.com", "—", "1700000000", `{"tier":"gold"}`, "0\n",
 			"  cus_1", "ada@example.com", "Ada", "1699999999", "{}", "-5\n",
@@ -277,7 +277,7 @@ func TestSandboxDataGet(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, stderr)
 		}
-		sbInOrder(t, stderr, "stripe.faults · 0 of 39 rows (newest first)\n", "  (no rows)\n")
+		sbInOrder(t, stderr, "stripe.faults · 0 of 39 rows\n", "  (no rows)\n")
 	})
 
 	t.Run("a table the twin does not have", func(t *testing.T) {

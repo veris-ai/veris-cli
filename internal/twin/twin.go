@@ -105,9 +105,10 @@ type Counts struct {
 	StateVersion int            `json:"state_version"`
 }
 
-// Rows is one page of GET /veris/data?entity_type=…, newest first by primary
-// key. A column the twin declares as file content arrives as a placeholder
-// rather than the bytes.
+// Rows is one page of GET /veris/data?entity_type=…. The route takes a
+// table, a limit and an offset and no sort, so the order is the twin's own
+// and nothing here may promise otherwise. A column the twin declares as
+// file content arrives as a placeholder rather than the bytes.
 type Rows struct {
 	EntityType string           `json:"entity_type"`
 	Rows       []map[string]any `json:"rows"`

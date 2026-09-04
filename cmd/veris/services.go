@@ -337,7 +337,7 @@ func servicesGet(ctx *cli.Context, idFlag, name string) error {
 			lines = append(lines, []string{"    " + t, strconv.Itoa(row.Tables[t])})
 		}
 		s.ui.Table(nil, lines)
-		s.ui.Link(fmt.Sprintf("veris sandbox data get %s TABLE   (rows, newest first)", svc.Name))
+		s.ui.Link(fmt.Sprintf("veris sandbox data get %s TABLE   (a page of rows)", svc.Name))
 		s.ui.Link(fmt.Sprintf("veris sandbox services manual %s   (the twin's testing notes)", svc.Name))
 	}
 	return nil
