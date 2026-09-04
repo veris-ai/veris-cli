@@ -497,7 +497,18 @@ which is the same failure the egress receipt exists to catch.
 
 A quick tunnel needs no Cloudflare account and mints a new hostname each run.
 `--expose-token` (or `VERIS_TUNNEL_TOKEN`, plus `--expose-hostname`) uses a
-named tunnel instead, for a stable URL. If your app runs on the HOST while the
+named tunnel instead, for a stable URL. In Cloudflare, configure that hostname's
+service URL as `http://127.0.0.1:18444`: Veris's callback recorder inside the
+network namespace where cloudflared runs. The recorder forwards to `--expose`
+and records the delivery. Token tunnels use Cloudflare's remote configuration;
+`--url` cannot override it. Use a dedicated tunnel/connector for this run so
+another connector cannot receive its callbacks. One named-tunnel run can use
+port 18444 per network namespace; separate runner containers have separate
+namespaces. The CLI waits up to a minute for a fresh sandbox probe through this
+recorder and explains the required service URL if the route is wrong. An app
+that has not started listening yet does not prevent recorder readiness.
+
+If your app runs on the HOST while the
 proxy is in a container, add `--expose-host host.docker.internal` — loopback
 there is the container's own.
 

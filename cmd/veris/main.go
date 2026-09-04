@@ -350,7 +350,7 @@ func cmdServe(args []string) error {
 			"without it a quick tunnel is used, which needs no account")
 	exposeHostname := fs.String("expose-hostname", "",
 		"public `hostname` a named tunnel serves; required with --expose-token, "+
-			"which announces nothing to read")
+			"which announces nothing to read; configure its Cloudflare service URL as http://"+namedCallbackAddress)
 	var requireCallback []requirement
 	fs.Func("require-callback",
 		"fail unless your app received a callback on this path[:count] (* for any path)",
