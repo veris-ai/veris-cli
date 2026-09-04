@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -1160,5 +1161,41 @@ func TestRunDefaultsRoutesAtTheFoldersSandbox(t *testing.T) {
 	}
 	if strings.Contains(stderr, "this folder") {
 		t.Errorf("the pointer must yield to $VERIS_SANDBOX_ID, got %q", stderr)
+	}
+}
+
+// Only the terminal's FOREGROUND process group may read it. A child put in a
+// group of its own is sent SIGTTIN on its first read and stops -- which is a
+// shell that starts, prints nothing, and accepts no keystroke. So a session
+// keeps this process's group, and everything else keeps its isolation, where
+// the opposite matters: a signal has to reach a test runner's whole tree.
+func TestASessionKeepsTheCallersProcessGroupAndARunDoesNot(t *testing.T) {
+	pgidOf := func(t *testing.T, session bool) int {
+		t.Helper()
+		out := filepath.Join(t.TempDir(), "pgid")
+		script := "ps -o pgid= -p $$ > " + out
+		code, err := superviseEnv(os.Environ(), []string{"/bin/sh", "-c", script}, session)
+		if err != nil || code != 0 {
+			t.Fatalf("probe exited %d: %v", code, err)
+		}
+		body, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pgid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+		if err != nil {
+			t.Fatalf("pgid %q: %v", body, err)
+		}
+		return pgid
+	}
+	mine, err := syscall.Getpgid(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pgidOf(t, true); got != mine {
+		t.Errorf("a session ran in group %d, not this process's %d; it would stop on SIGTTIN at its first read", got, mine)
+	}
+	if got := pgidOf(t, false); got == mine {
+		t.Errorf("an ordinary run must be isolated so a signal reaches its whole tree, but it shared group %d", got)
 	}
 }

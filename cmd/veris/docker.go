@@ -51,6 +51,10 @@ type dockerRun struct {
 	Handoff []config.PassEnvVar
 	Workdir string
 	Argv    []string
+	// Session is --session: the command is typed at, so the container is
+	// given a TTY as well as stdin. Without one a shell inside has no
+	// prompt, no line editing and no job control.
+	Session bool
 
 	// CapAdd is handed back to the workload container after --cap-drop=ALL,
 	// one --cap-add per entry, already validated by parseCapability. Never
@@ -576,6 +580,12 @@ func workloadArgs(spec dockerRun, proxyName, name, share string,
 	)
 	if interactive {
 		args = append(args, "-i")
+		// A TTY only for a session. Adding one to an ordinary run would
+		// change what the command under test sees -- colour, progress bars,
+		// isatty -- and so change the thing being tested.
+		if spec.Session {
+			args = append(args, "-t")
+		}
 	}
 	// Read-only: the workload has no business editing its own trust roots.
 	// Docker orders binds by destination, so these land over anything a -v

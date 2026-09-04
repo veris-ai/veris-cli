@@ -1456,6 +1456,10 @@ func upProxy(s *session, sb *api.Sandbox, o upOptions) error {
 	}
 	announceRouting(s, sb, o)
 	announceTier(s, o)
+	// --session: the shell is typed at, so it keeps this terminal's
+	// foreground process group and its signals. Without it the shell is
+	// isolated, stops on SIGTTIN at its first read, and looks frozen.
+	args = append(args, "--session")
 	return cmdRun(append(args, "--", sessionShell(o.image)))
 }
 

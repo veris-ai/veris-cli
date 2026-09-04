@@ -559,7 +559,7 @@ func runHostExposed(o localRun) error {
 	env := mergeEnv(os.Environ(), ht.childEnv(o.java))
 	env = mergeEnv(env, handedVars(handed))
 	env = mergeEnv(env, userEnvVars(o.userEnv))
-	status, runErr := superviseEnv(env, o.argv)
+	status, runErr := superviseEnv(env, o.argv, o.session)
 	finished := time.Now()
 	if o.fresh {
 		defer holdSignals()()

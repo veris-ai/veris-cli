@@ -85,6 +85,10 @@ func cmdRun(args []string) error {
 			"instead of attaching to an existing --sandbox")
 	ttlMinutes := fs.Int("ttl-minutes", 0,
 		"how long a sandbox created by --environment may live if teardown never runs")
+	session := fs.Bool("session", false,
+		"the command is an interactive session you type at (a shell): keep it "+
+			"in this terminal's foreground process group and let the terminal "+
+			"deliver its signals, instead of isolating it and forwarding them")
 	fresh := fs.Bool("fresh", false,
 		"deploy a sandbox of the environment on this machine (as veris up does, "+
 			"data files included), run, and delete it afterwards: up, run and "+
@@ -373,6 +377,7 @@ func cmdRun(args []string) error {
 			CapAdd:          capAdd,
 			Workdir:         *workdir,
 			Argv:            argv,
+			Session:         *session,
 			Requirements:    reqs,
 			Quiet:           *quiet,
 			KeepProxy:       *keepProxy,
@@ -407,6 +412,7 @@ func cmdRun(args []string) error {
 		quiet:          *quiet,
 		receipt:        *receiptPath,
 		client:         ledgerAPI,
+		session:        *session,
 		fresh:          *fresh,
 		expose:         *expose,
 		exposeHost:     *exposeHost,
@@ -438,6 +444,9 @@ type localRun struct {
 	client *api.Client
 	// fresh is a sandbox this run deployed: an empty ledger fails it.
 	fresh bool
+	// session is --session: the child is typed at, so it keeps this
+	// terminal's foreground process group and its signals.
+	session bool
 	// expose is the callback direction: the port to publish, 0 for none.
 	// With one, the proxy is a `veris serve --expose` child rather than
 	// this process (hosttunnel.go), and the rest describe its tunnel.
@@ -505,7 +514,7 @@ func runLocal(o localRun) error {
 	handed := withoutUserVars(cfg.PassEnv, o.userEnv)
 	announceHandoffs(os.Stderr, handed)
 	announceSuppressed(os.Stderr, cfg.PassEnv, o.userEnv)
-	status, runErr := supervise(running, cfg, authority, o.argv, o.java, handed, o.userEnv)
+	status, runErr := supervise(running, cfg, authority, o.argv, o.java, handed, o.userEnv, o.session)
 	finished := time.Now()
 	// The child is gone; what is left is the after-read and, for a --fresh
 	// sandbox, the teardown. A second Ctrl-C in between would take the
@@ -789,6 +798,7 @@ type javaOptions struct{ store, pass string }
 // named); userEnv is -e itself, layered last so it wins over everything.
 func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
 	argv []string, java javaOptions, handed []config.PassEnvVar, userEnv []string,
+	session bool,
 ) (int, error) {
 	proxyURL := running.ProxyURL()
 
@@ -814,25 +824,55 @@ func supervise(running *proxy.Running, cfg *config.Config, authority *ca.CA,
 		NodeAcceptsEnvProxy: nodeAcceptsEnvProxy(),
 		PassThrough:         passThroughVars(handed),
 	}))
-	return superviseEnv(mergeEnv(env, userEnvVars(userEnv)), argv)
+	return superviseEnv(mergeEnv(env, userEnvVars(userEnv)), argv, session)
 }
 
 // superviseEnv runs the child with env as its whole environment and returns
 // its exit status: supervise once the interception environment is known,
 // which the serve child hands over as a file rather than building here.
-func superviseEnv(env []string, argv []string) (int, error) {
+func superviseEnv(env []string, argv []string, session bool) (int, error) {
 	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // running the user's own command is the point
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	procgroup.Isolate(cmd)
+
+	// A session is a program the developer TYPES AT, and that changes who owns
+	// the terminal. Only the foreground process group may read it: a child put
+	// in its own group is sent SIGTTIN on its first read and stops, which
+	// looks exactly like a shell that started and then froze. So a session
+	// stays in this process group, which is already the foreground one, and
+	// the terminal delivers its own signals straight to it -- Ctrl-C belongs
+	// to the shell's job control, not to us, and leaving is exit or Ctrl-D.
+	//
+	// Every other child is isolated, because there the opposite is true: a
+	// test runner spawns compilers, servers and workers, and signalling only
+	// the runner leaves them alive holding the pipe this wait depends on.
+	if !session {
+		procgroup.Isolate(cmd)
+	}
 
 	// Ctrl-C reaches this process, not the child's group, so forward it: a test
 	// runner's own children would otherwise survive the interrupt. Subscribing
 	// BEFORE the child starts matters -- a signal arriving in the gap would
 	// take the default action here and leave the child orphaned in its own
 	// process group with nobody left to stop it.
+	//
+	// In a session the same signal reaches the child directly, since it shares
+	// this group. Forwarding it as well would deliver it twice, and taking the
+	// default action would kill the proxy out from under a shell the developer
+	// is still using, so an interrupt is held here and dropped.
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	if session {
+		signal.Notify(sigs, syscall.SIGTERM)
+		held := make(chan os.Signal, 1)
+		signal.Notify(held, os.Interrupt)
+		defer signal.Stop(held)
+		go func() {
+			for range held {
+			}
+		}()
+	} else {
+		signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	}
 	defer signal.Stop(sigs)
 
 	if err := cmd.Start(); err != nil {
