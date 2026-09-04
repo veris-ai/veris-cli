@@ -206,7 +206,7 @@ func (in *ingress) register(ctx context.Context, cfg *config.Config) error {
 		}
 		state, err := c.Register(ctx, in.URL)
 		if err != nil {
-			if errors.Is(err, callback.ErrDNSNotReady) {
+			if errors.Is(err, callback.ErrDNSNotReady) || errors.Is(err, callback.ErrTunnelNotReady) {
 				return err
 			}
 			lastErr = err
