@@ -299,6 +299,57 @@ the clock live; it is refused (409) for a sandbox booted from a snapshot or a
 promoted baseline, because that world is an image, and the CLI prints the
 allowed move: `veris down && veris up`.
 
+### Working against it: `up --proxy`
+
+`veris up --proxy` does not stop at a routable sandbox. It opens a shell
+already routed at it, and returns when you leave.
+
+```
+$ veris up --proxy
+✓ Up: 7hqz4m2n9c1v5x8b3k6t0r2p4 is this folder's sandbox (expires 16:04 EDT)
+Answered by the sandbox, at the vendor's own hostname:
+  api.stripe.com   → stripe
+Not proxied — handed to the session as a variable:
+  DATABASE_URL     → postgres
+Every other host reaches its real destination. --strict refuses them instead.
+Session in zsh, interception by proxy and CA variables
+! Not enforced here: Java, static Go binaries, Apache HttpClient and aiohttp
+  ignore those variables and reach the real vendor
+  veris up --proxy --image <image> moves the redirect into the kernel, which
+  covers every runtime.
+veris: using sandbox 7hqz4m2n9c1v5x8b3k6t0r2p4 (this folder)
+$ pytest -q
+........                                                            [100%]
+$ exit
+veris: the sandbox received 7 request(s):
+  stripe                       7
+```
+
+**There is nothing to source and no base URL to change.** Your code keeps its
+production hostnames; the sandbox answers them. The banner says which
+hostnames those are, which twins are handed over as variables instead of
+intercepted, and what happens to everything else, so the mechanism is on
+screen rather than taken on faith.
+
+This is the shape for work `run` does not fit: a shell you keep, an app you
+restart, a debugger you attach, an agent issuing many commands. Leaving the
+session prints the receipt a run ends on — a session that never called the
+sandbox says so.
+
+`up --proxy` runs `veris run` for the session, so the two interception tiers
+are exactly run's, and so is the choice between them:
+
+| | Covers | Needs |
+|---|---|---|
+| `up --proxy` | curl, git, Python, Node, Go via `HTTP_PROXY`, .NET — anything that reads the proxy and CA variables | nothing |
+| `up --proxy --image <img>` | **every runtime**: the redirect is `iptables` in the container's own network namespace, below every library | docker, and your code in an image |
+
+The host tier is a *request*, not an enforcement, which is why it names what
+it misses. There is no third option: a kernel redirect is only safe inside a
+network namespace — on the host it would need root and would capture the whole
+machine, and on macOS `iptables` does not exist at all. The container is the
+namespace, which is why `--image` is the answer for "everything".
+
 `down [--all]` deletes this folder's sandbox, or every sandbox of the in-use
 environment after one confirmation. `sandbox delete --id ID` deletes any other.
 
@@ -487,13 +538,18 @@ your own is never overwritten, exactly as `docker run` precedence has it.
 
 | Command | Purpose |
 |---|---|
-| `serve` | Run the proxy. This is what the container image runs, and what a long-lived local session runs. |
+| `serve` | The proxy as a process: the container image's entrypoint, a supervisor's child, with `--write-env` and `--ready-file` as its handoff. At a keyboard you want `veris up --proxy`. |
 | `check` | Assert a live proxy belongs to THIS run. Exit 2 if not. |
 
 ```sh
+veris serve                                       # this folder's sandbox and login
 veris serve --sandbox 7hqz4m2n9c1v5x8b3k6t0r2p4 --expose 3000
 veris serve --environment k3j2v0d8p1q7x9r2m5n8b4c6a --expose 3000
 ```
+
+With no `--sandbox`, `--config` or `--environment`, `serve` routes at this
+folder's sandbox and uses this folder's login, exactly as `run` does — so it
+needs no id and no `VERIS_API_KEY` on a machine that has logged in.
 
 Ingress belongs to the session rather than to one command, so `serve` owns
 it; `run --image` takes the same `--expose*` and `--require-callback` flags

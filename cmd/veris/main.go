@@ -92,7 +92,7 @@ func root() *cli.Command {
 			"  Define       veris env create|list|get|use|delete · veris services\n" +
 			"\n" +
 			"  This folder's sandbox — no id typed, from .veris/twin.local.yaml:\n" +
-			"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--watch]\n" +
+			"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--proxy [--image IMG]] [--watch]\n" +
 			"  veris status    [--watch] [--json]\n" +
 			"  veris down      [--all]\n" +
 			"  veris run       [--fresh] [--env NAME] [--image <image>] [--cap-add <CAP>] [--expose PORT] [--require-service <n>] [--require-callback <path>] [--receipt PATH] -- <cmd>\n" +
@@ -102,6 +102,7 @@ func root() *cli.Command {
 			"\n" +
 			"  Keep a world veris snapshot create|list|get|delete · veris baseline get|promote|set|clear|list\n" +
 			"  Proxy        veris serve [--sandbox <id>] [--transparent] [--print-routes] · veris check\n" +
+			"               serve is the proxy as a process; at a keyboard use up --proxy\n" +
 			"  Diagnose     veris doctor [--env NAME] [--json] · veris version",
 		Help: rootHelp,
 		Flags: func(fs *flag.FlagSet) {
@@ -166,11 +167,18 @@ Run with --help for the flags.`,
 		},
 		{
 			Name:    "serve",
-			Summary: "Run the proxy, as the container image and a long-lived session do",
+			Summary: "Run the proxy as a supervisor or container does (people want up --proxy)",
 			Usage:   "veris serve [--sandbox <id>] [--transparent] [--print-routes] [--listen <addr>]",
-			Help: `This is what the container image runs, and what a long-lived local
-session runs. Add --transparent for the kernel redirect, which is the only
-tier that covers every runtime.
+			Help: `serve is the proxy as a PROCESS: the container image's entrypoint,
+a supervisor's child. It does not make a sandbox -- that is veris up -- and
+its --write-env and --ready-file are the handoff a supervisor reads.
+
+At a keyboard you want "veris up --proxy", which makes the sandbox and puts
+you in a session already routed at it, with nothing to source.
+
+With no --sandbox, --config or --environment, serve routes at this folder's
+sandbox and uses this folder's login, as run does. Add --transparent for the
+kernel redirect, which is the only tier that covers every runtime.
 
 Run with --help for the flags.`,
 			RawArgs: true,
@@ -325,6 +333,9 @@ func cmdServe(args []string) error {
 	environment := fs.String("environment", os.Getenv("VERIS_ENVIRONMENT_ID"),
 		"deploy a fresh sandbox from this environment `id` and delete it "+
 			"afterwards, instead of attaching to an existing --sandbox")
+	envFlag := fs.String("env", "",
+		"environment `name` in .veris/twin.yaml, when this folder's pointer is "+
+			"what serve routes at and more than one environment could own it")
 	ttlMinutes := fs.Int("ttl-minutes", 60,
 		"how long a sandbox created by --environment may live if teardown never "+
 			"runs, so a crashed run cannot leak one forever")
@@ -413,6 +424,17 @@ func cmdServe(args []string) error {
 	// on return, in which a signal meant for the serve handler finds none
 	// installed and takes the default action -- which killed the test binary
 	// on CI while passing locally.
+	// The folder's login, and its sandbox when no flag named a target.
+	// Before this, `veris serve` straight after `veris up` failed with
+	// "nothing to route" while the id it wanted sat in
+	// .veris/twin.local.yaml, two lines above on the same screen -- and it
+	// demanded VERIS_API_KEY on a machine where up had just worked off a
+	// saved profile.
+	if err := adoptFolderContext(&sources, *envFlag,
+		*environment == "" && !explicitTarget(sources, "")); err != nil {
+		return err
+	}
+
 	provisionCtx := context.Background()
 	if *environment != "" || *expose > 0 {
 		ctx, cancel := signal.NotifyContext(

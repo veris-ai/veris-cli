@@ -16,6 +16,8 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/cfg"
 	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/discovery"
+	"github.com/veris-ai/veris-cli/internal/routes"
 )
 
 const (
@@ -220,7 +222,10 @@ func (f *sandboxTwins) services(withPGControl bool) []api.ServiceInfo {
 		pg.ControlURL = f.srv.URL + "/s/" + sbID + "/postgres"
 	}
 	return []api.ServiceInfo{
-		{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE"},
+		// The measured vendor hostname rides with the service, which is what
+		// makes stripe intercepted rather than passed through.
+		{Name: "stripe", Status: "ready", URL: stripe, ControlURL: stripe, EnvHint: "STRIPE_API_BASE",
+			Routes: []routes.Entry{{Host: "api.stripe.com"}}},
 		pg,
 	}
 }
@@ -1514,4 +1519,141 @@ func TestUpAndStatusNameTheTwinNobodyAskedFor(t *testing.T) {
 	if strings.Contains(stderr, "stripe +") {
 		t.Errorf("a twin the environment names is not an addition:\n%s", stderr)
 	}
+}
+
+// up --proxy hands the caller a session already routed at the sandbox it
+// just made. The proof is end to end: a real shell runs, a request it makes
+// at the vendor's own hostname reaches the twin, and leaving the shell ends
+// the session with the receipt -- with no file written anywhere.
+func TestUpProxyOpensASessionRoutedAtTheSandbox(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	t.Setenv(discovery.EnvConfig, "")
+	t.Setenv(discovery.EnvSandboxID, "")
+	ciProject(t, b, customersJSON)
+	plane.script(func(p *sandboxPlane) {
+		p.answer = func(int) *api.Sandbox {
+			return readySandbox(twins.services(false), time.Now().Add(30*time.Minute))
+		}
+	})
+	// The "shell" is a one-line script that makes a request at the vendor's
+	// own hostname and exits -- what a real session does by hand, and the
+	// only way to prove the shell it opened was actually routed.
+	t.Setenv("SHELL", fakeShell(t, "call"))
+
+	// up writes through the tree's stream; the session it hands over to is
+	// `run`, which owns os.Stderr. Both are the one stream in real use.
+	var code int
+	var banner string
+	session := captureStderr(t, func() {
+		code, _, banner = runSandboxCLI(t, "up", "--proxy", "--listen", "127.0.0.1:0")
+	})
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s%s", code, banner, session)
+	}
+	// How the session works, said before it starts.
+	sbInOrder(t, banner,
+		"\u2713 Up: "+sbID+" is this folder's sandbox",
+		"Answered by the sandbox, at the vendor's own hostname:",
+		"api.stripe.com",
+		"\u2192 stripe",
+		"Not proxied \u2014 handed to the session as a variable:",
+		"DATABASE_URL",
+		"Every other host reaches its real destination",
+		"interception by proxy and CA variables",
+		"Not enforced here: Java, static Go binaries")
+	// And the session itself: routed at this folder's sandbox, and the
+	// request the shell made actually arrived.
+	sbInOrder(t, session,
+		"veris: using sandbox "+sbID+" (this folder)",
+		"veris: the sandbox received 1 request(s):",
+		"stripe                       1")
+
+	// Nothing is written for the reader to source: the session's own
+	// environment is the handoff, and it lives exactly as long as the proxy.
+	for _, name := range []string{"proxy.env", "proxy.env.ready"} {
+		if _, err := os.Stat(filepath.Join(b.project, ".veris", name)); !os.IsNotExist(err) {
+			t.Errorf(".veris/%s was written; the session is the handoff", name)
+		}
+	}
+	// The sandbox outlives the session.
+	if ptr := sbPointer(t, b); ptr == nil || ptr.ID != sbID {
+		t.Errorf("the folder should still point at %s, got %+v", sbID, ptr)
+	}
+	if got := plane.deletedIDs(); len(got) != 0 {
+		t.Errorf("leaving the session deleted %v; that is veris down's job", got)
+	}
+}
+
+// fakeShell is a program SHELL can point at: it re-execs this test binary in
+// the child role named, which supervise reaches with the session's own
+// environment, proxy variables and all.
+func fakeShell(t *testing.T, role string) string {
+	t.Helper()
+	t.Setenv(childMarker, role)
+	path := filepath.Join(t.TempDir(), "fake-shell")
+	body := "#!/bin/sh\nexec " + os.Args[0] + " -test.run=TestMain\n"
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The flags that describe the proxy are refused without it, rather than
+// accepted and ignored: a --listen that did nothing is how two folders end
+// up fighting over port 8080 with neither told.
+func TestUpProxyFlagsNeedProxy(t *testing.T) {
+	plane := newSandboxPlane(t)
+	b := sandboxBench(t, plane.srv.URL)
+	ciProject(t, b, customersJSON)
+	for _, flag := range [][]string{
+		{"--image", "app:test"},
+		{"--listen", "127.0.0.1:0"},
+		{"--expose", "3000"},
+		{"--strict"},
+	} {
+		code, _, stderr := runSandboxCLI(t, append([]string{"up"}, flag...)...)
+		if code != 1 || !strings.Contains(stderr, flag[0]+" describes the session up would open; add --proxy, or drop it") {
+			t.Errorf("%v: exit %d:\n%s", flag, code, stderr)
+		}
+	}
+}
+
+// serve with no target is this folder's sandbox, the same target run takes.
+// Before this it failed with "nothing to route" while the id it wanted sat
+// in .veris/twin.local.yaml, two lines above on the same screen.
+func TestServeRoutesAtThisFoldersSandbox(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newSandboxTwins(t)
+	b := sandboxBench(t, plane.srv.URL)
+	t.Setenv(discovery.EnvConfig, "")
+	t.Setenv(discovery.EnvSandboxID, "")
+	ciProject(t, b, customersJSON)
+	plane.script(func(p *sandboxPlane) {
+		p.answer = func(int) *api.Sandbox {
+			return readySandbox(twins.services(false), time.Now().Add(30*time.Minute))
+		}
+	})
+	b.local(cfg.Local{Sandbox: &cfg.SandboxRef{ID: sbID, EnvironmentID: ciID}})
+
+	// --print-routes resolves the target and prints what it would intercept
+	// without binding anything, which is exactly the question here.
+	stderr := captureStderr(t, func() {
+		if err := cmdServe([]string{"--print-routes"}); err != nil {
+			t.Errorf("serve --print-routes: %v", err)
+		}
+	})
+	if !strings.Contains(stderr, "veris: using sandbox "+sbID+" (this folder)") {
+		t.Errorf("serve did not say which sandbox it took:\n%s", stderr)
+	}
+
+	// The pointer's own environment is the one it may be used for: taking ci's
+	// sandbox for a run of dev would route at the wrong world with nothing said.
+	t.Run("a pointer from another environment is refused", func(t *testing.T) {
+		err := cmdServe([]string{"--env", "dev", "--print-routes"})
+		if err == nil || !strings.Contains(err.Error(), "belongs to environment") {
+			t.Errorf("err = %v, want the cross-environment refusal", err)
+		}
+	})
 }

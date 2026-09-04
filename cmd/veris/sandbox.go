@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -213,6 +214,13 @@ type upOptions struct {
 	callbackURL string
 	timeout     string
 	watch       bool
+
+	// The session up hands over to once the sandbox is routable.
+	proxy  bool
+	image  string
+	listen string
+	expose int
+	strict bool
 }
 
 func upCommand() *cli.Command {
@@ -220,8 +228,15 @@ func upCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "up",
 		Summary: "Start a sandbox of the environment and wait for it",
-		Usage:   "veris up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--callback-url URL] [--timeout 300s] [--watch] [--json]",
-		Help: "up deploys a sandbox of the environment (NAME, --env, the folder's `use`, or the project default),\n" +
+		Usage:   "veris up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--callback-url URL] [--timeout 300s] [--proxy [--image IMG] [--listen ADDR] [--expose PORT] [--strict]] [--watch] [--json]",
+		Help: "--proxy opens a shell already routed at the new sandbox and returns when you leave it. There\n" +
+			"is nothing to source and no base URL to change: your code keeps its production hostnames and\n" +
+			"the sandbox answers them. It runs `veris run` for the session, so both tiers are the same\n" +
+			"ones run has -- on the host, proxy and CA variables, which Java, static Go binaries, Apache\n" +
+			"HttpClient and aiohttp ignore; with --image, the redirect moves into the kernel inside a\n" +
+			"container and covers every runtime. --listen, --expose and --strict belong to the proxy.\n" +
+			"The sandbox outlives the session: veris down, or the TTL, is what ends it.\n" +
+			"up deploys a sandbox of the environment (NAME, --env, the folder's `use`, or the project default),\n" +
 			"remembers its id for this folder at once, waits until the control plane reports it ready and\n" +
 			"every twin answers through the gateway, adds the environment config's data files, and prints\n" +
 			"the env-var hints the code under test needs. Settings come from the flag, then the environment\n" +
@@ -236,6 +251,11 @@ func upCommand() *cli.Command {
 			fs.StringVar(&o.snapshot, "snapshot", "", "snapshot id or name, for --boot snapshot")
 			fs.StringVar(&o.callbackURL, "callback-url", "", "where the twins deliver callbacks (config)")
 			fs.StringVar(&o.timeout, "timeout", defaultUpTimeout, "budget for ready and routable, e.g. 300s or 5m")
+			fs.BoolVar(&o.proxy, "proxy", false, "open a shell routed at the new sandbox, and hold it until you leave")
+			fs.StringVar(&o.image, "image", "", "with --proxy: run the session inside this container `image`, with the redirect in the kernel, which covers every runtime")
+			fs.StringVar(&o.listen, "listen", "", "with --proxy: `address` the proxy listens on (default 127.0.0.1:8080; :0 picks a free port)")
+			fs.IntVar(&o.expose, "expose", 0, "with --proxy: publish this local `port` at a public URL so the sandbox can deliver callbacks")
+			fs.BoolVar(&o.strict, "strict", false, "with --proxy: block unmapped hosts instead of letting them reach the real internet")
 		},
 		Run: func(ctx *cli.Context, args []string) error {
 			if len(args) > 1 {
@@ -247,6 +267,9 @@ func upCommand() *cli.Command {
 					return fmt.Errorf("up was given both NAME %q and --env %q", args[0], name)
 				}
 				name = args[0]
+			}
+			if err := o.checkProxyFlags(); err != nil {
+				return err
 			}
 			return up(ctx, name, o)
 		},
@@ -268,9 +291,40 @@ func up(ctx *cli.Context, name string, o upOptions) error {
 	}
 	studioLink(s.ui, s.consoleURL(), "sandboxes", sb.ID)
 	_, _, conf, _ := s.requireEnv()
-	s.ui.Next(runHint(conf))
+	if !o.proxy {
+		s.ui.Next(runHint(conf))
+	}
 	if s.ctx.Globals.JSON {
-		return printJSON(s.ctx.Stdout, sb)
+		if err := printJSON(s.ctx.Stdout, sb); err != nil {
+			return err
+		}
+	}
+	if o.proxy {
+		return upProxy(s, sb, o)
+	}
+	return nil
+}
+
+// checkProxyFlags refuses a flag that only means something with --proxy,
+// rather than accepting it and doing nothing with it. A --listen that was
+// silently ignored is how a second folder's proxy ends up fighting the
+// first one for port 8080 with nothing said.
+func (o upOptions) checkProxyFlags() error {
+	if o.proxy {
+		return nil
+	}
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"--image", o.image != ""},
+		{"--listen", o.listen != ""},
+		{"--expose", o.expose != 0},
+		{"--strict", o.strict},
+	} {
+		if f.set {
+			return &cli.UsageError{Msg: f.name + " describes the session up would open; add --proxy, or drop it"}
+		}
 	}
 	return nil
 }
@@ -1369,4 +1423,128 @@ func seededTables(raw json.RawMessage) (int, bool) {
 		return 0, false
 	}
 	return len(detail.Seeded), true
+}
+
+// --- up --proxy -------------------------------------------------------------
+
+// upProxy puts the caller in a session already routed at the sandbox up just
+// made, and returns when they leave it.
+//
+// It runs `veris run` rather than a proxy of its own. That is the whole
+// point: run already owns both interception tiers, the receipt, and the
+// handoff of every twin the proxy cannot route, and a second implementation
+// of any of it would be a second thing to get wrong. What up adds is that
+// the sandbox exists and its id never had to be typed.
+//
+// There is deliberately no file to source. An environment written to disk is
+// a step the reader has to take, in a shell we do not control, and it is
+// silently stale the moment the proxy stops. The session's own environment
+// is the handoff, and it exists for exactly as long as the proxy does.
+func upProxy(s *session, sb *api.Sandbox, o upOptions) error {
+	args := []string{}
+	if o.image != "" {
+		args = append(args, "--image", o.image)
+	}
+	if o.listen != "" {
+		args = append(args, "--listen", o.listen)
+	}
+	if o.expose > 0 {
+		args = append(args, "--expose", strconv.Itoa(o.expose))
+	}
+	if o.strict {
+		args = append(args, "--strict")
+	}
+	announceRouting(s, sb, o)
+	announceTier(s, o)
+	return cmdRun(append(args, "--", sessionShell(o.image)))
+}
+
+// sessionShell is what the session runs. On the host it is the caller's own
+// shell, which is the one they have configured; in a container it is the
+// image's /bin/sh, since nothing here knows what that image ships and sh is
+// the one thing a POSIX image must have.
+func sessionShell(image string) string {
+	if image != "" {
+		return "/bin/sh"
+	}
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	if runtime.GOOS == "windows" {
+		if c := os.Getenv("COMSPEC"); c != "" {
+			return c
+		}
+		return "cmd.exe"
+	}
+	return "/bin/sh"
+}
+
+// announceRouting is how the session works, said before it starts: which
+// hostnames are answered by the sandbox instead of the vendor, which twins
+// are handed over as variables rather than intercepted, and what happens to
+// everything else.
+//
+// Without it a session is a shell that looks exactly like any other shell,
+// and the reader has to take on faith that their unmodified production
+// hostnames now go somewhere else. The routes come from the sandbox record,
+// which is the only place they exist -- the binary keeps no copy.
+func announceRouting(s *session, sb *api.Sandbox, o upOptions) {
+	var intercepted, handed [][]string
+	for _, svc := range sb.Services {
+		if len(svc.Routes) == 0 {
+			if svc.EnvHint != "" {
+				handed = append(handed, []string{"  " + svc.EnvHint, "→ " + svc.Name})
+			}
+			continue
+		}
+		for _, r := range svc.Routes {
+			if len(r.Paths) == 0 {
+				intercepted = append(intercepted, []string{"  " + r.Host, "→ " + svc.Name})
+				continue
+			}
+			for _, p := range r.Paths {
+				intercepted = append(intercepted, []string{"  " + r.Host + p, "→ " + svc.Name})
+			}
+		}
+	}
+	if len(intercepted) > 0 {
+		s.ui.Info("Answered by the sandbox, at the vendor's own hostname:")
+		s.ui.Table(nil, intercepted)
+	}
+	if len(handed) > 0 {
+		s.ui.Info("Not proxied — handed to the session as a variable:")
+		s.ui.Table(nil, handed)
+	}
+	if o.strict {
+		s.ui.Info("Every other host is refused: --strict.")
+		return
+	}
+	s.ui.Info("Every other host reaches its real destination. --strict refuses them instead.")
+}
+
+// announceTier says which of the two interception tiers this session gets,
+// and the host tier says what it does not cover.
+//
+// That second line is the point. The host tier sets proxy and CA variables,
+// which is a REQUEST: a runtime that does not read them reaches the real
+// vendor, and the suite goes green against production. Naming the runtimes
+// it misses, beside the flag that covers them, is the difference between a
+// known limit and a silent one.
+func announceTier(s *session, o upOptions) {
+	if o.image != "" {
+		s.ui.Info("Session in %s, interception in the kernel: every runtime, nothing to configure", o.image)
+		return
+	}
+	s.ui.Info("Session in %s, interception by proxy and CA variables", shellName(sessionShell("")))
+	s.ui.Warn("Not enforced here: Java, static Go binaries, Apache HttpClient and aiohttp ignore those variables and reach the real vendor")
+	s.ui.Detail("veris up --proxy --image <image> moves the redirect into the kernel, which covers every runtime.")
+}
+
+// shellName is the shell as a reader recognises it, "zsh" rather than the
+// path it happens to live at.
+func shellName(path string) string {
+	if base := filepath.Base(path); base != "" && base != "." && base != string(filepath.Separator) {
+		return base
+	}
+	return path
 }

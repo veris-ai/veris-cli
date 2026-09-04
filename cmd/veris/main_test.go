@@ -493,7 +493,7 @@ func TestTheMilestoneThreeLeavesAnswerAsAScriptSeesThem(t *testing.T) {
 			argv: []string{"--help"},
 			code: 0,
 			stdoutHas: []string{
-				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--watch]\n",
+				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--proxy [--image IMG]] [--watch]\n",
 				"  veris status    [--watch] [--json]\n",
 				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
 				"[--expose PORT] [--require-service <n>] [--require-callback <path>]",
