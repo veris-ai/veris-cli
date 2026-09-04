@@ -209,6 +209,16 @@ func cmdRun(args []string) error {
 		sources.APIBase = firstNonEmpty(sources.APIBase, s.res.APIBase)
 		sources.APIKey = firstNonEmpty(sources.APIKey, s.res.APIKey)
 	}
+	// `--environment "$VERIS_ENVIRONMENT_ID"` in a shell where that is unset
+	// hands the flag nothing, and nothing is not "no flag": every check below
+	// reads an empty --environment as absent, so the run would route at the
+	// folder's sandbox in the host tier, and in the container tier start a
+	// proxy with no target and fail inside it. Said here, once, as itself.
+	if flagsGiven(fs)["environment"] && *environment == "" {
+		return errors.New(
+			"--environment is empty, so there is no environment to deploy from: " +
+				"pass its id (an unset $VERIS_ENVIRONMENT_ID expands to nothing)")
+	}
 	argv, reqs, callbackReqs := d.argv, d.reqs, d.callbackReqs
 	*expose, *image, *strict = d.expose, d.image, d.strict
 	// An empty argv is only a mistake WITHOUT --image. With one, it is the
@@ -343,6 +353,21 @@ func cmdRun(args []string) error {
 				return fmt.Errorf("%s applies to a local proxy, and --image puts "+
 					"the proxy in its own container. Drop it, or drop --image", name)
 			}
+		}
+		// The proxy container is handed one routing target, and handed none
+		// it starts, finds nothing to route and exits with the runner image's
+		// own words -- set VERIS_SANDBOX_ID, or mount a config at
+		// /veris/config.json -- which are for someone driving that image by
+		// hand, not for this command. The host tier refuses the same run
+		// before it does anything (resolveConfig), so this tier refuses here,
+		// in this command's words. --fresh is exempt: its sandbox does not
+		// exist yet, and it is the target.
+		if !*fresh && sources.File == "" && *environment == "" && sandboxForContainer(sources) == "" {
+			return fmt.Errorf(
+				"nothing to route: pass --sandbox <id> (or set $%s), "+
+					"--environment <id> to deploy one for this run, or --config <file>; "+
+					"veris up gives this folder a sandbox of its own",
+				discovery.EnvSandboxID)
 		}
 	}
 
