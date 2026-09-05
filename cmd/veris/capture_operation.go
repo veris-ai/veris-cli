@@ -34,7 +34,7 @@ func durableCapture(ctx context.Context, s *session, envID string, request api.C
 		return supported, err
 	}
 	if err := json.Unmarshal(result, out); err != nil {
-		return true, &api.CaptureError{request.RequestID, "unconfirmed", fmt.Sprintf("invalid capture result: %v", err)}
+		return true, &api.CaptureError{ID: request.RequestID, State: "unconfirmed", Detail: fmt.Sprintf("invalid capture result: %v", err)}
 	}
 	valid := false
 	switch r := out.(type) {
@@ -44,7 +44,7 @@ func durableCapture(ctx context.Context, s *session, envID string, request api.C
 		valid = r.Snapshot.EnvironmentID == envID && r.Snapshot.SourceSandbox == request.SandboxID && r.Snapshot.ID != "" && r.Snapshot.Image != "" && r.Snapshot.RevisionID != ""
 	}
 	if !valid {
-		return true, &api.CaptureError{request.RequestID, "unconfirmed", "capture result does not identify the requested source and saved image; retain the source"}
+		return true, &api.CaptureError{ID: request.RequestID, State: "unconfirmed", Detail: "capture result does not identify the requested source and saved image; retain the source"}
 	}
 	return true, nil
 }
