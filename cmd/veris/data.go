@@ -32,7 +32,8 @@ const (
 // editing and removing your own data in a running sandbox.
 func sandboxDataCommand() *cli.Command {
 	var schemaID, schemaTable, getID, addID, setID, deleteID string
-	var limit int
+	var limit, offset int
+	var all bool
 	return &cli.Command{
 		Name:    "data",
 		Summary: "A sandbox's data: schema, get, add, set, delete",
@@ -71,14 +72,25 @@ func sandboxDataCommand() *cli.Command {
 			{
 				Name:    "get",
 				Summary: "Row counts per table, or a page of one table's rows",
-				Usage:   "veris sandbox data get [NAME [TABLE]] [--limit N] [--id ID] [--json]",
+				Usage:   "veris sandbox data get [NAME [TABLE]] [--limit N] [--offset N | --all] [--id ID] [--json]",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&getID, "id", "", "sandbox id (default: this folder's)")
-					fs.IntVar(&limit, "limit", defaultDataLimit, "rows to show of a table")
+					fs.IntVar(&limit, "limit", defaultDataLimit, "rows per page (1..1000)")
+					fs.IntVar(&offset, "offset", 0, "rows to skip")
+					fs.BoolVar(&all, "all", false, "read every page; stop writers while reading")
 				},
 				Run: func(ctx *cli.Context, args []string) error {
 					if len(args) > 2 {
 						return fmt.Errorf("sandbox data get takes NAME and TABLE at most (got %q)", strings.Join(args, " "))
+					}
+					if limit > 1000 {
+						return errors.New("--limit must not exceed 1000; use --all to read every page")
+					}
+					if offset < 0 || (all && offset != 0) {
+						return errors.New("--offset must be nonnegative and cannot be combined with --all")
+					}
+					if (all || offset != 0) && len(args) != 2 {
+						return errors.New("--all and --offset need NAME and TABLE")
 					}
 					if limit <= 0 {
 						return fmt.Errorf("--limit must be positive (got %d)", limit)
@@ -90,7 +102,7 @@ func sandboxDataCommand() *cli.Command {
 					if len(args) > 1 {
 						table = args[1]
 					}
-					return dataGet(ctx, getID, name, table, limit)
+					return dataGet(ctx, getID, name, table, limit, offset, all)
 				},
 			},
 			{
@@ -688,7 +700,7 @@ func printTableSchema(s *session, svc api.ServiceInfo, doc *schemaDoc, table str
 
 // dataGet is counts per table for every twin (or the named one), or with a
 // TABLE the newest rows of that table.
-func dataGet(ctx *cli.Context, idFlag, name, table string, limit int) error {
+func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, all bool) error {
 	s, _, sb, err := openSandboxServices(ctx, idFlag)
 	if err != nil {
 		return err
@@ -699,7 +711,7 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit int) error {
 		if err != nil {
 			return err
 		}
-		return dataRows(bg, s, *svc, table, limit)
+		return dataRows(bg, s, *svc, table, limit, offset, all)
 	}
 	targets := sb.Services
 	if name != "" {
@@ -753,20 +765,39 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit int) error {
 // own: GET /veris/data takes a table, a limit and an offset, and no sort,
 // so a row written a moment ago may be on any page. To see what a run just
 // sent, read the trace, which is ordered.
-func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string, limit int) error {
+func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string, limit, offset int, all bool) error {
 	if svc.ControlURL == "" {
 		s.ui.Fail("%s has no control URL to read rows through (data plane; query it with your own client at %s)", svc.Name, svc.URL)
 		return printed(1)
 	}
 	tw := s.twin(svc.ControlURL)
-	page, err := tw.Rows(ctx, table, limit, 0)
+	page, err := tw.Rows(ctx, table, limit, offset)
 	if err != nil {
 		return s.fail("read", fmt.Sprintf("table %s of %s", table, svc.Name), err)
+	}
+	if all {
+		for len(page.Rows) < page.Total {
+			nextOffset := len(page.Rows)
+			next, err := tw.Rows(ctx, table, limit, nextOffset)
+			if err != nil {
+				return s.fail("read", fmt.Sprintf("table %s of %s at offset %d", table, svc.Name, nextOffset), err)
+			}
+			if next.Total != page.Total || next.Offset != nextOffset || len(next.Rows) == 0 {
+				return errors.New("table changed or pagination stopped before all rows were read; stop writers and retry")
+			}
+			page.Rows = append(page.Rows, next.Rows...)
+		}
+		if len(page.Rows) != page.Total {
+			return errors.New("table returned more rows than its total; retry after stopping writers")
+		}
 	}
 	if page.Rows == nil {
 		page.Rows = []map[string]any{}
 	}
 	if s.ctx.Globals.JSON {
+		if offset > 0 || len(page.Rows) < page.Total {
+			fmt.Fprintf(s.ctx.Stderr, "veris: %s.%s: showing %d of %d rows (offset %d); use --all for all rows\n", svc.Name, table, len(page.Rows), page.Total, offset)
+		}
 		return printJSON(s.ctx.Stdout, page.Rows)
 	}
 	// The schema's column order is a nicety, not a need: a schema that will
@@ -805,8 +836,8 @@ func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string
 		lines = append(lines, line)
 	}
 	s.ui.Table(header, lines)
-	if page.Total > len(page.Rows) {
-		s.ui.Link(fmt.Sprintf("veris sandbox data get %s %s --limit %d   (more rows)", svc.Name, table, min(page.Total, 1000)))
+	if page.Total > offset+len(page.Rows) {
+		s.ui.Link(fmt.Sprintf("veris sandbox data get %s %s --offset %d --limit %d   (next page; --all for all rows)", svc.Name, table, offset+len(page.Rows), limit))
 	}
 	return nil
 }

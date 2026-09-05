@@ -793,6 +793,9 @@ func printVerdict(w io.Writer, l *ledger, assertions []assertion, engine *proxy.
 				oks = append(oks, fmt.Sprintf("✓ ledgers agree (%d = %d)", sent, recorded))
 			} else {
 				fmt.Fprintf(w, "veris: ! ledgers differ (engine %d, sandbox %d)\n", sent, recorded)
+				if recorded > sent {
+					fmt.Fprintln(w, "            — sandbox totals can include sibling token verification or concurrent traffic; compare per-twin traces. Requirements are judged separately.")
+				}
 			}
 		}
 	}
