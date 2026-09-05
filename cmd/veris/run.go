@@ -79,7 +79,8 @@ func cmdRun(args []string) error {
 	exposeToken := fs.String("expose-token", "",
 		"cloudflared named-tunnel `token` (defaults to $VERIS_TUNNEL_TOKEN)")
 	exposeHostname := fs.String("expose-hostname", "",
-		"public `hostname` a named tunnel serves; required with --expose-token")
+		"public `hostname` a named tunnel serves; required with --expose-token; "+
+			"configure its Cloudflare service URL as http://"+namedCallbackAddress)
 	environment := fs.String("environment", "",
 		"deploy a fresh sandbox from this environment `id` and delete it after, "+
 			"instead of attaching to an existing --sandbox")

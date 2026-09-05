@@ -38,6 +38,26 @@ type ingressOptions struct {
 	Binary   string
 }
 
+// A remotely managed tunnel's service URL is configured in Cloudflare, so it
+// needs an address that survives runner restarts. Quick tunnels own their local
+// configuration and can use an ephemeral port instead.
+const namedCallbackAddress = "127.0.0.1:18444"
+
+func listenForCallbacks(opts ingressOptions) (net.Listener, error) {
+	addr := "127.0.0.1:0"
+	if opts.Token != "" {
+		addr = namedCallbackAddress
+		if opts.Port == 18444 && isLocalOrigin(opts.Host) {
+			return nil, errors.New("--expose 18444 is the named tunnel's callback recorder; choose the application's own port")
+		}
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("bind the callback listener at %s: %w", addr, err)
+	}
+	return ln, nil
+}
+
 // ingress is a live callback path: everything needed to report on it and to
 // take it down again.
 type ingress struct {
@@ -51,6 +71,7 @@ type ingress struct {
 	// tried must not displace it.
 	clients []*callback.Client
 	log     *slog.Logger
+	named   bool
 }
 
 // reservedPorts are the proxy's own listeners. The workload shares this network
@@ -100,6 +121,7 @@ func startIngress(
 		in := &ingress{
 			URL: pending.url, Inbound: pending.inbound,
 			tunnel: pending.tunnel, server: pending.server, log: log,
+			named: pending.original.Token != "",
 		}
 		// Registered at creation, so there is nothing to PATCH. The clients are
 		// still needed: the confirmation probe once the app is listening runs
@@ -111,12 +133,22 @@ func startIngress(
 				InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
 			}))
 		}
-		if len(in.clients) > 0 {
+		if in.named {
+			if len(in.clients) == 0 {
+				_ = in.Stop(context.Background())
+				return nil, errors.New("no service endpoint to verify named callback routing")
+			}
+			if err := in.waitForNamedRecorder(ctx, in.clients[0]); err != nil {
+				_ = in.Stop(context.Background())
+				return nil, err
+			}
+		} else if len(in.clients) > 0 {
 			if _, err := in.clients[0].ProbeResolved(ctx); err != nil {
 				_ = in.Stop(context.Background())
 				return nil, fmt.Errorf("confirm callback hostname before starting the app: %w", err)
 			}
 		}
+
 		// The sandbox may already have probed us at creation, and that is not a
 		// callback the run produced.
 		in.Inbound.Baseline()
@@ -131,7 +163,7 @@ func startIngress(
 	// Loopback only. Whatever this binds is what the tunnel publishes, and a
 	// routable bind would publish it twice -- once deliberately and once to
 	// anything that can reach this host.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenForCallbacks(opts)
 	if err != nil {
 		return nil, fmt.Errorf("bind the callback listener: %w", err)
 	}
@@ -158,7 +190,7 @@ func startIngress(
 		return nil, err
 	}
 
-	in := &ingress{URL: tun.URL(), Inbound: inbound, tunnel: tun, server: srv, log: log}
+	in := &ingress{URL: tun.URL(), Inbound: inbound, tunnel: tun, server: srv, log: log, named: opts.Token != ""}
 	if err := in.register(ctx, cfg); err != nil {
 		_ = in.Stop(context.Background())
 		return nil, err
@@ -212,6 +244,9 @@ func (in *ingress) register(ctx context.Context, cfg *config.Config) error {
 			lastErr = err
 			continue
 		}
+		if in.named {
+			return in.waitForNamedRecorder(ctx, c)
+		}
 		switch {
 		case state.Answered():
 			in.log.Info("callbacks registered", "url", in.URL, "via", ep.Name)
@@ -232,6 +267,32 @@ func (in *ingress) register(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 	return fmt.Errorf("register the callback URL with the sandbox: %w", lastErr)
+}
+
+// An HTTP response alone may come from the app directly or from the wrong
+// origin in Cloudflare's remote configuration. Observe a fresh sandbox probe
+// through our recorder before the workload starts; the app need not listen yet.
+func (in *ingress) waitForNamedRecorder(ctx context.Context, c *callback.Client) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	before := in.Inbound.Receipt().Total
+	for {
+		_, err := c.Probe(ctx)
+		if err != nil {
+			return fmt.Errorf("probe named callback routing from the sandbox: %w", err)
+		}
+		if in.Inbound.Receipt().Total > before {
+			in.log.Info("named callback tunnel reached the recorder", "url", in.URL)
+			return nil
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("named callback tunnel did not reach this run's recorder: configure the Cloudflare hostname's service URL as http://%s in the cloudflared network namespace, and use a dedicated connector for this run: %w", namedCallbackAddress, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // Stop clears the registration and closes the tunnel.
@@ -369,7 +430,7 @@ func openIngress(ctx context.Context, log *slog.Logger, opts ingressOptions) (*p
 	if err != nil {
 		return nil, err
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenForCallbacks(opts)
 	if err != nil {
 		return nil, fmt.Errorf("bind the callback listener: %w", err)
 	}
