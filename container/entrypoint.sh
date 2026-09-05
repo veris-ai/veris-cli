@@ -158,9 +158,10 @@ trap 'kill -TERM "$PROXY_PID" 2>/dev/null' TERM INT
 # complete.
 i=0
 # --environment provisions a sandbox before the marker is written, and that is
-# allowed minutes for scheduling and image pulls. Thirty seconds would kill a
-# healthy deployment as a startup failure -- and the host now waits six.
+# allowed minutes for scheduling and image pulls. Exposed callbacks also wait
+# for tunnel allocation and sandbox-side DNS propagation before readiness.
 READY_TRIES=300
+[ -n "${VERIS_EXPOSE:-}" ] && READY_TRIES=1800  # 3 min at 0.1s, matching the host
 [ -n "${VERIS_ENVIRONMENT_ID:-}" ] && READY_TRIES=5400  # 9 min at 0.1s, matching the host
 
 while [ ! -s "$READY_FILE" ]; do

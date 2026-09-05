@@ -474,7 +474,10 @@ veris run --image your-image --expose 3000 --require-callback /hooks/stripe
 ```
 
 The port is the one your app listens on. Your image starts only after the proxy
-reports ready, so the registration probe necessarily runs before anything is
+reports ready. A new tunnel hostname may take time to resolve from the sandbox;
+the proxy retries DNS failures for up to one minute before allowing the app to
+start, and refuses startup if resolution still fails. This checks the sandbox's
+resolver, not the laptop's. The registration probe runs before anything is
 listening; the proxy waits for your port to open and re-probes, and the verdict
 you read is the one taken then. Your app is handed `VERIS_PUBLIC_URL` and
 registers that with the vendor itself — through the vendor's own API, because
