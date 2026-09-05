@@ -52,6 +52,8 @@ type capturePlane struct {
 	promote  func(p *capturePlane, body api.PromoteRequest) (int, any)
 	promotes []api.PromoteRequest
 
+	operation func(http.ResponseWriter, *http.Request)
+
 	resets      []api.ResetEnvironmentRequest
 	resetStatus int    // 0 → 200 with the environment as reset
 	resetDetail string // the 422's detail
@@ -101,6 +103,13 @@ func newCapturePlane(t *testing.T) *capturePlane {
 		}
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/environments/{id}/capture-operations", func(w http.ResponseWriter, r *http.Request) {
+		if p.operation != nil {
+			p.operation(w, r)
+			return
+		}
+		sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+	})
 	mux.HandleFunc("GET /v1/environments/{id}", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -357,7 +366,7 @@ func TestSnapshotCreateRecordsTheWorld(t *testing.T) {
 	}
 	sbInOrder(t, stderr,
 		"! Capturing freezes and scrubs sandbox "+sbID+"; deploy a fresh one afterwards.",
-		"Capturing world (this blocks; the load balancer may drop the response first)",
+		"Capturing world",
 		"✓ Snapshot recorded: "+snapNewID+` "after-onboarding" (snap-`+snapNewID+", 4.2 MB, clock today, ",
 		"  scrubbed: stripe [deliveries, _veris_requests, webhook_endpoints.url]",
 		"! webhook destinations under the curator's callback URL became veris://client/…",
