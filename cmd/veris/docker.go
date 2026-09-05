@@ -87,12 +87,17 @@ type dockerRun struct {
 	LogFormat string
 }
 
+type containerReceipt struct {
+	Engine  *proxy.Receipt
+	Inbound *proxy.InboundReceipt
+}
+
 // runContainerised is the container tier from network create to teardown.
 // The engine's receipt is returned once it has been read back from the proxy
 // container, beside whatever the run's exit is, so the caller can judge the
 // requirements on both ledgers; nil when the containers never ran or the
 // receipt could not be read.
-func runContainerised(spec dockerRun) (*proxy.Receipt, error) {
+func runContainerised(spec dockerRun) (*containerReceipt, error) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return nil, errors.New("--image needs docker on PATH")
 	}
@@ -259,6 +264,7 @@ func runContainerised(spec dockerRun) (*proxy.Receipt, error) {
 	if !spec.Quiet {
 		printReceipt(os.Stderr, receipt)
 	}
+	result := &containerReceipt{Engine: &receipt}
 
 	unmet := unmetRequirements(spec.Requirements, receipt)
 	unmet = append(unmet, environmentReceiptUnmet(spec.Environment, spec.Requirements, receipt)...)
@@ -273,10 +279,11 @@ func runContainerised(spec dockerRun) (*proxy.Receipt, error) {
 			// A workload that already failed keeps its own status; only an
 			// otherwise-successful run becomes indeterminate.
 			if status != 0 {
-				return &receipt, exitCode(status)
+				return result, exitCode(status)
 			}
-			return &receipt, exitCode(exitIndeterminate)
+			return result, exitCode(exitIndeterminate)
 		}
+		result.Inbound = &inbound
 		if !spec.Quiet {
 			printInbound(os.Stderr, inbound)
 		}
@@ -288,12 +295,12 @@ func runContainerised(spec dockerRun) (*proxy.Receipt, error) {
 		UnknownBundles: unknownBundles,
 	})
 	if status != 0 {
-		return &receipt, exitCode(status)
+		return result, exitCode(status)
 	}
 	if fatal {
-		return &receipt, exitCode(exitRequirementUnmet)
+		return result, exitCode(exitRequirementUnmet)
 	}
-	return &receipt, nil
+	return result, nil
 }
 
 // ensureProxyImage pulls the proxy's own image when it is absent, with the
