@@ -954,3 +954,26 @@ page before printing the array. `--limit` is the page size, at most 1000.
 Stop writers while collecting pages: this is not an atomic snapshot. A changed
 total, stalled page, or failed request fails the command without emitting a
 partial JSON array. Filter the complete array locally to count rows from a run.
+
+### Import file bodies
+
+`veris sandbox files import google-drive ./pdfs --owner OWNER --prefix Corpus`
+streams a local directory through the service's existing `/veris/files` control
+surface. For GCS sources, first use `gcloud storage rsync gs://BUCKET/pdfs ./pdfs`.
+The command hashes every file, stages ZIP batches (128 MiB payload by default),
+and streams an individual file raw when it exceeds the batch budget. Files
+larger than 1 GiB, symlinks, and special files are refused.
+
+Use `--checkpoint PATH --resume` to resume the exact source and destination,
+skipping acknowledged batches. A changed manifest is refused. A disconnected
+POST may have committed: its pending batch is retained and automatic replay is
+refused until the operator reconciles the listed files with the service. Each
+batch is atomic; the whole directory is not. Repeated paths can create revisions.
+A killed importer may leave a `.lock` beside its checkpoint; remove that lock
+only after confirming the importer is no longer running. Checkpoints contain
+service capability URLs and should remain private. `--json` emits a receipt
+with SHA-256 hashes and acknowledged byte/file totals; progress goes to stderr.
+
+After upload, promote with `--keep-source` or create a snapshot, boot a separate
+sandbox and verify its file downloads before deleting the source. The command
+does not promote automatically and does not claim a successful restore.
