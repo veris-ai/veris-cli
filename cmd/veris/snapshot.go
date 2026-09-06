@@ -19,11 +19,9 @@ import (
 	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
-// defaultCaptureTimeout is the client deadline of a capture -- a snapshot
-// or a promote -- and then of the poll that follows a dropped answer. The
-// control plane's own budget for a capture is 600 s; the load balancer in
-// front of it gives up at about 150 s while the capture keeps running.
-const defaultCaptureTimeout = "900s"
+// defaultCaptureTimeout bounds the client wait. The server has its own
+// capture budget; durable operations survive a disconnected client.
+const defaultCaptureTimeout = "1800s"
 
 // capturePollInterval is how often the poll after a dropped answer reads
 // the control plane; a variable so a test turns seconds into milliseconds.
@@ -36,9 +34,11 @@ type captureOptions struct {
 	clockRestore string
 	keepExternal bool
 	timeout      string
+	requestID    string
 }
 
 func (o *captureOptions) bind(fs *flag.FlagSet) {
+	fs.StringVar(&o.requestID, "request-id", "", "reuse a durable capture request after an interrupted wait")
 	fs.StringVar(&o.sandbox, "sandbox", "", "sandbox id to capture (default: this folder's)")
 	fs.StringVar(&o.clockRestore, "clock-restore", "", "what a sandbox booted from the capture does with its clock: today (default), frozen or rebase")
 	fs.BoolVar(&o.keepExternal, "keep-external", false, "keep third-party webhook destinations in the image (default: scrub them)")
@@ -71,10 +71,10 @@ func snapshotCommand() *cli.Command {
 			{
 				Name:    "create",
 				Summary: "Capture a sandbox's world as a new snapshot",
-				Usage:   "veris snapshot create [--name N] [--sandbox ID] [--clock-restore today|frozen|rebase] [--keep-external] [--delete-source] [--timeout 900s] [--json]",
-				Help: "The capture blocks on the control plane and the load balancer may drop the answer after\n" +
-					"about 150 s while the capture continues; create then polls the snapshot list for the new\n" +
-					"row rather than sending the capture again, which would mint a second image.",
+				Usage:   "veris snapshot create [--name N] [--sandbox ID] [--clock-restore today|frozen|rebase] [--keep-external] [--delete-source] [--timeout 1800s] [--request-id ID] [--json]",
+				Help: "Tracks a durable capture operation when supported by the API. Reuse --request-id after\n" +
+					"an interrupted wait. Terminal failures stop polling and retain the source. Older APIs\n" +
+					"use the legacy capture and snapshot-list recovery path.",
 				Flags: func(fs *flag.FlagSet) {
 					create.bind(fs)
 					fs.StringVar(&name, "name", "", "a label for the snapshot (not unique; the newest wins a name lookup)")
@@ -175,6 +175,11 @@ func runCapture(ctx context.Context, s *session, verb, noun string, timeout time
 		s.ui.Next(call.check)
 		return false, printed(1)
 	}
+	var operationError *api.CaptureError
+	if errors.As(postErr, &operationError) && operationError.State == "unconfirmed" {
+		s.ui.Warn("%s", operationError.Error())
+		return false, printed(4)
+	}
 	if !lbDropped(postErr) {
 		return false, s.fail(verb, noun, postErr)
 	}
@@ -240,6 +245,10 @@ func runCapture(ctx context.Context, s *session, verb, noun string, timeout time
 // would wait out the deadline for nothing. A dial failure is the plane
 // unreachable, and a POST that never went out has nothing to poll for.
 func lbDropped(err error) bool {
+	var ce *api.CaptureError
+	if errors.As(err, &ce) {
+		return false
+	}
 	var ae *api.Error
 	if errors.As(err, &ae) {
 		return ae.Status >= 500 && !hasJSONDetail(ae.Body)
@@ -381,9 +390,14 @@ func snapshotCreate(ctx *cli.Context, o captureOptions, name string, deleteSourc
 	var resp *api.SnapshotResponse
 	var found *api.Snapshot
 	call := captureCall{
-		label:   "Capturing world (this blocks; the load balancer may drop the response first)",
+		label:   "Capturing world",
 		pollFor: fmt.Sprintf("GET /v1/environments/%s/snapshots for source_sandbox=%s", envID, shortID(id)),
 		post: func(ctx context.Context) error {
+			var result api.SnapshotResponse
+			if supported, err := durableCapture(ctx, s, envID, api.CaptureRequest{SandboxID: id, Kind: "snapshot", RequestID: o.requestID, Name: name, ClockRestore: o.clockRestore, KeepExternalDestinations: o.keepExternal}, &result); supported {
+				resp = &result
+				return err
+			}
 			r, err := captureClient(s).CreateSnapshot(ctx, envID, req)
 			resp = r
 			return err
