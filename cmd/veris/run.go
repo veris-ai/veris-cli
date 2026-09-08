@@ -97,7 +97,7 @@ func cmdRun(args []string) error {
 	keep := fs.Bool("keep", false,
 		"leave a --fresh sandbox running afterwards, as this folder's")
 	freshTTL := fs.Int("ttl", 0,
-		"lifetime in `minutes` of a --fresh sandbox if teardown never runs (config, then 120)")
+		"lifetime in `minutes` of a --fresh sandbox if teardown never runs (config, then the control plane's default)")
 	receiptPath := fs.String("receipt", "",
 		"write the run's receipt as JSON to this `file`: both ledgers and the "+
 			"verdict, never on stdout")
