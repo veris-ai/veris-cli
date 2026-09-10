@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,11 +60,68 @@ const (
 	  "source_sandbox": "k3j2v0d8p1q7x9r2m5n8b4c6a", "clock_restore": "today",
 	  "size_bytes": 4096
 	}`
+
+	// ledgerEventJSON is one http event with the whole common header, the
+	// shape services-sandbox's core writes and the api forwards.
+	ledgerEventJSON = `{
+	  "seq": 5106, "id": 412,
+	  "source": {"kind": "service", "name": "stripe", "protocol": "http"},
+	  "plane": "vendor", "type": "http", "direction": "inbound", "tier": "fault",
+	  "at": "2026-09-10T14:02:14.355Z", "world_time": "2026-09-10T09:00:00Z",
+	  "duration_ms": 41, "session": "66e0a1b2.1f3a",
+	  "origin": {"ip": "10.8.3.21", "application": null, "user_agent": "python-httpx/0.27"},
+	  "actor": {"credential": "api_key", "ref": "acct_clinic_admin"},
+	  "state": {"before": 12, "after": 13, "mutating": true},
+	  "outcome": {"ok": false, "code": "402", "fault": {"kind": "error", "id": "flt_7"}, "error": "card_declined"},
+	  "correlation": {"request_id": "req-1", "caused_by": null},
+	  "redacted": ["http.request.headers.authorization"],
+	  "http": {"method": "POST", "path": "/v1/charges", "query": {"expand": "customer"}, "op": null,
+	           "request": {"headers": {"authorization": "Bearer [redacted]"}, "body": "amount=2000",
+	                       "bytes": 11, "truncated": false, "encoding": "identity"},
+	           "response": {"status": 402, "headers": {"content-type": "application/json"},
+	                        "body": {"error": {"code": "card_declined"}}, "bytes": 34, "truncated": false}}
+	}`
+
+	// ledgerJSON is one page of the merged stream: an http event, a sql
+	// event, and a source whose own ledger could not be read.
+	ledgerJSON = `{
+	  "format": "veris.sandbox-ledger/1",
+	  "sandbox_id": "k3j2v0d8p1q7x9r2m5n8b4c6a",
+	  "clock": {"mode": "frozen", "world_time": "2026-09-10T09:00:00Z", "offset_seconds": 0},
+	  "sources": [
+	    {"kind": "service", "name": "stripe", "protocol": "http", "ledger": "complete",
+	     "last_seq": 5106, "lag_ms": 0, "error": null},
+	    {"kind": "service", "name": "github", "protocol": "http", "ledger": "unavailable",
+	     "last_seq": 0, "lag_ms": null, "error": "no /veris/ledger"},
+	    {"kind": "sandbox", "name": null, "protocol": null, "ledger": "complete",
+	     "last_seq": 5106, "lag_ms": 0, "error": null}
+	  ],
+	  "events": [` + ledgerEventJSON + `,
+	    {"seq": 5105, "id": 88,
+	     "source": {"kind": "service", "name": "postgres", "protocol": "postgres"},
+	     "plane": "vendor", "type": "sql", "direction": "inbound", "tier": "handler",
+	     "at": "2026-09-10T14:02:12.100Z", "world_time": "2026-09-10T09:00:00Z",
+	     "duration_ms": 3, "session": "68c1a0d3.9f",
+	     "origin": {"ip": null, "application": "psycopg", "user_agent": null},
+	     "actor": {"credential": "role", "ref": "app"},
+	     "state": {"before": null, "after": null, "mutating": true},
+	     "outcome": {"ok": true, "code": null, "fault": null, "error": null},
+	     "correlation": {"request_id": "68c1a0d3.9f:12", "caused_by": null},
+	     "redacted": [],
+	     "sql": {"database": "app", "role": "app", "application": "psycopg",
+	             "statement": "UPDATE invoices SET status = $1", "parameters": ["paid"],
+	             "protocol_phase": "execute", "command_tag": "UPDATE 1", "rows": 1,
+	             "sqlstate": null, "message": null}}
+	  ],
+	  "page": {"order": "time", "dir": "desc", "limit": 50, "count": 2,
+	           "has_more": true, "next_cursor": "b3BhcXVl", "watermark_seq": 5106}
+	}`
 )
 
 func TestEveryMethodSendsItsPathMethodAndBody(t *testing.T) {
 	url := "https://3000-abc.e2b.app"
 	ttl := 240
+	mutating := true
 	image := "reg.example/env-repo/env-x@sha256:abc"
 	ctx := context.Background()
 
@@ -294,6 +352,29 @@ func TestEveryMethodSendsItsPathMethodAndBody(t *testing.T) {
 				if !reflect.DeepEqual(got, want) {
 					t.Errorf("got %+v, want %+v", got, want)
 				}
+			},
+		},
+		{
+			name: "SandboxLedger",
+			call: func(c *Client) (any, error) {
+				return c.SandboxLedger(ctx, sandboxID, LedgerQuery{
+					AfterSeq: 5100, Order: "time", Dir: "desc", Limit: 50,
+					Detail: "summary", Source: "stripe", Mutating: &mutating,
+				})
+			},
+			wantMethod: "GET",
+			wantPath: "/v1/sandboxes/" + sandboxID + "/ledger?after_seq=5100&detail=summary" +
+				"&dir=desc&limit=50&mutating=true&order=time&source=stripe",
+			status: 200, answer: ledgerJSON,
+			check: checkLedger,
+		},
+		{
+			name:       "SandboxLedgerEvent",
+			call:       func(c *Client) (any, error) { return c.SandboxLedgerEvent(ctx, sandboxID, 5106) },
+			wantMethod: "GET", wantPath: "/v1/sandboxes/" + sandboxID + "/ledger/5106",
+			status: 200, answer: ledgerEventJSON,
+			check: func(t *testing.T, got any) {
+				checkLedgerEvent(t, got.(*LedgerEvent))
 			},
 		},
 		{
@@ -660,6 +741,27 @@ func TestJSONTagsMirrorModelsPy(t *testing.T) {
 		{"CreateSnapshotRequest", CreateSnapshotRequest{Name: "n", ClockRestore: "today"}, []string{"sandbox_id", "name", "clock_restore", "keep_external_destinations"}},
 		{"CreateSandboxRequest", CreateSandboxRequest{TTLMinutes: new(int), SnapshotID: strp(""), ClientBaseURL: strp(""), Metadata: map[string]string{"k": "v"}},
 			[]string{"ttl_minutes", "snapshot_id", "client_base_url", "metadata"}},
+		{"Ledger", Ledger{}, []string{"format", "sandbox_id", "clock", "sources", "events", "page"}},
+		{"LedgerClock", LedgerClock{}, []string{"mode", "world_time", "offset_seconds"}},
+		{"LedgerSource", LedgerSource{}, []string{"kind", "name", "protocol", "ledger", "last_seq", "lag_ms", "error"}},
+		{"LedgerPage", LedgerPage{}, []string{"order", "dir", "limit", "count", "has_more", "next_cursor", "watermark_seq"}},
+		{"LedgerSourceRef", LedgerSourceRef{}, []string{"kind", "name", "protocol"}},
+		{"LedgerOutcome", LedgerOutcome{}, []string{"ok", "code", "fault", "error"}},
+		{"LedgerFault", LedgerFault{}, []string{"kind", "id"}},
+		{"LedgerState", LedgerState{}, []string{"before", "after", "mutating"}},
+		{"LedgerActor", LedgerActor{}, []string{"credential", "ref"}},
+		{"LedgerOp", LedgerOp{}, []string{"type", "name"}},
+		{"LedgerHTTP", LedgerHTTP{}, []string{"method", "path", "query", "op", "request", "response"}},
+		{"LedgerHTTPSide", LedgerHTTPSide{}, []string{"status", "headers", "body", "bytes", "truncated", "encoding"}},
+		{"LedgerSQL", LedgerSQL{}, []string{"database", "application", "statement", "command_tag"}},
+		{"LedgerConnection", LedgerConnection{}, []string{"event", "peer", "reason"}},
+		{"LedgerDelivery", LedgerDelivery{}, []string{"delivery_id", "rule_id", "attempt", "destination", "method"}},
+		{"LedgerWorld", LedgerWorld{}, []string{"event", "detail", "by"}},
+		// LedgerEvent carries the bytes it arrived as, so an event decoded
+		// from the wire re-encodes as those; one built here encodes from its
+		// own tags, which is what this checks.
+		{"LedgerEvent", LedgerEvent{}, []string{"seq", "id", "source", "plane", "type", "direction", "tier",
+			"at", "world_time", "duration_ms", "session", "actor", "state", "outcome"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -680,5 +782,176 @@ func TestJSONTagsMirrorModelsPy(t *testing.T) {
 				t.Errorf("%s has %d fields, want %d: %s", tc.name, len(fields), len(tc.want), b)
 			}
 		})
+	}
+}
+
+// checkLedger holds one page of the merged stream to its envelope: the
+// sources are whole, whether or not their own ledgers were, and the two
+// events decode into the payloads their types name.
+func checkLedger(t *testing.T, got any) {
+	t.Helper()
+	l, ok := got.(*Ledger)
+	if !ok {
+		t.Fatalf("got %T", got)
+	}
+	if l.Format != LedgerFormat || l.SandboxID != sandboxID {
+		t.Errorf("envelope = %q %q", l.Format, l.SandboxID)
+	}
+	if l.Clock.Mode != "frozen" || !l.Clock.WorldTime.Equal(time.Date(2026, 9, 10, 9, 0, 0, 0, time.UTC)) {
+		t.Errorf("clock = %+v", l.Clock)
+	}
+	wantSources := []LedgerSource{
+		{Kind: "service", Name: "stripe", Protocol: "http", Ledger: LedgerComplete, LastSeq: 5106, LagMS: l.Sources[0].LagMS},
+		{Kind: "service", Name: "github", Protocol: "http", Ledger: LedgerUnavailable, Error: "no /veris/ledger"},
+		{Kind: "sandbox", Ledger: LedgerComplete, LastSeq: 5106, LagMS: l.Sources[2].LagMS},
+	}
+	if !reflect.DeepEqual(l.Sources, wantSources) {
+		t.Errorf("sources = %+v, want %+v", l.Sources, wantSources)
+	}
+	// A source that could not be read says so with a null lag; one that
+	// could reports zero, and the two must not decode alike.
+	if l.Sources[1].LagMS != nil {
+		t.Errorf("github's lag = %v, want null", *l.Sources[1].LagMS)
+	}
+	if l.Sources[0].LagMS == nil || *l.Sources[0].LagMS != 0 {
+		t.Errorf("stripe's lag = %v, want 0", l.Sources[0].LagMS)
+	}
+	wantPage := LedgerPage{Order: "time", Dir: "desc", Limit: 50, Count: 2,
+		HasMore: true, NextCursor: "b3BhcXVl", WatermarkSeq: 5106}
+	if l.Page != wantPage {
+		t.Errorf("page = %+v, want %+v", l.Page, wantPage)
+	}
+	if len(l.Events) != 2 {
+		t.Fatalf("%d events, want 2", len(l.Events))
+	}
+	checkLedgerEvent(t, &l.Events[0])
+	sql := l.Events[1]
+	if sql.Type != "sql" || sql.SQL == nil {
+		t.Fatalf("second event = %+v", sql)
+	}
+	if sql.SQL.CommandTag != "UPDATE 1" || sql.SQL.Statement != "UPDATE invoices SET status = $1" ||
+		sql.SQL.Database != "app" || sql.SQL.Application != "psycopg" {
+		t.Errorf("sql = %+v", sql.SQL)
+	}
+	if sql.HTTP != nil {
+		t.Errorf("a sql event decoded an http payload: %+v", sql.HTTP)
+	}
+	// A sql event that ran cleanly carries no code, and its world versions
+	// are unknown rather than zero.
+	if !sql.Outcome.OK || sql.Outcome.Code != "" || !sql.State.Mutating ||
+		sql.State.Before != nil || sql.State.After != nil {
+		t.Errorf("sql outcome/state = %+v %+v", sql.Outcome, sql.State)
+	}
+	// The payload the type names is reachable as it arrived, whichever the
+	// type is: that is what the CLI prints for a type it does not model.
+	if payload := sql.Payload(); !strings.Contains(string(payload), `"parameters": ["paid"]`) {
+		t.Errorf("sql payload = %s", payload)
+	}
+}
+
+// checkLedgerEvent holds the http event to its header, its payload, and the
+// promise that what this client does not model still survives a round trip.
+func checkLedgerEvent(t *testing.T, e *LedgerEvent) {
+	t.Helper()
+	if e.Seq != 5106 || e.ID.String() != "412" || e.Type != "http" || e.Plane != "vendor" ||
+		e.Tier != "fault" || e.Direction != "inbound" || e.Session != "66e0a1b2.1f3a" {
+		t.Errorf("header = %+v", e)
+	}
+	if e.Source != (LedgerSourceRef{Kind: "service", Name: "stripe", Protocol: "http"}) {
+		t.Errorf("source = %+v", e.Source)
+	}
+	if !e.At.Equal(time.Date(2026, 9, 10, 14, 2, 14, 355000000, time.UTC)) ||
+		!e.WorldTime.Equal(time.Date(2026, 9, 10, 9, 0, 0, 0, time.UTC)) {
+		t.Errorf("times = %v / %v", e.At, e.WorldTime)
+	}
+	if e.DurationMS == nil || *e.DurationMS != 41 {
+		t.Errorf("duration = %v", e.DurationMS)
+	}
+	if e.Actor != (LedgerActor{Credential: "api_key", Ref: "acct_clinic_admin"}) {
+		t.Errorf("actor = %+v", e.Actor)
+	}
+	if e.Outcome.OK || e.Outcome.Code != "402" || e.Outcome.Error != "card_declined" ||
+		e.Outcome.Fault == nil || *e.Outcome.Fault != (LedgerFault{Kind: "error", ID: "flt_7"}) {
+		t.Errorf("outcome = %+v", e.Outcome)
+	}
+	if e.State.Before == nil || *e.State.Before != 12 || e.State.After == nil || *e.State.After != 13 || !e.State.Mutating {
+		t.Errorf("state = %+v", e.State)
+	}
+	if e.HTTP == nil {
+		t.Fatal("no http payload")
+	}
+	if e.HTTP.Method != "POST" || e.HTTP.Path != "/v1/charges" || e.HTTP.Op != nil {
+		t.Errorf("http = %+v", e.HTTP)
+	}
+	if got := e.HTTP.Request.Headers["authorization"]; got != "Bearer [redacted]" {
+		t.Errorf("request headers = %v", e.HTTP.Request.Headers)
+	}
+	if string(e.HTTP.Request.Body) != `"amount=2000"` || e.HTTP.Request.Bytes != 11 {
+		t.Errorf("request = %+v", e.HTTP.Request)
+	}
+	if e.HTTP.Response.Status == nil || *e.HTTP.Response.Status != 402 ||
+		!strings.Contains(string(e.HTTP.Response.Body), "card_declined") {
+		t.Errorf("response = %+v", e.HTTP.Response)
+	}
+	// Fields this client does not model -- origin, correlation, redacted --
+	// are what --json must still print, so the event re-encodes as the bytes
+	// it arrived as.
+	encoded, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"origin"`, `"correlation"`, `"redacted"`, `"expand"`} {
+		if !strings.Contains(string(encoded), field) {
+			t.Errorf("%s was dropped by a round trip: %s", field, encoded)
+		}
+	}
+}
+
+// A control plane older than the ledger has no such route, and FastAPI
+// answers a path it has no route for with exactly {"detail": "Not Found"}.
+// Every other 404 names what was missing and is a real answer, not a reason
+// to fall back to the per-twin traces.
+func TestNoLedgerRouteIsOnlyFastAPIsUnroutedAnswer(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"no such route", 404, `{"detail":"Not Found"}`, true},
+		{"no such sandbox", 404, `{"detail":"sandbox x not found"}`, false},
+		{"no such event", 404, `{"detail":"no event 99 in sandbox x"}`, false},
+		{"unreadable", 502, `{"detail":"sandbox ledger is unavailable"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := serve(t, func(w http.ResponseWriter, r *http.Request) {
+				respond(w, tc.status, tc.body)
+			})
+			_, err := c.SandboxLedger(context.Background(), "x", LedgerQuery{Limit: 1})
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if got := NoLedgerRoute(err); got != tc.want {
+				t.Errorf("NoLedgerRoute(%v) = %v, want %v", err, got, tc.want)
+			}
+		})
+	}
+	if NoLedgerRoute(nil) {
+		t.Error("NoLedgerRoute(nil) is true")
+	}
+}
+
+// An empty query sends none: the control plane's own defaults then decide
+// the order, the page size and the detail.
+func TestLedgerQueryOmitsWhatWasNotAsked(t *testing.T) {
+	c, rec := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		respond(w, 200, ledgerJSON)
+	})
+	if _, err := c.SandboxLedger(context.Background(), sandboxID, LedgerQuery{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.last().Path; got != "/v1/sandboxes/"+sandboxID+"/ledger" {
+		t.Errorf("path = %q", got)
 	}
 }
