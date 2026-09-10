@@ -1053,6 +1053,32 @@ func TestSandboxTraceLedgerFollow(t *testing.T) {
 		}
 	})
 
+	t.Run("a plane that stops answering is one warning", func(t *testing.T) {
+		events := lgFixture()[:1]
+		plane := traceLedgerBench(t, &events, 0, nil)
+		plane.script(func(p *sandboxPlane) {
+			serve := p.ledger
+			p.ledger = func(q url.Values) (int, any) {
+				if q.Get("order") == "arrival" {
+					// A refusal, not a 5xx: the client retries those, and a
+					// follow must not spend its interval on backoff.
+					return 422, map[string]any{"detail": "unknown source 'sandbox'"}
+				}
+				return serve(q)
+			}
+		})
+		code, _, stderr := ledgerFollowFor(t, plane, 4)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		if n := strings.Count(stderr, "! could not read the ledger"); n != 1 {
+			t.Errorf("the failure was reported %d times, want once:\n%s", n, stderr)
+		}
+		if !strings.Contains(stderr, "unknown source") {
+			t.Errorf("the refusal's own words are missing:\n%s", stderr)
+		}
+	})
+
 	t.Run("json is one event per line", func(t *testing.T) {
 		events := lgFixture()[:1]
 		plane := traceLedgerBench(t, &events, 0, nil)
