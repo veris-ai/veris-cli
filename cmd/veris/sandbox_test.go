@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -252,6 +253,20 @@ type sandboxPlane struct {
 	resets      int
 	listAll     func() (int, any) // GET /v1/sandboxes; nil → 404
 	lists       map[string]func() (int, any)
+
+	// ledger answers GET /v1/sandboxes/{id}/ledger and ledgerEvent answers
+	// /ledger/{seq}. Nil is FastAPI's answer for a route it has none for,
+	// which is what a control plane older than the ledger sends and what
+	// trace falls back to the per-twin merge on.
+	ledger      func(q url.Values) (int, any)
+	ledgerEvent func(seq string) (int, any)
+	// ledgerQueries are the raw query strings the ledger route was asked
+	// with, in order; ledgerSeqs the seqs asked of the event route.
+	ledgerQueries []string
+	ledgerSeqs    []string
+	// onLedger, when set, runs under the lock before the nth ledger read is
+	// answered (1-based), so a follow test can add events between polls.
+	onLedger func(p *sandboxPlane, n int)
 }
 
 func newSandboxPlane(t *testing.T) *sandboxPlane {
@@ -352,6 +367,31 @@ func newSandboxPlane(t *testing.T) *sandboxPlane {
 			sbJSON(w, 200, sb.Services)
 		}
 	})
+	mux.HandleFunc("GET /v1/sandboxes/{id}/ledger", func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.ledgerQueries = append(p.ledgerQueries, r.URL.RawQuery)
+		if p.onLedger != nil {
+			p.onLedger(p, len(p.ledgerQueries))
+		}
+		if p.ledger == nil {
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+			return
+		}
+		status, body := p.ledger(r.URL.Query())
+		sbJSON(w, status, body)
+	})
+	mux.HandleFunc("GET /v1/sandboxes/{id}/ledger/{seq}", func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.ledgerSeqs = append(p.ledgerSeqs, r.PathValue("seq"))
+		if p.ledgerEvent == nil {
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+			return
+		}
+		status, body := p.ledgerEvent(r.PathValue("seq"))
+		sbJSON(w, status, body)
+	})
 	mux.HandleFunc("DELETE /v1/environments/{env}/sandboxes/{id}", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -400,6 +440,20 @@ func (p *sandboxPlane) resetCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.resets
+}
+
+// ledgerAsked is every query string the ledger route was asked with, in
+// order; ledgerEventsAsked every seq asked of the single-event route.
+func (p *sandboxPlane) ledgerAsked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.ledgerQueries...)
+}
+
+func (p *sandboxPlane) ledgerEventsAsked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.ledgerSeqs...)
 }
 
 // readySandbox is sbID ready in ci with the given services.
