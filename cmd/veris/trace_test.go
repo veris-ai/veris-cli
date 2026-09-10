@@ -1254,3 +1254,81 @@ func TestSandboxTraceLedgerRefusals(t *testing.T) {
 		})
 	}
 }
+
+// Every payload the ledger can carry has to read as one line of the Event
+// column: the types the fixtures above do not exercise are held here.
+func TestLedgerEventSummaryAndOutcome(t *testing.T) {
+	cases := []struct {
+		name        string
+		event       api.LedgerEvent
+		wantSummary string
+		wantOutcome string
+	}{
+		{
+			name: "an http call is its method and path",
+			event: api.LedgerEvent{Type: "http", HTTP: &api.LedgerHTTP{Method: "GET", Path: "/v1/customers"},
+				Outcome: api.LedgerOutcome{OK: true, Code: "200"}},
+			wantSummary: "GET /v1/customers", wantOutcome: "200",
+		},
+		{
+			name: "a hang has no status of its own",
+			event: api.LedgerEvent{Type: "http", HTTP: &api.LedgerHTTP{Method: "POST", Path: "/v1/charges"},
+				Outcome: api.LedgerOutcome{Fault: &api.LedgerFault{Kind: "hang", ID: "flt_7"}}},
+			wantSummary: "POST /v1/charges", wantOutcome: "hang",
+		},
+		{
+			name: "a statement is folded to one line and cut",
+			event: api.LedgerEvent{Type: "sql", SQL: &api.LedgerSQL{CommandTag: "SELECT 3",
+				Statement: "SELECT id,\n       status\n  FROM invoices\n WHERE tenant = $1 AND status = $2 AND created_at > $3"},
+				Outcome: api.LedgerOutcome{OK: true}},
+			wantSummary: "SELECT 3 SELECT id, status FROM invoices WHERE tenant = $1 AND…", wantOutcome: "ok",
+		},
+		{
+			name: "a failed statement shows its sqlstate",
+			event: api.LedgerEvent{Type: "sql", SQL: &api.LedgerSQL{CommandTag: "", Statement: "INSERT INTO invoices VALUES ($1)"},
+				Outcome: api.LedgerOutcome{Code: "23505", Error: "duplicate key"}},
+			wantSummary: "INSERT INTO invoices VALUES ($1)", wantOutcome: "23505",
+		},
+		{
+			name: "a connection is its turn and its peer",
+			event: api.LedgerEvent{Type: "connection", Connection: &api.LedgerConnection{Event: "authenticated", Peer: "app@10.8.3.21"},
+				Outcome: api.LedgerOutcome{OK: true}},
+			wantSummary: "authenticated app@10.8.3.21", wantOutcome: "ok",
+		},
+		{
+			name: "a delivery is its target",
+			event: api.LedgerEvent{Type: "delivery", Delivery: &api.LedgerDelivery{Method: "POST",
+				Destination: "https://odd-forest.example/hooks/stripe", Attempt: 2},
+				Outcome: api.LedgerOutcome{Code: "500"}},
+			wantSummary: "POST https://odd-forest.example/hooks/stripe", wantOutcome: "500",
+		},
+		{
+			name: "a world event is its own name",
+			event: api.LedgerEvent{Type: "world", World: &api.LedgerWorld{Event: "reset",
+				Detail: json.RawMessage(`{"services":3}`), By: "api:reset"},
+				Outcome: api.LedgerOutcome{OK: true}},
+			wantSummary: `reset {"services":3}`, wantOutcome: "ok",
+		},
+		{
+			name:        "an outcome with nothing to say says nothing",
+			event:       api.LedgerEvent{Type: "message"},
+			wantSummary: "", wantOutcome: "—",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ledgerEventSummary(tc.event); got != tc.wantSummary {
+				t.Errorf("summary = %q, want %q", got, tc.wantSummary)
+			}
+			if got := ledgerOutcome(tc.event.Outcome); got != tc.wantOutcome {
+				t.Errorf("outcome = %q, want %q", got, tc.wantOutcome)
+			}
+			// A world event and a hang have no duration; the column says so
+			// rather than printing a zero that reads as instant.
+			row := ledgerTableRows([]api.LedgerEvent{tc.event})[0]
+			if row[len(row)-1] != "—" {
+				t.Errorf("a nil duration rendered as %q", row[len(row)-1])
+			}
+		})
+	}
+}
