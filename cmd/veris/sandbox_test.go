@@ -1406,6 +1406,32 @@ func newJSONPlane(t *testing.T) *httptest.Server {
 	mux.HandleFunc("GET /v1/environments/{env}/sandboxes/{id}/clock", func(w http.ResponseWriter, r *http.Request) {
 		sbJSON(w, 200, api.SandboxClock{ID: 1, Mode: "live"})
 	})
+	// This plane keeps a ledger, so `sandbox trace --json` is held to the
+	// same one-document rule on the route it prefers.
+	mux.HandleFunc("GET /v1/sandboxes/{id}/ledger", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, map[string]any{
+			"format": api.LedgerFormat, "sandbox_id": sbID,
+			"clock": map[string]any{"mode": "live", "world_time": "2026-03-01T09:00:00Z", "offset_seconds": 0},
+			"sources": []map[string]any{{"kind": "service", "name": "stripe", "protocol": "http",
+				"ledger": api.LedgerComplete, "last_seq": 5103, "lag_ms": 0, "error": nil}},
+			"events": []map[string]any{{
+				"seq": 5103, "id": 1,
+				"source": map[string]any{"kind": "service", "name": "stripe", "protocol": "http"},
+				"plane":  "vendor", "type": "http", "direction": "inbound", "tier": "handler",
+				"at": "2026-03-01T09:00:05.120Z", "world_time": "2026-03-01T09:00:00Z", "duration_ms": 6,
+				"session": nil,
+				"actor":   map[string]any{"credential": "api_key", "ref": "acct_1"},
+				"state":   map[string]any{"before": 3, "after": 3, "mutating": false},
+				"outcome": map[string]any{"ok": true, "code": "200", "fault": nil, "error": nil},
+				"http": map[string]any{"method": "GET", "path": "/v1/customers/cus_1",
+					"query": map[string]any{}, "op": nil,
+					"request":  map[string]any{"bytes": 0, "truncated": false},
+					"response": map[string]any{"status": 200, "bytes": 812, "truncated": false}},
+			}},
+			"page": map[string]any{"order": "time", "dir": "desc", "limit": 50, "count": 1,
+				"has_more": false, "next_cursor": nil, "watermark_seq": 5103},
+		})
+	})
 
 	twin := "/s/" + sbID + "/stripe/veris/"
 	mux.HandleFunc("GET "+twin+"health", func(w http.ResponseWriter, r *http.Request) {

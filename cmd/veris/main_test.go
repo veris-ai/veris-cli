@@ -412,9 +412,10 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			name: "sandbox trace --help is a leaf with its own flags",
 			argv: []string{"sandbox", "trace", "--help"},
 			code: 0,
-			stdoutHas: []string{"veris sandbox trace - What the sandbox received, newest first",
-				"Usage:\n  veris sandbox trace [--id ID] [--service NAME] [--tier handler|fault|control|delivery]",
-				"  --body ", "  --follow ", "  --since ", "  --tier ", "  --limit "},
+			stdoutHas: []string{"veris sandbox trace - What the sandbox saw, newest first",
+				"Usage:\n  veris sandbox trace [--id ID] [--source NAME|sandbox]",
+				"  --body ", "  --follow ", "  --since ", "  --tier ", "  --limit ",
+				"  --source ", "  --type ", "  --plane ", "  --session ", "  --mutating "},
 			stderrNone: true,
 		},
 		{
