@@ -45,11 +45,10 @@ func baselineCommand() *cli.Command {
 			{
 				Name:    "promote",
 				Summary: "Capture a sandbox and pin it as the baseline",
-				Usage:   "veris baseline promote [--sandbox ID] [--clock-restore today|frozen|rebase] [--keep-external] [--keep-source] [--timeout 900s] [--yes] [--json]",
-				Help: "The capture blocks on the control plane and the load balancer may drop the answer after\n" +
-					"about 150 s while the capture continues; promote then polls the environment until the pin\n" +
-					"changes rather than sending the promote again, which would mint a second image. The\n" +
-					"source sandbox is left frozen and scrubbed and is deleted afterwards unless --keep-source.",
+				Usage:   "veris baseline promote [--sandbox ID] [--clock-restore today|frozen|rebase] [--keep-external] [--keep-source] [--timeout 1800s] [--request-id ID] [--yes] [--json]",
+				Help: "Tracks a durable capture operation when supported by the API. Reuse --request-id after\n" +
+					"an interrupted wait. Terminal failures retain the source. Older APIs use legacy capture\n" +
+					"and baseline polling. Use --keep-source until a fresh boot has verified the saved data.",
 				Flags: func(fs *flag.FlagSet) {
 					promote.bind(fs)
 					fs.BoolVar(&keepSource, "keep-source", false, "keep the captured sandbox (it is left frozen and scrubbed)")
@@ -250,6 +249,11 @@ func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool) error 
 		label:   fmt.Sprintf("Promoting (freeze → capture → push; polling GET /v1/environments/%s if the load balancer times out)", shortID(envID)),
 		pollFor: fmt.Sprintf("GET /v1/environments/%s for baseline.source_sandbox=%s", envID, shortID(id)),
 		post: func(ctx context.Context) error {
+			var result api.PromoteResponse
+			if supported, err := durableCapture(ctx, s, envID, api.CaptureRequest{SandboxID: id, Kind: "promote", RequestID: o.requestID, ClockRestore: o.clockRestore, KeepExternalDestinations: o.keepExternal}, &result); supported {
+				resp = &result
+				return err
+			}
 			r, err := captureClient(s).PromoteSandbox(ctx, envID, id, req)
 			resp = r
 			return err

@@ -36,6 +36,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/veris-ai/veris-cli/internal/direct"
 )
 
 // Client talks to one twin. ControlURL is the twin's control_url as the
@@ -51,7 +53,7 @@ type Client struct {
 func New(controlURL string) *Client {
 	return &Client{
 		ControlURL: strings.TrimSuffix(controlURL, "/"),
-		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		HTTP:       &http.Client{Timeout: 30 * time.Second, Transport: direct.Transport()},
 	}
 }
 
@@ -461,7 +463,7 @@ func (c *Client) Seed(ctx context.Context, schemaSQL string) (*Seed, error) {
 const maxBody = 16 << 20
 
 // defaultHTTP serves a Client whose HTTP field was left nil.
-var defaultHTTP = &http.Client{Timeout: 30 * time.Second}
+var defaultHTTP = &http.Client{Timeout: 30 * time.Second, Transport: direct.Transport()}
 
 // do sends one request and decodes a 2xx answer into out. Anything else
 // becomes *Error, with the 404s that mean "no such route" marked so

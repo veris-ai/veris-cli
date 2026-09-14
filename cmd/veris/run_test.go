@@ -1199,3 +1199,88 @@ func TestASessionKeepsTheCallersProcessGroupAndARunDoesNot(t *testing.T) {
 		t.Errorf("an ordinary run must be isolated so a signal reaches its whole tree, but it shared group %d", got)
 	}
 }
+
+// The container tier is handed one routing target, and a run that names none
+// is refused here, in this command's words, before docker is asked for
+// anything: the alternative was a proxy container that started, found nothing
+// to route and died with the runner image's own instructions -- set
+// VERIS_SANDBOX_ID, or mount /veris/config.json -- which nobody typing `veris
+// run` sets. `--environment "$VERIS_ENVIRONMENT_ID"` in a shell where that
+// is unset is the usual way to arrive here, so an empty id is named as
+// itself in both tiers, rather than read as no flag.
+func TestRunContainerTierRefusesToStartWithNothingToRoute(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	logPath := filepath.Join(b.home, "docker.log")
+	fakeDocker(t, "#!/bin/sh\necho \"$*\" >> "+logPath+"\nexit 1\n")
+
+	err := cmdRun([]string{"--image", "img:test", "--environment", "", "--", "true"})
+	if err == nil || !strings.Contains(err.Error(), "--environment is empty") {
+		t.Errorf("an empty --environment with --image should be refused as empty, got: %v", err)
+	}
+	err = cmdRun([]string{"--environment", "", "--", "true"})
+	if err == nil || !strings.Contains(err.Error(), "--environment is empty") {
+		t.Errorf("an empty --environment without --image should be refused as empty, got: %v", err)
+	}
+	err = cmdRun([]string{"--image", "img:test", "--ttl-minutes", "15", "--", "true"})
+	if err == nil || !strings.Contains(err.Error(), "nothing to route") {
+		t.Errorf("no target at all should be refused as nothing to route, got: %v", err)
+	}
+	for _, want := range []string{"--sandbox <id>", "--environment <id>", "--config <file>", "veris up"} {
+		if err != nil && !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal should name %s as a way out, got: %v", want, err)
+		}
+	}
+	if _, statErr := os.Stat(logPath); statErr == nil {
+		log, _ := os.ReadFile(logPath)
+		t.Errorf("a refused run must not reach docker, yet it was invoked:\n%s", log)
+	}
+}
+
+// Past the refusal, the same command line hands the proxy container the
+// environment to deploy from, the TTL, and the credentials and control plane
+// of THIS session, never the runner image's production default. Asserted on
+// the `docker run` the CLI issues, with a docker that accepts the network and
+// image steps and fails the run itself, so nothing waits on a container.
+func TestRunContainerTierHandsTheProxyTheEnvironmentAndThisSessionsPlane(t *testing.T) {
+	b := newBench(t)
+	t.Setenv(discovery.EnvConfig, "")
+	t.Setenv(discovery.EnvAPIKey, "vsk_test")
+	t.Setenv(discovery.EnvAPIBase, "http://127.0.0.1:1")
+	logPath := filepath.Join(b.home, "docker.log")
+	fakeDocker(t, "#!/bin/sh\necho \"$*\" >> "+logPath+"\n"+
+		"case \"$1\" in network|image) exit 0;; esac\nexit 1\n")
+
+	var err error
+	captureStderr(t, func() {
+		err = cmdRun([]string{"--image", "img:test", "--environment", "env_1",
+			"--ttl-minutes", "15", "--quiet", "--", "true"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "start the proxy container") {
+		t.Fatalf("expected the run to get as far as starting the proxy container, got: %v", err)
+	}
+	log, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var proxyRun string
+	for _, line := range strings.Split(string(log), "\n") {
+		if strings.HasPrefix(line, "run -d --name veris-proxy-") {
+			proxyRun = line
+		}
+	}
+	if proxyRun == "" {
+		t.Fatalf("no proxy `docker run` was issued:\n%s", log)
+	}
+	for _, want := range []string{
+		"-e VERIS_ENVIRONMENT_ID=env_1", "-e VERIS_TTL_MINUTES=15",
+		"-e VERIS_API_KEY=vsk_test", "-e VERIS_API_BASE=http://127.0.0.1:1",
+	} {
+		if !strings.Contains(proxyRun, want) {
+			t.Errorf("the proxy container was not handed %s:\n%s", want, proxyRun)
+		}
+	}
+	if strings.Contains(proxyRun, "VERIS_SANDBOX_ID=") {
+		t.Errorf("--environment deploys its own sandbox, so no VERIS_SANDBOX_ID belongs beside it:\n%s", proxyRun)
+	}
+}

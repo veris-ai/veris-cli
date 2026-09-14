@@ -30,11 +30,23 @@ on:
       - "go.sum"
       - ".github/workflows/image.yml"
     tags: ["v*"]
+  # Called by release.yml once it has cut a tag. A tag pushed with
+  # GITHUB_TOKEN raises no events, by design, so the tags: trigger above
+  # never fires for an automated release and the release calls this instead.
+  # The trigger stays for a tag a person pushes by hand.
+  workflow_call:
+    inputs:
+      version:
+        description: The release tag to build and label the image with.
+        type: string
+        required: true
   workflow_dispatch:
 
 concurrency:
-  group: image
-  cancel-in-progress: true
+  # A release must not be cancelled by the main-branch build that follows it,
+  # so the two do not share a group.
+  group: image-${{ inputs.version || github.ref }}
+  cancel-in-progress: ${{ inputs.version == '' }}
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -47,6 +59,11 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The tag when released, so the image is built from exactly what
+          # the binaries were built from rather than from whatever main
+          # moved to while the release ran.
+          ref: ${{ inputs.version || github.ref }}
 
       # BOTH architectures, unlike an image that runs on a cluster we choose.
       # This one runs on a developer's laptop, and an amd64-only image on
@@ -71,12 +88,17 @@ jobs:
         id: tags
         run: |
           set -euo pipefail
-          TAGS="$IMAGE:runner,$IMAGE:${GITHUB_SHA::12}"
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            TAGS="$TAGS,$IMAGE:${GITHUB_REF_NAME},$IMAGE:latest"
-            VERSION="${GITHUB_REF_NAME}"
+          SHA="$(git rev-parse HEAD)"
+          TAGS="$IMAGE:runner,$IMAGE:${SHA::12}"
+          RELEASE="${{ inputs.version }}"
+          if [ -z "$RELEASE" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            RELEASE="${GITHUB_REF_NAME}"
+          fi
+          if [ -n "$RELEASE" ]; then
+            TAGS="$TAGS,$IMAGE:${RELEASE},$IMAGE:latest"
+            VERSION="$RELEASE"
           else
-            VERSION="${GITHUB_SHA::12}"
+            VERSION="${SHA::12}"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

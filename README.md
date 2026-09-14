@@ -505,7 +505,10 @@ veris run --image your-image --expose 3000 --require-callback /hooks/stripe
 ```
 
 The port is the one your app listens on. Your image starts only after the proxy
-reports ready, so the registration probe necessarily runs before anything is
+reports ready. A new tunnel hostname may take time to resolve from the sandbox;
+the proxy retries DNS failures for up to one minute before allowing the app to
+start, and refuses startup if resolution still fails. This checks the sandbox's
+resolver, not the laptop's. The registration probe runs before anything is
 listening; the proxy waits for your port to open and re-probes, and the verdict
 you read is the one taken then. Your app is handed `VERIS_PUBLIC_URL` and
 registers that with the vendor itself — through the vendor's own API, because
@@ -523,9 +526,25 @@ veris: your app received 2 callback(s):
 for any path). Without it a webhook suite that received nothing still passes,
 which is the same failure the egress receipt exists to catch.
 
+`--receipt run.json` saves both ledgers and the verdict. `engine.callbacks`
+records the inbound method, path, HTTP status and count, including rejected
+callbacks; `sandbox.deliveries` records the sandbox's outbound attempts. Check
+the application's signature and processing assertions alongside those counts.
+
 A quick tunnel needs no Cloudflare account and mints a new hostname each run.
 `--expose-token` (or `VERIS_TUNNEL_TOKEN`, plus `--expose-hostname`) uses a
-named tunnel instead, for a stable URL. If your app runs on the HOST while the
+named tunnel instead, for a stable URL. In Cloudflare, configure that hostname's
+service URL as `http://127.0.0.1:18444`: Veris's callback recorder inside the
+network namespace where cloudflared runs. The recorder forwards to `--expose`
+and records the delivery. Token tunnels use Cloudflare's remote configuration;
+`--url` cannot override it. Use a dedicated tunnel/connector for this run so
+another connector cannot receive its callbacks. One named-tunnel run can use
+port 18444 per network namespace; separate runner containers have separate
+namespaces. The CLI waits up to a minute for a fresh sandbox probe through this
+recorder and explains the required service URL if the route is wrong. An app
+that has not started listening yet does not prevent recorder readiness.
+
+If your app runs on the HOST while the
 proxy is in a container, add `--expose-host host.docker.internal` — loopback
 there is the container's own.
 
@@ -913,9 +932,97 @@ The e2e script matters because the Go tests exercise the proxy through Go's own
 TLS stack, which is more forgiving than OpenSSL's. CI runs the unit tests, the
 race detector and every cross-build on any PR.
 
-Releasing: tag `vX.Y.Z`; the release workflow attaches the `make dist` binaries,
-which is where the installer downloads from.
+### Releasing
+
+**Nobody picks the number and nobody pushes the tag.** `ci` passing on `main`
+is the trigger; the commit subjects since the last tag decide the bump; the
+release workflow cuts the tag, attaches the `make dist` binaries the installer
+downloads, and publishes the runner image.
+
+Every commit on `main` is a squashed pull request whose title this repo already
+requires to be `type(scope): subject`, so the history is a conventional-commit
+log without anyone maintaining it as one:
+
+| Commits since the last tag | Result |
+|---|---|
+| `feat` | minor |
+| `fix`, `perf` | patch |
+| `!` before the colon, or `BREAKING CHANGE:` in the body | see below |
+| only `docs`, `chore`, `ci`, `test`, `refactor`, `style`, `build` | **no release** |
+
+The last row is deliberate. Those change nothing a user of the binary can
+observe, and a release nobody can tell apart from the last one is noise in the
+changelog and a download that gains its taker nothing.
+
+**Before 1.0**, which is where this is, a breaking change moves the MINOR.
+`0.y.z` is semver's own place for a public API that is not yet stable, and
+going to `1.0.0` is a claim about stability that a script reading commit
+subjects has no business making. Ask for it by hand: run the release workflow
+with `bump: major`, which is also the way to force any bump the commits did
+not earn.
+
+`scripts/next-version.sh` decides it and runs the same on a laptop, so you can
+see what the next merge would cut before you make it:
+
+```sh
+scripts/next-version.sh          # release=… bump=… previous=… version=…
+bash scripts/next-version-test.sh # the rules, held to examples
+```
+
+Pushing a tag by hand still works and still publishes — it is the escape hatch,
+not the path.
 
 ## Licence
 
 MIT. Built on [elazarl/goproxy](https://github.com/elazarl/goproxy) (BSD-3).
+
+### Reading complete sandbox tables
+
+`veris sandbox data get NAME TABLE` reads one page (20 rows by default).
+`--json` preserves the row-array format and reports partial reads on stderr.
+Use `--offset N --limit N` for another page, or `--all --json` to collect every
+page before printing the array. `--limit` is the page size, at most 1000.
+Stop writers while collecting pages: this is not an atomic snapshot. A changed
+total, stalled page, or failed request fails the command without emitting a
+partial JSON array. Filter the complete array locally to count rows from a run.
+
+### Import file bodies
+
+`veris sandbox files import google-drive ./pdfs --owner OWNER --prefix Corpus`
+streams a local directory through the service's existing `/veris/files` control
+surface. For GCS sources, first use `gcloud storage rsync gs://BUCKET/pdfs ./pdfs`.
+The command hashes every file, stages ZIP batches (128 MiB payload by default),
+and streams an individual file raw when it exceeds the batch budget. Files
+larger than 1 GiB, symlinks, and special files are refused.
+
+Use `--checkpoint PATH --resume` to resume the exact source and destination,
+skipping acknowledged batches. A changed manifest is refused. A disconnected
+POST may have committed: its pending batch is retained and automatic replay is
+refused until the operator reconciles the listed files with the service. Each
+batch is atomic; the whole directory is not. Repeated paths can create revisions.
+A killed importer may leave a `.lock` beside its checkpoint; remove that lock
+only after confirming the importer is no longer running. Checkpoints contain
+service capability URLs and should remain private. `--json` emits a receipt
+with SHA-256 hashes and acknowledged byte/file totals; progress goes to stderr.
+
+After upload, promote with `--keep-source` or create a snapshot, boot a separate
+sandbox and verify its file downloads before deleting the source. The command
+does not promote automatically and does not claim a successful restore.
+
+### Long-running captures
+
+`veris baseline promote --keep-source` and `veris snapshot create` use durable
+capture operations when the API supports them. The CLI prints the request ID
+before submission, then the operation ID and phase. To resume after a lost
+connection, repeat the same command and options with `--request-id ID`.
+Terminal `failed` or `interrupted` outcomes stop polling and retain the source.
+An unconfirmed outcome (including a missing/invalid saved-image result) exits 4
+and retains the source. The default client wait is 1800 seconds; it does not
+extend the server's independently configured capture budget.
+
+Only an explicit missing-route response permits the legacy synchronous capture
+and baseline/snapshot polling fallback. Deploy the API's capture-operations
+migration and implementation first to get durable tracking. Worker loss is
+reported as interrupted; it is not automatically replayed, because publication
+may already have completed. Inspect the baseline or snapshots before starting
+a new request. Verify a separate fresh boot before deleting an imported source.

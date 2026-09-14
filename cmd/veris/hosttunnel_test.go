@@ -243,6 +243,7 @@ func mustExit(t *testing.T, err error, want int) {
 // stopped. The secrets travel in serve's environment and never in its argv.
 func TestRunHostExposeComposesServeAndJudgesBothReceipts(t *testing.T) {
 	stopped, argvFile := useFakeServe(t)
+	receiptPath := filepath.Join(t.TempDir(), "receipt.json")
 	t.Setenv(fakeServeInbound, `{"total":2,"delivered":2,"callbacks":[{"method":"POST","path":"/hooks/stripe","status":200,"count":2}],"by_path":{"/hooks/stripe":2},"delivered_by_path":{"/hooks/stripe":2}}`)
 	cfgPath := writeConfig(t, sandbox(t))
 	argv := child(t, "call")
@@ -250,13 +251,29 @@ func TestRunHostExposeComposesServeAndJudgesBothReceipts(t *testing.T) {
 	var err error
 	stderr := captureStderr(t, func() {
 		err = cmdRun(append([]string{
-			"--config", cfgPath, "--expose", "3000",
+			"--config", cfgPath, "--expose", "3000", "--receipt", receiptPath,
 			"--expose-token", "tok_secret", "--expose-hostname", "hooks.example.com",
 			"--require-service", "stripe", "--require-callback", "/hooks/stripe", "--",
 		}, argv...))
 	})
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, stderr)
+	}
+	raw, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved struct {
+		Engine struct {
+			Callbacks []proxy.Callback `json:"callbacks"`
+		} `json:"engine"`
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	wantCallbacks := []proxy.Callback{{Method: "POST", Path: "/hooks/stripe", Status: 200, Count: 2}}
+	if !slices.Equal(saved.Engine.Callbacks, wantCallbacks) {
+		t.Fatalf("saved callbacks = %+v, want %+v", saved.Engine.Callbacks, wantCallbacks)
 	}
 	for _, want := range []string{
 		"veris: callbacks arrive at " + fakePublicURL,
@@ -729,5 +746,35 @@ func TestHostTunnelReadsBothReceiptsInOneDrainedRead(t *testing.T) {
 	}
 	if _, _, err := readStatusReceipts("http://127.0.0.1:1" + proxy.StatusPath); err == nil {
 		t.Error("an unreachable proxy must be an error")
+	}
+}
+
+func TestRunReceiptRetainsRejectedCallbackEvidence(t *testing.T) {
+	useFakeServe(t)
+	t.Setenv(fakeServeInbound, `{"total":1,"delivered":0,"callbacks":[{"method":"POST","path":"/hooks/stripe","status":500,"count":1}],"by_path":{"/hooks/stripe":1},"delivered_by_path":{}}`)
+	cfgPath := writeConfig(t, sandbox(t))
+	path := filepath.Join(t.TempDir(), "receipt.json")
+	argv := child(t, "silent")
+	var err error
+	captureStderr(t, func() {
+		err = cmdRun(append([]string{"--config", cfgPath, "--expose", "3000", "--require-callback", "/hooks/stripe", "--receipt", path, "--"}, argv...))
+	})
+	mustExit(t, err, exitRequirementUnmet)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved struct {
+		ExitCode int `json:"exit_code"`
+		Engine   struct {
+			Callbacks []proxy.Callback `json:"callbacks"`
+		} `json:"engine"`
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	want := []proxy.Callback{{Method: "POST", Path: "/hooks/stripe", Status: 500, Count: 1}}
+	if saved.ExitCode != exitRequirementUnmet || !slices.Equal(saved.Engine.Callbacks, want) {
+		t.Fatalf("rejected callback evidence lost: %+v", saved)
 	}
 }

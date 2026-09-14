@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/veris-ai/veris-cli/internal/direct"
 )
 
 // DefaultBase is the control plane this client talks to unless told otherwise.
@@ -58,7 +60,7 @@ func New(base, key string) *Client {
 	return &Client{
 		Base: strings.TrimSuffix(base, "/"),
 		Key:  key,
-		HTTP: &http.Client{Timeout: 30 * time.Second},
+		HTTP: &http.Client{Timeout: 30 * time.Second, Transport: direct.Transport()},
 	}
 }
 

@@ -79,7 +79,8 @@ func cmdRun(args []string) error {
 	exposeToken := fs.String("expose-token", "",
 		"cloudflared named-tunnel `token` (defaults to $VERIS_TUNNEL_TOKEN)")
 	exposeHostname := fs.String("expose-hostname", "",
-		"public `hostname` a named tunnel serves; required with --expose-token")
+		"public `hostname` a named tunnel serves; required with --expose-token; "+
+			"configure its Cloudflare service URL as http://"+namedCallbackAddress)
 	environment := fs.String("environment", "",
 		"deploy a fresh sandbox from this environment `id` and delete it after, "+
 			"instead of attaching to an existing --sandbox")
@@ -96,7 +97,7 @@ func cmdRun(args []string) error {
 	keep := fs.Bool("keep", false,
 		"leave a --fresh sandbox running afterwards, as this folder's")
 	freshTTL := fs.Int("ttl", 0,
-		"lifetime in `minutes` of a --fresh sandbox if teardown never runs (config, then 120)")
+		"lifetime in `minutes` of a --fresh sandbox if teardown never runs (config, then the control plane's default)")
 	receiptPath := fs.String("receipt", "",
 		"write the run's receipt as JSON to this `file`: both ledgers and the "+
 			"verdict, never on stdout")
@@ -208,6 +209,16 @@ func cmdRun(args []string) error {
 		sources.Local = pointer
 		sources.APIBase = firstNonEmpty(sources.APIBase, s.res.APIBase)
 		sources.APIKey = firstNonEmpty(sources.APIKey, s.res.APIKey)
+	}
+	// `--environment "$VERIS_ENVIRONMENT_ID"` in a shell where that is unset
+	// hands the flag nothing, and nothing is not "no flag": every check below
+	// reads an empty --environment as absent, so the run would route at the
+	// folder's sandbox in the host tier, and in the container tier start a
+	// proxy with no target and fail inside it. Said here, once, as itself.
+	if flagsGiven(fs)["environment"] && *environment == "" {
+		return errors.New(
+			"--environment is empty, so there is no environment to deploy from: " +
+				"pass its id (an unset $VERIS_ENVIRONMENT_ID expands to nothing)")
 	}
 	argv, reqs, callbackReqs := d.argv, d.reqs, d.callbackReqs
 	*expose, *image, *strict = d.expose, d.image, d.strict
@@ -343,6 +354,21 @@ func cmdRun(args []string) error {
 				return fmt.Errorf("%s applies to a local proxy, and --image puts "+
 					"the proxy in its own container. Drop it, or drop --image", name)
 			}
+		}
+		// The proxy container is handed one routing target, and handed none
+		// it starts, finds nothing to route and exits with the runner image's
+		// own words -- set VERIS_SANDBOX_ID, or mount a config at
+		// /veris/config.json -- which are for someone driving that image by
+		// hand, not for this command. The host tier refuses the same run
+		// before it does anything (resolveConfig), so this tier refuses here,
+		// in this command's words. --fresh is exempt: its sandbox does not
+		// exist yet, and it is the target.
+		if !*fresh && sources.File == "" && *environment == "" && sandboxForContainer(sources) == "" {
+			return fmt.Errorf(
+				"nothing to route: pass --sandbox <id> (or set $%s), "+
+					"--environment <id> to deploy one for this run, or --config <file>; "+
+					"veris up gives this folder a sandbox of its own",
+				discovery.EnvSandboxID)
 		}
 	}
 
@@ -609,7 +635,7 @@ func (o localRun) conclude(p *proof, status int, engine *proxy.Receipt,
 	case readErr != nil || shutErr != nil || v.Indeterminate:
 		code = exitIndeterminate
 	}
-	writeReceipt(os.Stderr, o.receipt, p, l, engine, v.Assertions, started, finished, code)
+	writeReceipt(os.Stderr, o.receipt, p, l, engine, inbound, v.Assertions, started, finished, code)
 	if code != 0 {
 		return exitCode(code)
 	}
@@ -643,7 +669,12 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 	// judge; the rest is judged once, below, with the engine's count merged.
 	reqs := spec.Requirements
 	spec.Requirements = p.enginesAlone(reqs)
-	engine, err := runContainerised(spec)
+	containerResult, err := runContainerised(spec)
+	var engine *proxy.Receipt
+	var inbound *proxy.InboundReceipt
+	if containerResult != nil {
+		engine, inbound = containerResult.Engine, containerResult.Inbound
+	}
 	finished := time.Now()
 	if fresh {
 		// As in runLocal: nothing must interrupt the after-read and the
@@ -666,7 +697,7 @@ func runContainerisedProved(spec dockerRun, client *api.Client, callbackReqs []r
 	case v.Indeterminate:
 		code = exitIndeterminate
 	}
-	writeReceipt(os.Stderr, receiptPath, p, l, engine, v.Assertions, started, finished, code)
+	writeReceipt(os.Stderr, receiptPath, p, l, engine, inbound, v.Assertions, started, finished, code)
 	if code != 0 {
 		return exitCode(code)
 	}

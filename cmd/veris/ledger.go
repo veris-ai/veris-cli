@@ -793,6 +793,9 @@ func printVerdict(w io.Writer, l *ledger, assertions []assertion, engine *proxy.
 				oks = append(oks, fmt.Sprintf("✓ ledgers agree (%d = %d)", sent, recorded))
 			} else {
 				fmt.Fprintf(w, "veris: ! ledgers differ (engine %d, sandbox %d)\n", sent, recorded)
+				if recorded > sent {
+					fmt.Fprintln(w, "            — sandbox totals can include sibling token verification or concurrent traffic; compare per-twin traces. Requirements are judged separately.")
+				}
 			}
 		}
 	}
@@ -934,7 +937,7 @@ type runReceipt struct {
 
 type engineReceipt struct {
 	Services  map[string]int64 `json:"services"`
-	Callbacks []any            `json:"callbacks"`
+	Callbacks []proxy.Callback `json:"callbacks"`
 }
 
 type sandboxReceipt struct {
@@ -947,6 +950,7 @@ type sandboxReceipt struct {
 // that cannot be written is reported but does not change the verdict: the
 // run happened, and its exit code is what a harness reads first.
 func writeReceipt(w io.Writer, path string, p *proof, l *ledger, engine *proxy.Receipt,
+	inbound *proxy.InboundReceipt,
 	assertions []assertion, started, finished time.Time, code int,
 ) {
 	if path == "" {
@@ -960,7 +964,10 @@ func writeReceipt(w io.Writer, path string, p *proof, l *ledger, engine *proxy.R
 		r.SandboxID, r.EnvironmentID = p.sandboxID, p.envID
 	}
 	if engine != nil {
-		r.Engine = &engineReceipt{Services: engine.ByService, Callbacks: []any{}}
+		r.Engine = &engineReceipt{Services: engine.ByService, Callbacks: []proxy.Callback{}}
+		if inbound != nil && inbound.Callbacks != nil {
+			r.Engine.Callbacks = inbound.Callbacks
+		}
 		if r.Engine.Services == nil {
 			r.Engine.Services = map[string]int64{}
 		}

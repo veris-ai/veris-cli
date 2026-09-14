@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,7 +138,53 @@ func (c *Client) Register(ctx context.Context, url string) (ProbeState, error) {
 	if err := c.patch(ctx, url); err != nil {
 		return ProbeState{}, err
 	}
-	return c.Probe(ctx)
+	return c.ProbeResolved(ctx)
+}
+
+// ErrDNSNotReady means the sandbox still cannot resolve the callback hostname.
+// Trying another service in the same sandbox must not turn this into readiness.
+var ErrDNSNotReady = errors.New("sandbox cannot resolve the callback hostname")
+
+// ErrTunnelNotReady means Cloudflare still has no connected tunnel at startup.
+var ErrTunnelNotReady = errors.New("Cloudflare tunnel is not ready (error code: 1033)")
+
+// ProbeResolved waits out DNS propagation and Cloudflare connector startup before
+// the workload can emit its first webhook. It does not wait for the app: the
+// recorder's origin-not-listening 502 is sufficient. Other failures remain visible.
+// Readiness is tested from the sandbox, not the laptop.
+func (c *Client) ProbeResolved(ctx context.Context) (ProbeState, error) {
+	return c.probeResolved(ctx, time.Minute, 2*time.Second)
+}
+
+func (c *Client) probeResolved(ctx context.Context, budget, interval time.Duration) (ProbeState, error) {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	var waiting error
+	for {
+		state, err := c.Probe(ctx)
+		if err != nil {
+			if waiting != nil && ctx.Err() != nil {
+				return state, fmt.Errorf("%w after waiting for callback readiness: %w", waiting, ctx.Err())
+			}
+			return ProbeState{}, err
+		}
+		result := state.LastProbeResult
+		switch {
+		case result["outcome"] == "connect_error" && result["error"] == "gaierror":
+			waiting = ErrDNSNotReady
+		case result["outcome"] == "http_response" && state.DeadTunnel() == "error code: 1033":
+			waiting = ErrTunnelNotReady
+		default:
+			return state, nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return state, fmt.Errorf("%w after waiting for callback readiness: %w", waiting, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // Clear unregisters the URL, so the next run does not inherit a dead hostname

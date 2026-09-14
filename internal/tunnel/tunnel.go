@@ -125,13 +125,14 @@ func Start(ctx context.Context, opts Options) (*Tunnel, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 
-	// --url in BOTH modes. Without it a named tunnel serves whatever its
-	// remote ingress configuration points at, which is not the listener that
-	// records callbacks and forwards them to the app -- so the stable-URL mode
-	// would bypass the receipt entirely, or reach nothing at all.
-	args := []string{"tunnel", "--no-autoupdate", "--url", opts.Target}
+	// Token tunnels receive their ingress rules from Cloudflare. A local --url
+	// does not override those rules; the caller must verify the configured
+	// destination reaches its recorder. Only quick tunnels use a local target.
+	args := []string{"tunnel", "--no-autoupdate"}
 	if opts.Token != "" {
 		args = append(args, "run", "--token", opts.Token)
+	} else {
+		args = append(args, "--url", opts.Target)
 	}
 
 	cmd := exec.Command(bin, args...) //nolint:gosec // argv built above

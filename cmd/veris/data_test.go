@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -251,7 +253,7 @@ func TestSandboxDataGet(t *testing.T) {
 			"  id", "email", "name", "created", "metadata", "balance\n",
 			"  cus_2", "bob@example.com", "—", "1700000000", `{"tier":"gold"}`, "0\n",
 			"  cus_1", "ada@example.com", "Ada", "1699999999", "{}", "-5\n",
-			"→ veris sandbox data get stripe customers --limit 41   (more rows)\n")
+			"→ veris sandbox data get stripe customers --offset 2 --limit 5   (next page; --all for all rows)\n")
 		if q := twins.rowQueries(); len(q) != 1 || q[0] != "entity_type=customers&limit=5" {
 			t.Errorf("queries = %q, want entity_type=customers&limit=5", q)
 		}
@@ -265,6 +267,9 @@ func TestSandboxDataGet(t *testing.T) {
 		var rows []map[string]any
 		if err := json.Unmarshal([]byte(stdout), &rows); err != nil || len(rows) != 2 || rows[0]["id"] != "cus_2" {
 			t.Errorf("stdout %q: %v", stdout, err)
+		}
+		if !strings.Contains(stderr, "showing 2 of 41 rows (offset 0); use --all") {
+			t.Errorf("missing partial-page notice: %s", stderr)
 		}
 		q := twins.rowQueries()
 		if len(q) == 0 || q[len(q)-1] != "entity_type=customers&limit=20" {
@@ -621,4 +626,70 @@ func TestSandboxDataDelete(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestSandboxDataPagination(t *testing.T) {
+	for _, mode := range []string{"complete", "empty", "changed", "error", "repeated"} {
+		t.Run(mode, func(t *testing.T) {
+			plane := newSandboxPlane(t)
+			twins := newDataTwins(t)
+			var offsets []int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+				limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+				offsets = append(offsets, offset)
+				if mode == "error" && offset > 0 {
+					http.Error(w, "unavailable", 503)
+					return
+				}
+				total := 5
+				if mode == "changed" && offset > 0 {
+					total++
+				}
+				rows := []map[string]any{}
+				for i := offset; i < min(offset+limit, 5); i++ {
+					if mode != "empty" || offset == 0 {
+						rows = append(rows, map[string]any{"id": i})
+					}
+				}
+				if mode == "repeated" {
+					offset = 0
+				}
+				sbJSON(w, 200, map[string]any{"rows": rows, "total": total, "offset": offset, "limit": limit})
+			}))
+			defer srv.Close()
+			services := twins.services()
+			services[0].ControlURL = srv.URL
+			dataBench(t, plane, services)
+			code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe", "customers", "--all", "--limit", "2", "--json")
+			if mode != "complete" {
+				if code == 0 || stdout != "" {
+					t.Fatalf("partial result escaped: exit %d stdout %s stderr %s", code, stdout, stderr)
+				}
+				return
+			}
+			var rows []map[string]any
+			if code != 0 || json.Unmarshal([]byte(stdout), &rows) != nil || len(rows) != 5 {
+				t.Fatalf("exit %d stdout %s stderr %s", code, stdout, stderr)
+			}
+			for i, row := range rows {
+				if row["id"] != float64(i) {
+					t.Fatalf("wrong row %d: %v", i, row)
+				}
+			}
+			if len(offsets) != 3 || offsets[0] != 0 || offsets[1] != 2 || offsets[2] != 4 {
+				t.Fatalf("offsets: %v", offsets)
+			}
+			code, stdout, stderr = runSandboxCLI(t, "sandbox", "data", "get", "stripe", "customers", "--offset", "4", "--limit", "2", "--json")
+			if code != 0 || json.Unmarshal([]byte(stdout), &rows) != nil || len(rows) != 1 || rows[0]["id"] != float64(4) || !strings.Contains(stderr, "offset 4") {
+				t.Fatalf("offset read: exit %d stdout %s stderr %s", code, stdout, stderr)
+			}
+		})
+	}
+	for _, flags := range [][]string{{"--limit", "1001"}, {"--offset", "-1"}, {"--all", "--offset", "1"}} {
+		code, _, _ := runSandboxCLI(t, append([]string{"sandbox", "data", "get", "stripe", "customers"}, flags...)...)
+		if code == 0 {
+			t.Fatalf("accepted %v", flags)
+		}
+	}
 }

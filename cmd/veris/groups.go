@@ -17,6 +17,7 @@ func sandboxCommands() []*cli.Command {
 			c.Sub = append(c.Sub,
 				sandboxServicesCommand(),
 				sandboxDataCommand(),
+				sandboxFilesCommand(),
 				sandboxTraceCommand(),
 				sandboxClockCommand(),
 			)
