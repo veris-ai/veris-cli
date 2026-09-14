@@ -41,38 +41,63 @@ var traceFollowContext = func() (context.Context, context.CancelFunc) {
 
 // traceOptions are trace's flags; zero means "not given".
 type traceOptions struct {
-	id      string
-	service string
-	tier    string
-	limit   int
-	since   int
-	body    int
-	follow  bool
+	id       string
+	service  string
+	source   string
+	tier     string
+	typ      string
+	plane    string
+	session  string
+	limit    int
+	since    int
+	body     int
+	follow   bool
+	mutating bool
 }
 
-// sandboxTraceCommand is `veris sandbox trace`: the sandbox's own request
-// ledger from GET /veris/requests on every twin, merged newest first. It is
-// the receipt when you are outside run.
+// ledgerOnly reports whether a flag was given that only a sandbox ledger can
+// honour, so a control plane without one says so rather than quietly
+// answering a wider question than it was asked.
+func (o traceOptions) ledgerOnly() bool {
+	return o.source != "" || o.typ != "" || o.plane != "" || o.session != "" || o.mutating
+}
+
+// sandboxTraceCommand is `veris sandbox trace`: the sandbox's ledger, the one
+// time-ordered stream of everything it saw, newest first. It is the receipt
+// when you are outside run.
 func sandboxTraceCommand() *cli.Command {
 	var o traceOptions
 	return &cli.Command{
 		Name:    "trace",
-		Summary: "What the sandbox received, newest first",
-		Usage:   "veris sandbox trace [--id ID] [--service NAME] [--tier handler|fault|control|delivery] [--limit N] [--since ID] [--follow] [--body ID] [--json]",
-		Help: "trace reads GET /veris/requests on every twin (or --service NAME) and merges the rows newest first;\n" +
-			"credentials are already redacted. Times are the sandbox's own clock, in UTC. A status of — is a\n" +
-			"hang fault: the twin sent nothing. --since ID keeps rows above that id; --follow polls every 2 s and\n" +
-			"prints what arrived, oldest first, until Ctrl-C (with --json, one row per line); its first batch\n" +
-			"is the newest rows shown oldest first too, tail -f style. --body ID prints one entry's request\n" +
-			"and response headers and bodies.",
+		Summary: "What the sandbox saw, newest first",
+		Usage: "veris sandbox trace [--id ID] [--source NAME|sandbox] [--type http|sql|connection|delivery|world]\n" +
+			"                    [--plane vendor|control|world] [--session ID] [--mutating] [--service NAME]\n" +
+			"                    [--tier handler|fault|control|delivery] [--limit N] [--since SEQ] [--follow]\n" +
+			"                    [--body SEQ] [--json]",
+		Help: "trace reads the sandbox's ledger (GET /v1/sandboxes/{id}/ledger): every request its twins\n" +
+			"answered, every statement its data planes ran, and the sandbox's own world events, as one\n" +
+			"stream ordered by time, newest first. Credentials are already redacted. Every event carries a\n" +
+			"sandbox-wide seq: --since SEQ keeps what is above one, --body SEQ prints one event's request\n" +
+			"and response whole. The filters narrow the stream and combine: --source (a twin's name, or\n" +
+			"'sandbox'), --type, --plane, --session, --tier, --mutating. --follow polls every 2 s and prints\n" +
+			"what arrived, oldest first, until Ctrl-C (with --json, one event per line); its first batch is\n" +
+			"the newest events shown oldest first too, tail -f style.\n" +
+			"A control plane that keeps no ledger is read the old way instead: GET /veris/requests on every\n" +
+			"twin (or --service NAME), merged here, where --since and --body are per-twin row ids rather\n" +
+			"than one sandbox-wide seq.",
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&o.id, "id", "", "sandbox id (default: this folder's)")
-			fs.StringVar(&o.service, "service", "", "one twin's trace (default: every twin)")
-			fs.StringVar(&o.tier, "tier", "", "only rows of this tier: handler, fault, control or delivery")
-			fs.IntVar(&o.limit, "limit", traceDefaultLimit, "rows to show across the merge (1..1000)")
-			fs.IntVar(&o.since, "since", 0, "only rows with an id above this")
-			fs.BoolVar(&o.follow, "follow", false, "keep polling and print new rows as they arrive")
-			fs.IntVar(&o.body, "body", 0, "print the headers and bodies of the entry with this id")
+			fs.StringVar(&o.source, "source", "", "one source's events: a twin's name, or 'sandbox' for the world's own")
+			fs.StringVar(&o.service, "service", "", "one twin's events (default: every source)")
+			fs.StringVar(&o.typ, "type", "", "only events of this type: http, sql, connection, delivery or world")
+			fs.StringVar(&o.plane, "plane", "", "only events on this plane: vendor, control or world")
+			fs.StringVar(&o.session, "session", "", "only events of this session")
+			fs.BoolVar(&o.mutating, "mutating", false, "only events that changed the world")
+			fs.StringVar(&o.tier, "tier", "", "only events of this tier: handler, fault, control or delivery")
+			fs.IntVar(&o.limit, "limit", traceDefaultLimit, "events to show (1..1000)")
+			fs.IntVar(&o.since, "since", 0, "only events above this seq")
+			fs.BoolVar(&o.follow, "follow", false, "keep polling and print new events as they arrive")
+			fs.IntVar(&o.body, "body", 0, "print the request and response of the event with this seq")
 		},
 		Run: func(ctx *cli.Context, args []string) error {
 			if err := noPositionals(ctx, args); err != nil {
@@ -168,17 +193,35 @@ func noTrace(err error) bool {
 	return errors.As(err, &te) && te.Status == http.StatusNotFound
 }
 
-// sandboxTrace is the whole verb: resolve the sandbox and its twins, read
-// each trace, merge, print; then follow when asked.
+// sandboxTrace is the whole verb: resolve the sandbox, read its ledger and
+// print it; then follow when asked. A control plane that serves no ledger is
+// read the old way, by merging every twin's own request trace here.
 func sandboxTrace(ctx *cli.Context, o traceOptions) error {
-	// Flags are checked before anything is read: a --tier the twin would
-	// refuse is a usage error, not a reason to fetch the sandbox first.
+	// Flags are checked before anything is read: a --tier the control plane
+	// would refuse is a usage error, not a reason to fetch the sandbox first.
 	if err := traceCheckFlags(o); err != nil {
 		return err
 	}
-	s, _, sb, err := openSandboxServices(ctx, o.id)
+	s, c, sb, err := openSandboxServices(ctx, o.id)
 	if err != nil {
 		return err
+	}
+	// A name that is not one of the sandbox's twins is a wrong target on
+	// either path, and is said before anything is read. traceTwins resolves
+	// it again below; the lookup is local, and this way the message is
+	// printed once.
+	if o.service != "" {
+		if _, err := twinNamed(s, sb, o.service); err != nil {
+			return err
+		}
+	}
+	if done, err := traceLedger(s, c, sb, o); done {
+		return err
+	}
+	if o.ledgerOnly() {
+		s.ui.Fail("Sandbox %s keeps no ledger: --source, --type, --plane, --session and --mutating need one", sb.ID)
+		s.ui.Detail("its twins' own request traces are all there is; --service, --tier and --since ID still work")
+		return printed(1)
 	}
 	twins, err := traceTwins(s, sb, o.service)
 	if err != nil {
@@ -226,7 +269,7 @@ func sandboxTrace(ctx *cli.Context, o traceOptions) error {
 	}
 	switch {
 	case o.follow && s.ctx.Globals.JSON:
-		if err := traceJSONLines(s, rows); err != nil {
+		if err := jsonLines(s, rows); err != nil {
 			return err
 		}
 	case s.ctx.Globals.JSON:
@@ -253,8 +296,8 @@ func sandboxTrace(ctx *cli.Context, o traceOptions) error {
 	return traceFollow(s, twins, o, last)
 }
 
-// traceCheckFlags refuses the combinations the twin or the merge cannot
-// honour before any twin is asked.
+// traceCheckFlags refuses the combinations the ledger, the twin or the merge
+// cannot honour before anything is asked.
 func traceCheckFlags(o traceOptions) error {
 	switch o.tier {
 	case "", twin.TierHandler, twin.TierFault, twin.TierControl, twin.TierDelivery:
@@ -262,14 +305,27 @@ func traceCheckFlags(o traceOptions) error {
 		return fmt.Errorf("--tier must be %s, %s, %s or %s (got '%s')",
 			twin.TierHandler, twin.TierFault, twin.TierControl, twin.TierDelivery, o.tier)
 	}
+	switch o.typ {
+	case "", "http", "sql", "command", "message", "connection", "delivery", "world":
+	default:
+		return fmt.Errorf("--type must be http, sql, connection, delivery or world (got '%s')", o.typ)
+	}
+	switch o.plane {
+	case "", "vendor", "control", "world":
+	default:
+		return fmt.Errorf("--plane must be vendor, control or world (got '%s')", o.plane)
+	}
+	if o.source != "" && o.service != "" {
+		return errors.New("--source and --service both name one source; pass one")
+	}
 	if o.limit < 1 || o.limit > traceMaxLimit {
 		return fmt.Errorf("--limit must be between 1 and %d (got %d)", traceMaxLimit, o.limit)
 	}
 	if o.since < 0 {
-		return fmt.Errorf("--since must be a trace id (got %d)", o.since)
+		return fmt.Errorf("--since must be a ledger seq (got %d)", o.since)
 	}
 	if o.body < 0 {
-		return fmt.Errorf("--body must be a trace id (got %d)", o.body)
+		return fmt.Errorf("--body must be a ledger seq (got %d)", o.body)
 	}
 	if o.body > 0 && o.follow {
 		return errors.New("--body prints one entry; it cannot be combined with --follow")
@@ -435,7 +491,7 @@ func traceFollow(s *session, twins []*traceTwin, o traceOptions, last map[string
 		}
 		sortTraceRows(fresh, false)
 		if s.ctx.Globals.JSON {
-			if err := traceJSONLines(s, fresh); err != nil {
+			if err := jsonLines(s, fresh); err != nil {
 				return err
 			}
 			continue
@@ -444,9 +500,10 @@ func traceFollow(s *session, twins []*traceTwin, o traceOptions, last map[string
 	}
 }
 
-// traceJSONLines writes one compact JSON object per row to stdout, the
-// --follow --json shape: a stream has no closing bracket to wait for.
-func traceJSONLines(s *session, rows []traceRow) error {
+// jsonLines writes one compact JSON object per row to stdout, the --follow
+// --json shape: a stream has no closing bracket to wait for. Both traces --
+// the ledger's events and the twins' rows -- print through it.
+func jsonLines[T any](s *session, rows []T) error {
 	enc := json.NewEncoder(s.ctx.Stdout)
 	enc.SetEscapeHTML(false)
 	for _, r := range rows {

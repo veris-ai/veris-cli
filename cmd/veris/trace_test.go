@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -133,8 +134,10 @@ func (f *traceFake) services() []api.ServiceInfo {
 }
 
 // traceBench is a logged-in bench whose folder points at sbID, ready in ci
-// with the fake twins' services.
-func traceBench(t *testing.T, twins *traceFake) *bench {
+// with the fake twins' services. The plane is returned so a test can script
+// its ledger route; left unscripted it answers 404, the pre-ledger control
+// plane every twin-merge test below is written against.
+func traceBench(t *testing.T, twins *traceFake) (*bench, *sandboxPlane) {
 	t.Helper()
 	plane := newSandboxPlane(t)
 	b := sandboxBench(t, plane.srv.URL)
@@ -144,7 +147,7 @@ func traceBench(t *testing.T, twins *traceFake) *bench {
 	plane.script(func(p *sandboxPlane) {
 		p.answer = func(int) *api.Sandbox { return readySandbox(services, time.Now().Add(time.Hour)) }
 	})
-	return b
+	return b, plane
 }
 
 func intp(n int) *int       { return &n }
@@ -641,7 +644,7 @@ func TestSandboxTraceRefusals(t *testing.T) {
 func TestSandboxTraceTwinFailureIsAWarning(t *testing.T) {
 	twins := newTraceTwins(t)
 	twins.script(traceFixture)
-	b := traceBench(t, twins)
+	b, _ := traceBench(t, twins)
 	// github's control URL points at a closed port: the read fails, stripe
 	// still prints, and the failure is one ! line.
 	dead := httptest.NewServer(http.NotFoundHandler())
@@ -661,4 +664,697 @@ func TestSandboxTraceTwinFailureIsAWarning(t *testing.T) {
 		t.Fatalf("exit %d:\n%s", code, stderr)
 	}
 	sbInOrder(t, stderr, "! github: could not read the trace: cannot reach the twin at", "/v1/charges")
+}
+
+// --- the sandbox ledger -----------------------------------------------------
+//
+// The tests above drive the per-twin merge, which is what trace does against
+// a control plane that keeps no ledger (newSandboxPlane answers its ledger
+// routes 404 until a test scripts them). The ones below script them, and
+// hold trace to the ledger's own shapes: one sandbox-wide seq per event,
+// sources that may not all be legible, and a follow that drains.
+
+// lgAt is an event's wall clock as the fixtures write it, and lgLocal is how
+// the table must render it: the reader's own zone, to the millisecond.
+const (
+	lgAt1 = "2026-03-01T09:00:05.120Z"
+	lgAt2 = "2026-03-01T09:00:08.355Z"
+	lgAt3 = "2026-03-01T09:00:09.900Z"
+	lgAt4 = "2026-03-01T09:00:11.010Z"
+)
+
+func lgLocal(t *testing.T, at string) string {
+	t.Helper()
+	ts, err := time.Parse(time.RFC3339, at)
+	if err != nil {
+		t.Fatalf("fixture time %q: %v", at, err)
+	}
+	return ts.Local().Format("15:04:05.000")
+}
+
+// lgEvent is one ledger event with the whole common header, so a test also
+// proves the fields trace does not model survive --json.
+func lgEvent(seq int64, at, source, protocol, plane, typ, tier string, ms *int64,
+	outcome map[string]any, payload map[string]any) map[string]any {
+	src := map[string]any{"kind": "service", "name": source, "protocol": protocol}
+	if source == "" {
+		src = map[string]any{"kind": "sandbox", "name": nil, "protocol": nil}
+	}
+	e := map[string]any{
+		"seq": seq, "id": seq - 5000, "source": src,
+		"plane": plane, "type": typ, "direction": "inbound", "tier": tier,
+		"at": at, "world_time": "2026-03-01T09:00:00Z", "duration_ms": ms,
+		"session":     nil,
+		"origin":      map[string]any{"ip": "10.8.3.21", "application": nil, "user_agent": "python-httpx/0.27"},
+		"actor":       map[string]any{"credential": "api_key", "ref": "acct_clinic_admin"},
+		"state":       map[string]any{"before": 12, "after": 12, "mutating": false},
+		"outcome":     outcome,
+		"correlation": map[string]any{"request_id": "req-" + strconv.FormatInt(seq, 10), "caused_by": nil},
+		"redacted":    []string{"http.request.headers.authorization"},
+	}
+	e[typ] = payload
+	return e
+}
+
+func lgMS(ms int64) *int64 { return &ms }
+
+func lgOK(code string) map[string]any {
+	return map[string]any{"ok": true, "code": code, "fault": nil, "error": nil}
+}
+
+// lgFixture is four events of one sandbox, seqs 5103..5106: a stripe call,
+// a hang, a postgres statement and the sandbox's own clock change.
+func lgFixture() []map[string]any {
+	return []map[string]any{
+		lgEvent(5103, lgAt1, "stripe", "http", "vendor", "http", twin.TierHandler, lgMS(6), lgOK("200"),
+			map[string]any{"method": "GET", "path": "/v1/customers/cus_dev_ada", "query": map[string]any{},
+				"op": nil, "request": map[string]any{"bytes": 0, "truncated": false},
+				"response": map[string]any{"status": 200, "bytes": 812, "truncated": false}}),
+		lgEvent(5104, lgAt2, "stripe", "http", "vendor", "http", twin.TierFault, nil,
+			map[string]any{"ok": false, "code": nil, "fault": map[string]any{"kind": "hang", "id": "flt_7"}, "error": nil},
+			map[string]any{"method": "POST", "path": "/v1/charges", "query": map[string]any{},
+				"op": nil, "request": map[string]any{"bytes": 24, "truncated": false},
+				"response": map[string]any{"status": nil, "bytes": 0, "truncated": false}}),
+		lgEvent(5105, lgAt3, "postgres", "postgres", "vendor", "sql", twin.TierHandler, lgMS(3), lgOK(""),
+			map[string]any{"database": "app", "role": "app", "application": "psycopg",
+				"statement":   "UPDATE invoices SET status = 'paid' WHERE id = $1 AND tenant = $2 RETURNING id",
+				"command_tag": "UPDATE 1", "protocol_phase": "execute", "rows": 1}),
+		lgEvent(5106, lgAt4, "", "", "world", "world", twin.TierControl, nil, lgOK(""),
+			map[string]any{"event": "clock", "detail": map[string]any{"mode": "frozen"}, "by": "api:clock"}),
+	}
+}
+
+func lgSeq(e map[string]any) int64 {
+	switch v := e["seq"].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
+// lgSources is the envelope's sources: every member and the sandbox itself,
+// each with the state of its own ledger.
+func lgSources(states map[string]string) []map[string]any {
+	out := []map[string]any{}
+	for _, name := range []string{"stripe", "github", "postgres"} {
+		state := states[name]
+		if state == "" {
+			state = api.LedgerComplete
+		}
+		protocol := "http"
+		if name == "postgres" {
+			protocol = "postgres"
+		}
+		out = append(out, map[string]any{"kind": "service", "name": name, "protocol": protocol,
+			"ledger": state, "last_seq": 5106, "lag_ms": 0, "error": nil})
+	}
+	state := states["sandbox"]
+	if state == "" {
+		state = api.LedgerComplete
+	}
+	out = append(out, map[string]any{"kind": "sandbox", "name": nil, "protocol": nil,
+		"ledger": state, "last_seq": 5106, "lag_ms": 0, "error": nil})
+	return out
+}
+
+// lgServe answers the ledger route off a slice the test can add to between
+// polls, honouring after_seq, type, dir and limit, and cutting every page to
+// pageSize so a drain can be observed. states scripts the sources' health.
+func lgServe(all *[]map[string]any, pageSize int, states map[string]string) func(url.Values) (int, any) {
+	return func(q url.Values) (int, any) {
+		var after int64
+		if v := q.Get("after_seq"); v != "" {
+			after, _ = strconv.ParseInt(v, 10, 64)
+		}
+		limit := 200
+		if v := q.Get("limit"); v != "" {
+			limit, _ = strconv.Atoi(v)
+		}
+		if pageSize > 0 && pageSize < limit {
+			limit = pageSize
+		}
+		var watermark int64
+		kept := []map[string]any{}
+		for _, e := range *all {
+			watermark = max(watermark, lgSeq(e))
+			if lgSeq(e) <= after {
+				continue
+			}
+			if want := q.Get("type"); want != "" && e["type"] != want {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		asc := q.Get("dir") != "desc"
+		sort.SliceStable(kept, func(i, j int) bool { return (lgSeq(kept[i]) < lgSeq(kept[j])) == asc })
+		hasMore := false
+		if len(kept) > limit {
+			kept, hasMore = kept[:limit], true
+		}
+		return 200, map[string]any{
+			"format": api.LedgerFormat, "sandbox_id": sbID,
+			"clock":   map[string]any{"mode": "frozen", "world_time": "2026-03-01T09:00:00Z", "offset_seconds": 0},
+			"sources": lgSources(states),
+			"events":  kept,
+			"page": map[string]any{"order": q.Get("order"), "dir": q.Get("dir"), "limit": limit,
+				"count": len(kept), "has_more": hasMore, "next_cursor": nil, "watermark_seq": watermark},
+		}
+	}
+}
+
+// traceLedgerBench is traceBench with the ledger route scripted off events.
+func traceLedgerBench(t *testing.T, events *[]map[string]any, pageSize int, states map[string]string) *sandboxPlane {
+	t.Helper()
+	twins := newTraceTwins(t)
+	twins.script(traceFixture)
+	_, plane := traceBench(t, twins)
+	plane.script(func(p *sandboxPlane) { p.ledger = lgServe(events, pageSize, states) })
+	return plane
+}
+
+func TestSandboxTraceLedger(t *testing.T) {
+	t.Run("table", func(t *testing.T) {
+		events := lgFixture()
+		plane := traceLedgerBench(t, &events, 0, nil)
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "trace")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		if stdout != "" {
+			t.Errorf("stdout should be empty without --json, got:\n%s", stdout)
+		}
+		// Newest first, one stream: the world's own event, a statement, a
+		// hang and a call, each with its sandbox-wide seq.
+		sbInOrder(t, stderr,
+			"  Seq", "At", "Source", "Type", "Plane", "Event", "Outcome", "ms",
+			"5106", lgLocal(t, lgAt4), "sandbox", "world", "world", "clock", "—",
+			"5105", lgLocal(t, lgAt3), "postgres", "sql", "vendor", "UPDATE 1", "UPDATE invoices SET status", "3",
+			"5104", lgLocal(t, lgAt2), "stripe", "http", "vendor", "POST /v1/charges", "hang", "—",
+			"5103", lgLocal(t, lgAt1), "stripe", "http", "vendor", "GET /v1/customers/cus_dev_ada", "200", "6",
+			"→ veris sandbox trace --body 5106   (request and response of one event)",
+		)
+		// seq is sandbox-wide, so the hint names no twin.
+		if strings.Contains(stderr, "--body 5106 --service") {
+			t.Errorf("the ledger's --body hint must not name a source:\n%s", stderr)
+		}
+		if q := plane.ledgerAsked(); len(q) != 1 || q[0] != "detail=summary&dir=desc&limit=50&order=time" {
+			t.Errorf("the ledger was asked %q", q)
+		}
+	})
+
+	t.Run("the filters ride along", func(t *testing.T) {
+		events := lgFixture()
+		plane := traceLedgerBench(t, &events, 0, nil)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace", "--since", "5100", "--limit", "10",
+			"--source", "postgres", "--type", "sql", "--plane", "vendor", "--tier", "handler",
+			"--session", "66e0a1b2.1f3a", "--mutating")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		want := "after_seq=5100&detail=summary&dir=desc&limit=10&mutating=true&order=time&plane=vendor" +
+			"&session=66e0a1b2.1f3a&source=postgres&tier=handler&type=sql"
+		if q := plane.ledgerAsked(); len(q) != 1 || q[0] != want {
+			t.Errorf("the ledger was asked\n%q\nwant\n%q", q, want)
+		}
+	})
+
+	t.Run("--service names the source too", func(t *testing.T) {
+		events := lgFixture()
+		plane := traceLedgerBench(t, &events, 0, nil)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace", "--service", "stripe")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		if q := plane.ledgerAsked(); len(q) != 1 || !strings.Contains(q[0], "source=stripe") {
+			t.Errorf("the ledger was asked %q, want source=stripe", q)
+		}
+	})
+
+	t.Run("json carries what this client does not model", func(t *testing.T) {
+		events := lgFixture()
+		traceLedgerBench(t, &events, 0, nil)
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "trace", "--json", "--limit", "2")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
+			t.Fatalf("stdout is not a JSON list: %v\n%s", err, stdout)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("%d events, want 2:\n%s", len(rows), stdout)
+		}
+		if rows[0]["seq"] != float64(5106) || rows[1]["seq"] != float64(5105) {
+			t.Errorf("newest first is broken: %v %v", rows[0]["seq"], rows[1]["seq"])
+		}
+		for _, field := range []string{"origin", "correlation", "redacted", "world_time", "direction"} {
+			if _, ok := rows[0][field]; !ok {
+				t.Errorf("%s was dropped from --json: %v", field, rows[0])
+			}
+		}
+	})
+
+	t.Run("nothing recorded", func(t *testing.T) {
+		var events []map[string]any
+		traceLedgerBench(t, &events, 0, nil)
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "trace", "--type", "sql", "--mutating")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "No events recorded of type sql that changed the world", "→ Next: veris run")
+		if stdout != "" {
+			t.Errorf("stdout:\n%s", stdout)
+		}
+		code, stdout, _ = runSandboxCLI(t, "sandbox", "trace", "--json")
+		if code != 0 || strings.TrimSpace(stdout) != "[]" {
+			t.Errorf("exit %d, stdout %q; want 0 and []", code, stdout)
+		}
+	})
+
+	t.Run("a source that keeps no ledger is a warning", func(t *testing.T) {
+		events := lgFixture()
+		traceLedgerBench(t, &events, 0, map[string]string{"github": api.LedgerUnavailable, "postgres": api.LedgerPartial})
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "! github: no ledger", "! postgres: ledger partial", "  Seq", "5106")
+	})
+
+	t.Run("nothing legible at all is a failure", func(t *testing.T) {
+		var events []map[string]any
+		traceLedgerBench(t, &events, 0, map[string]string{
+			"stripe": api.LedgerUnavailable, "github": api.LedgerUnavailable,
+			"postgres": api.LedgerUnavailable, "sandbox": api.LedgerUnavailable})
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace")
+		if code != 1 {
+			t.Fatalf("exit %d, want 1:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "! stripe: no ledger", "! sandbox: no ledger")
+		if strings.Contains(stderr, "No events recorded") {
+			t.Errorf("an unreadable sandbox must not read as an empty one:\n%s", stderr)
+		}
+	})
+}
+
+// ledgerFollowFor runs `sandbox trace --follow` against a scripted ledger and
+// ends it once the route has been read polls times, the way Ctrl-C would.
+func ledgerFollowFor(t *testing.T, plane *sandboxPlane, polls int, args ...string) (int, string, string) {
+	t.Helper()
+	interval, mk := traceFollowInterval, traceFollowContext
+	traceFollowInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	traceFollowContext = func() (context.Context, context.CancelFunc) { return ctx, cancel }
+	t.Cleanup(func() { traceFollowInterval, traceFollowContext = interval, mk; cancel() })
+	plane.script(func(p *sandboxPlane) {
+		prev := p.onLedger
+		p.onLedger = func(p *sandboxPlane, n int) {
+			if prev != nil {
+				prev(p, n)
+			}
+			if n >= polls {
+				cancel()
+			}
+		}
+	})
+	return runSandboxCLI(t, append([]string{"sandbox", "trace", "--follow"}, args...)...)
+}
+
+func TestSandboxTraceLedgerFollow(t *testing.T) {
+	t.Run("drains each tick and advances the watermark", func(t *testing.T) {
+		events := lgFixture()[:1] // seq 5103 only
+		plane := traceLedgerBench(t, &events, 2, nil)
+		rest := lgFixture()[1:]
+		// The three remaining events land before the second poll, and the
+		// page size of 2 means the tick must drain twice to print them all.
+		plane.script(func(p *sandboxPlane) {
+			p.onLedger = func(p *sandboxPlane, n int) {
+				if n == 2 {
+					events = append(events, rest...)
+				}
+			}
+		})
+		code, stdout, stderr := ledgerFollowFor(t, plane, 6)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		if stdout != "" {
+			t.Errorf("stdout:\n%s", stdout)
+		}
+		// The first batch is the newest events, oldest first; the arrivals
+		// follow in seq order, all three in the one tick that drained.
+		sbInOrder(t, stderr, "  Seq", "5103", "5104", "5105", "5106")
+		// Each event is a row once: the first batch's rows, then the
+		// arrivals. (5103 also appears in the --body hint under it.)
+		for _, once := range []string{"cus_dev_ada", "/v1/charges", "UPDATE invoices", "clock"} {
+			if n := strings.Count(stderr, once); n != 1 {
+				t.Errorf("%s printed %d times, want once:\n%s", once, n, stderr)
+			}
+		}
+		q := plane.ledgerAsked()
+		if len(q) < 3 {
+			t.Fatalf("the ledger was asked only %q", q)
+		}
+		if q[0] != "detail=summary&dir=desc&limit=50&order=time" {
+			t.Errorf("first read %q", q[0])
+		}
+		// Every poll is the ledger's own commit order, above the watermark.
+		if q[1] != "after_seq=5103&detail=summary&dir=asc&limit=1000&order=arrival" {
+			t.Errorf("first poll %q", q[1])
+		}
+		if q[2] != "after_seq=5105&detail=summary&dir=asc&limit=1000&order=arrival" {
+			t.Errorf("the drain must resume above the page it just read, got %q", q[2])
+		}
+		if last := q[len(q)-1]; last != "after_seq=5106&detail=summary&dir=asc&limit=1000&order=arrival" {
+			t.Errorf("last poll %q", last)
+		}
+	})
+
+	t.Run("the watermark covers what the filters hid", func(t *testing.T) {
+		// Only the sql event matches --type sql, but the watermark the page
+		// carries is the whole sandbox's, so the poll starts above every
+		// event read past -- not just the one printed.
+		events := lgFixture()
+		plane := traceLedgerBench(t, &events, 0, nil)
+		code, _, stderr := ledgerFollowFor(t, plane, 3, "--type", "sql")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "5105", "UPDATE invoices")
+		q := plane.ledgerAsked()
+		if len(q) < 2 {
+			t.Fatalf("the ledger was asked only %q", q)
+		}
+		if !strings.Contains(q[1], "after_seq=5106") || !strings.Contains(q[1], "type=sql") {
+			t.Errorf("first poll %q, want after_seq=5106 and type=sql", q[1])
+		}
+	})
+
+	t.Run("a plane that stops answering is one warning", func(t *testing.T) {
+		events := lgFixture()[:1]
+		plane := traceLedgerBench(t, &events, 0, nil)
+		plane.script(func(p *sandboxPlane) {
+			serve := p.ledger
+			p.ledger = func(q url.Values) (int, any) {
+				if q.Get("order") == "arrival" {
+					// A refusal, not a 5xx: the client retries those, and a
+					// follow must not spend its interval on backoff.
+					return 422, map[string]any{"detail": "unknown source 'sandbox'"}
+				}
+				return serve(q)
+			}
+		})
+		code, _, stderr := ledgerFollowFor(t, plane, 4)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		if n := strings.Count(stderr, "! could not read the ledger"); n != 1 {
+			t.Errorf("the failure was reported %d times, want once:\n%s", n, stderr)
+		}
+		if !strings.Contains(stderr, "unknown source") {
+			t.Errorf("the refusal's own words are missing:\n%s", stderr)
+		}
+	})
+
+	t.Run("json is one event per line", func(t *testing.T) {
+		events := lgFixture()[:1]
+		plane := traceLedgerBench(t, &events, 0, nil)
+		rest := lgFixture()[3:]
+		plane.script(func(p *sandboxPlane) {
+			p.onLedger = func(p *sandboxPlane, n int) {
+				if n == 2 {
+					events = append(events, rest...)
+				}
+			}
+		})
+		code, stdout, stderr := ledgerFollowFor(t, plane, 4, "--json")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("%d lines, want 2:\n%s", len(lines), stdout)
+		}
+		for i, want := range []string{`"seq":5103`, `"seq":5106`} {
+			var row map[string]any
+			if err := json.Unmarshal([]byte(lines[i]), &row); err != nil {
+				t.Errorf("line %d is not JSON: %v", i, err)
+			}
+			if !strings.Contains(lines[i], want) {
+				t.Errorf("line %d = %s, want %s", i, lines[i], want)
+			}
+		}
+	})
+}
+
+func TestSandboxTraceLedgerBody(t *testing.T) {
+	events := lgFixture()
+	plane := traceLedgerBench(t, &events, 0, nil)
+	full := map[string]any{
+		"seq": 5104, "id": 104,
+		"source": map[string]any{"kind": "service", "name": "stripe", "protocol": "http"},
+		"plane":  "vendor", "type": "http", "direction": "inbound", "tier": twin.TierFault,
+		"at": lgAt2, "world_time": "2026-03-01T09:00:00Z", "duration_ms": 3004,
+		"session": "66e0a1b2.1f3a",
+		"actor":   map[string]any{"credential": "api_key", "ref": "acct_clinic_admin"},
+		"state":   map[string]any{"before": 12, "after": 13, "mutating": true},
+		"outcome": map[string]any{"ok": false, "code": "402",
+			"fault": map[string]any{"kind": "error", "id": "flt_7"}, "error": "card_declined"},
+		"http": map[string]any{
+			"method": "POST", "path": "/v1/charges", "query": map[string]any{}, "op": nil,
+			"request": map[string]any{
+				"headers": map[string]any{"authorization": "Bearer [redacted]", "content-type": "application/x-www-form-urlencoded"},
+				"body":    "amount=2000&currency=usd", "bytes": 24, "truncated": false, "encoding": "identity"},
+			"response": map[string]any{"status": 402,
+				"headers": map[string]any{"content-type": "application/json"},
+				"body":    map[string]any{"error": map[string]any{"code": "card_declined", "type": "card_error"}},
+				"bytes":   57, "truncated": false},
+		},
+		"redacted": []string{"http.request.headers.authorization"},
+	}
+	sqlEvent := lgFixture()[2]
+	plane.script(func(p *sandboxPlane) {
+		p.ledgerEvent = func(seq string) (int, any) {
+			switch seq {
+			case "5104":
+				return 200, full
+			case "5105":
+				return 200, sqlEvent
+			default:
+				return 404, map[string]string{"detail": "no event " + seq + " in sandbox " + sbID}
+			}
+		}
+	})
+
+	t.Run("an http event renders headers and bodies", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "trace", "--body", "5104")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		if stdout != "" {
+			t.Errorf("stdout:\n%s", stdout)
+		}
+		sbInOrder(t, stderr,
+			"stripe #5104  vendor fault  POST /v1/charges → 402  3004 ms  "+lgLocal(t, lgAt2),
+			"actor: api_key acct_clinic_admin",
+			"session: 66e0a1b2.1f3a",
+			"state: 12 → 13 (mutating)",
+			"error: card_declined",
+			"fault: error flt_7",
+			"Request headers",
+			"  authorization: Bearer [redacted]",
+			"  content-type: application/x-www-form-urlencoded",
+			"Request body",
+			"  amount=2000&currency=usd",
+			"Response headers",
+			"  content-type: application/json",
+			"Response body",
+			"  {", `"code": "card_declined"`,
+		)
+		if got := plane.ledgerEventsAsked(); len(got) != 1 || got[0] != "5104" {
+			t.Errorf("the event route was asked %q", got)
+		}
+	})
+
+	t.Run("another type prints its payload", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace", "--body", "5105")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "postgres #5105  vendor handler  UPDATE 1 UPDATE invoices",
+			"Payload", `"command_tag": "UPDATE 1"`, `"protocol_phase": "execute"`)
+	})
+
+	t.Run("json is the event as it arrived", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "trace", "--body", "5104", "--json")
+		if code != 0 {
+			t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+		}
+		var row map[string]any
+		if err := json.Unmarshal([]byte(stdout), &row); err != nil {
+			t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+		}
+		if row["seq"] != float64(5104) {
+			t.Errorf("row %v", row)
+		}
+		if _, ok := row["redacted"]; !ok {
+			t.Errorf("redacted was dropped: %v", row)
+		}
+	})
+
+	t.Run("no such seq", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace", "--body", "99")
+		if code != 1 {
+			t.Fatalf("exit %d, want 1:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "✗ No ledger event 99 in sandbox "+sbID, "→ Next: veris sandbox trace")
+		// The twins were not scanned: one seq names one event, so a wrong
+		// one is said rather than hunted for.
+		if strings.Contains(stderr, "could not read the trace") {
+			t.Errorf("the per-twin scan ran anyway:\n%s", stderr)
+		}
+	})
+}
+
+func TestSandboxTraceLedgerOnlyFlagsNeedALedger(t *testing.T) {
+	twins := newTraceTwins(t)
+	twins.script(traceFixture)
+	traceBench(t, twins) // the plane's ledger routes answer 404
+	cases := [][]string{
+		{"--type", "sql"},
+		{"--plane", "world"},
+		{"--source", "sandbox"},
+		{"--session", "66e0a1b2.1f3a"},
+		{"--mutating"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			code, stdout, stderr := runSandboxCLI(t, append([]string{"sandbox", "trace"}, args...)...)
+			if code != 1 {
+				t.Fatalf("exit %d, want 1:\n%s", code, stderr)
+			}
+			sbInOrder(t, stderr, "✗ Sandbox "+sbID+" keeps no ledger:", "--mutating need one")
+			if stdout != "" {
+				t.Errorf("stdout:\n%s", stdout)
+			}
+		})
+	}
+	t.Run("the twins are still merged for the flags they can answer", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "trace", "--tier", "fault", "--since", "1")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "  Time", "Twin", "/repos/acme/app/issues", "/v1/charges")
+	})
+}
+
+func TestSandboxTraceLedgerRefusals(t *testing.T) {
+	twins := newTraceTwins(t)
+	twins.script(traceFixture)
+	traceBench(t, twins)
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"bad type", []string{"--type", "grpc"}, "--type must be http, sql, connection, delivery or world (got 'grpc')"},
+		{"bad plane", []string{"--plane", "data"}, "--plane must be vendor, control or world (got 'data')"},
+		{"both source and service", []string{"--source", "stripe", "--service", "stripe"},
+			"--source and --service both name one source; pass one"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runSandboxCLI(t, append([]string{"sandbox", "trace"}, tc.args...)...)
+			if code != 1 {
+				t.Errorf("exit %d, want 1:\n%s", code, stderr)
+			}
+			if !strings.Contains(stderr, tc.want) {
+				t.Errorf("stderr lacks %q:\n%s", tc.want, stderr)
+			}
+			if stdout != "" {
+				t.Errorf("stdout:\n%s", stdout)
+			}
+		})
+	}
+}
+
+// Every payload the ledger can carry has to read as one line of the Event
+// column: the types the fixtures above do not exercise are held here.
+func TestLedgerEventSummaryAndOutcome(t *testing.T) {
+	cases := []struct {
+		name        string
+		event       api.LedgerEvent
+		wantSummary string
+		wantOutcome string
+	}{
+		{
+			name: "an http call is its method and path",
+			event: api.LedgerEvent{Type: "http", HTTP: &api.LedgerHTTP{Method: "GET", Path: "/v1/customers"},
+				Outcome: api.LedgerOutcome{OK: true, Code: "200"}},
+			wantSummary: "GET /v1/customers", wantOutcome: "200",
+		},
+		{
+			name: "a hang has no status of its own",
+			event: api.LedgerEvent{Type: "http", HTTP: &api.LedgerHTTP{Method: "POST", Path: "/v1/charges"},
+				Outcome: api.LedgerOutcome{Fault: &api.LedgerFault{Kind: "hang", ID: "flt_7"}}},
+			wantSummary: "POST /v1/charges", wantOutcome: "hang",
+		},
+		{
+			name: "a statement is folded to one line and cut",
+			event: api.LedgerEvent{Type: "sql", SQL: &api.LedgerSQL{CommandTag: "SELECT 3",
+				Statement: "SELECT id,\n       status\n  FROM invoices\n WHERE tenant = $1 AND status = $2 AND created_at > $3"},
+				Outcome: api.LedgerOutcome{OK: true}},
+			wantSummary: "SELECT 3 SELECT id, status FROM invoices WHERE tenant = $1 AND…", wantOutcome: "ok",
+		},
+		{
+			name: "a failed statement shows its sqlstate",
+			event: api.LedgerEvent{Type: "sql", SQL: &api.LedgerSQL{CommandTag: "", Statement: "INSERT INTO invoices VALUES ($1)"},
+				Outcome: api.LedgerOutcome{Code: "23505", Error: "duplicate key"}},
+			wantSummary: "INSERT INTO invoices VALUES ($1)", wantOutcome: "23505",
+		},
+		{
+			name: "a connection is its turn and its peer",
+			event: api.LedgerEvent{Type: "connection", Connection: &api.LedgerConnection{Event: "authenticated", Peer: "app@10.8.3.21"},
+				Outcome: api.LedgerOutcome{OK: true}},
+			wantSummary: "authenticated app@10.8.3.21", wantOutcome: "ok",
+		},
+		{
+			name: "a delivery is its target",
+			event: api.LedgerEvent{Type: "delivery", Delivery: &api.LedgerDelivery{Method: "POST",
+				Destination: "https://odd-forest.example/hooks/stripe", Attempt: 2},
+				Outcome: api.LedgerOutcome{Code: "500"}},
+			wantSummary: "POST https://odd-forest.example/hooks/stripe", wantOutcome: "500",
+		},
+		{
+			name: "a world event is its own name",
+			event: api.LedgerEvent{Type: "world", World: &api.LedgerWorld{Event: "reset",
+				Detail: json.RawMessage(`{"services":3}`), By: "api:reset"},
+				Outcome: api.LedgerOutcome{OK: true}},
+			wantSummary: `reset {"services":3}`, wantOutcome: "ok",
+		},
+		{
+			name:        "an outcome with nothing to say says nothing",
+			event:       api.LedgerEvent{Type: "message"},
+			wantSummary: "", wantOutcome: "—",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ledgerEventSummary(tc.event); got != tc.wantSummary {
+				t.Errorf("summary = %q, want %q", got, tc.wantSummary)
+			}
+			if got := ledgerOutcome(tc.event.Outcome); got != tc.wantOutcome {
+				t.Errorf("outcome = %q, want %q", got, tc.wantOutcome)
+			}
+			// A world event and a hang have no duration; the column says so
+			// rather than printing a zero that reads as instant.
+			row := ledgerTableRows([]api.LedgerEvent{tc.event})[0]
+			if row[len(row)-1] != "—" {
+				t.Errorf("a nil duration rendered as %q", row[len(row)-1])
+			}
+		})
+	}
 }

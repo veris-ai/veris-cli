@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -252,6 +253,20 @@ type sandboxPlane struct {
 	resets      int
 	listAll     func() (int, any) // GET /v1/sandboxes; nil → 404
 	lists       map[string]func() (int, any)
+
+	// ledger answers GET /v1/sandboxes/{id}/ledger and ledgerEvent answers
+	// /ledger/{seq}. Nil is FastAPI's answer for a route it has none for,
+	// which is what a control plane older than the ledger sends and what
+	// trace falls back to the per-twin merge on.
+	ledger      func(q url.Values) (int, any)
+	ledgerEvent func(seq string) (int, any)
+	// ledgerQueries are the raw query strings the ledger route was asked
+	// with, in order; ledgerSeqs the seqs asked of the event route.
+	ledgerQueries []string
+	ledgerSeqs    []string
+	// onLedger, when set, runs under the lock before the nth ledger read is
+	// answered (1-based), so a follow test can add events between polls.
+	onLedger func(p *sandboxPlane, n int)
 }
 
 func newSandboxPlane(t *testing.T) *sandboxPlane {
@@ -352,6 +367,31 @@ func newSandboxPlane(t *testing.T) *sandboxPlane {
 			sbJSON(w, 200, sb.Services)
 		}
 	})
+	mux.HandleFunc("GET /v1/sandboxes/{id}/ledger", func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.ledgerQueries = append(p.ledgerQueries, r.URL.RawQuery)
+		if p.onLedger != nil {
+			p.onLedger(p, len(p.ledgerQueries))
+		}
+		if p.ledger == nil {
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+			return
+		}
+		status, body := p.ledger(r.URL.Query())
+		sbJSON(w, status, body)
+	})
+	mux.HandleFunc("GET /v1/sandboxes/{id}/ledger/{seq}", func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.ledgerSeqs = append(p.ledgerSeqs, r.PathValue("seq"))
+		if p.ledgerEvent == nil {
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+			return
+		}
+		status, body := p.ledgerEvent(r.PathValue("seq"))
+		sbJSON(w, status, body)
+	})
 	mux.HandleFunc("DELETE /v1/environments/{env}/sandboxes/{id}", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -400,6 +440,20 @@ func (p *sandboxPlane) resetCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.resets
+}
+
+// ledgerAsked is every query string the ledger route was asked with, in
+// order; ledgerEventsAsked every seq asked of the single-event route.
+func (p *sandboxPlane) ledgerAsked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.ledgerQueries...)
+}
+
+func (p *sandboxPlane) ledgerEventsAsked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.ledgerSeqs...)
 }
 
 // readySandbox is sbID ready in ci with the given services.
@@ -1351,6 +1405,32 @@ func newJSONPlane(t *testing.T) *httptest.Server {
 	})
 	mux.HandleFunc("GET /v1/environments/{env}/sandboxes/{id}/clock", func(w http.ResponseWriter, r *http.Request) {
 		sbJSON(w, 200, api.SandboxClock{ID: 1, Mode: "live"})
+	})
+	// This plane keeps a ledger, so `sandbox trace --json` is held to the
+	// same one-document rule on the route it prefers.
+	mux.HandleFunc("GET /v1/sandboxes/{id}/ledger", func(w http.ResponseWriter, r *http.Request) {
+		sbJSON(w, 200, map[string]any{
+			"format": api.LedgerFormat, "sandbox_id": sbID,
+			"clock": map[string]any{"mode": "live", "world_time": "2026-03-01T09:00:00Z", "offset_seconds": 0},
+			"sources": []map[string]any{{"kind": "service", "name": "stripe", "protocol": "http",
+				"ledger": api.LedgerComplete, "last_seq": 5103, "lag_ms": 0, "error": nil}},
+			"events": []map[string]any{{
+				"seq": 5103, "id": 1,
+				"source": map[string]any{"kind": "service", "name": "stripe", "protocol": "http"},
+				"plane":  "vendor", "type": "http", "direction": "inbound", "tier": "handler",
+				"at": "2026-03-01T09:00:05.120Z", "world_time": "2026-03-01T09:00:00Z", "duration_ms": 6,
+				"session": nil,
+				"actor":   map[string]any{"credential": "api_key", "ref": "acct_1"},
+				"state":   map[string]any{"before": 3, "after": 3, "mutating": false},
+				"outcome": map[string]any{"ok": true, "code": "200", "fault": nil, "error": nil},
+				"http": map[string]any{"method": "GET", "path": "/v1/customers/cus_1",
+					"query": map[string]any{}, "op": nil,
+					"request":  map[string]any{"bytes": 0, "truncated": false},
+					"response": map[string]any{"status": 200, "bytes": 812, "truncated": false}},
+			}},
+			"page": map[string]any{"order": "time", "dir": "desc", "limit": 50, "count": 1,
+				"has_more": false, "next_cursor": nil, "watermark_seq": 5103},
+		})
 	})
 
 	twin := "/s/" + sbID + "/stripe/veris/"

@@ -299,6 +299,37 @@ the clock live; it is refused (409) for a sandbox booted from a snapshot or a
 promoted baseline, because that world is an image, and the CLI prints the
 allowed move: `veris down && veris up`.
 
+### What it saw: `sandbox trace`
+
+`sandbox trace [--source NAME|sandbox] [--type http|sql|connection|delivery|world]
+[--plane vendor|control|world] [--session ID] [--mutating] [--tier
+handler|fault|control|delivery] [--limit N] [--since SEQ] [--follow] [--body
+SEQ]` prints the sandbox's **ledger**: one time-ordered stream of everything
+the sandbox saw — every request its twins answered, every statement its data
+planes ran, and the sandbox's own world events (a reset, a clock change, a
+capture) — read from `GET /v1/sandboxes/{id}/ledger`, newest first.
+
+Every event carries a **seq** that is sandbox-wide, so one number names one
+event wherever it came from: `--since SEQ` keeps what is above one and `--body
+SEQ` prints that event's request and response whole (`/ledger/{seq}`, headers
+and bodies included; every other payload prints as it is stored). The filters
+combine, and a source that keeps no ledger of its own — a twin from an image
+older than the ledger — is a `!` line, not a failed read: the rest of the
+stream is still printed.
+
+`--follow` polls every 2 s and prints what arrived, oldest first, until
+Ctrl-C. Each poll drains: a burst that spans several pages is read to the end
+and printed as one batch, and only then does the watermark advance — so
+nothing is printed twice and nothing is skipped, including events the filters
+kept out of the batch.
+
+A control plane that keeps no ledger is read the old way instead: `GET
+/veris/requests` on every twin (or `--service NAME`), merged here, where
+`--since` and `--body` are per-twin row ids rather than one sandbox-wide seq.
+The ledger-only flags say so on such a plane rather than quietly answering a
+wider question. `run`'s own receipt is unchanged: it counts per twin, from
+each twin's own trace.
+
 ### Working against it: `up --proxy`
 
 `veris up --proxy` does not stop at a routable sandbox. It opens a shell
