@@ -138,16 +138,19 @@ type dataTwins struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 
-	counts    map[string]int              // the HTTP twins' GET /veris/data counts, singletons included
-	version   int                         // their state_version
-	health    int                         // the HTTP twins' GET /veris/health status (0 → 200)
-	rows      map[string][]map[string]any // rows per table, newest first
-	addStatus int                         // POST /veris/data status (0 → 200)
-	adds      []string                    // twins that received a POST /veris/data, in order
-	edits     []dataEdit                  // every PATCH and DELETE /veris/data, in order
-	queries   []string                    // raw query of every GET /veris/data with an entity_type
-	seeds     []string                    // schema_sql of every POST /veris/seed
-	pgData404 bool                        // postgres GET /veris/data is FastAPI's 404 rather than the singletons
+	counts     map[string]int              // the HTTP twins' GET /veris/data counts, singletons included
+	countReads int                         // how many bare GET /veris/data the HTTP twins answered
+	countDelay time.Duration               // how long each bare GET /veris/data takes to answer
+	addDelay   time.Duration               // how long each POST /veris/data takes to answer
+	version    int                         // their state_version
+	health     int                         // the HTTP twins' GET /veris/health status (0 → 200)
+	rows       map[string][]map[string]any // rows per table, newest first
+	addStatus  int                         // POST /veris/data status (0 → 200)
+	adds       []string                    // twins that received a POST /veris/data, in order
+	edits      []dataEdit                  // every PATCH and DELETE /veris/data, in order
+	queries    []string                    // raw query of every GET /veris/data with an entity_type
+	seeds      []string                    // schema_sql of every POST /veris/seed
+	pgData404  bool                        // postgres GET /veris/data is FastAPI's 404 rather than the singletons
 }
 
 // dataEdit is one PATCH or DELETE of /veris/data as the twin received it.
@@ -201,6 +204,24 @@ func newDataTwins(t *testing.T) *dataTwins {
 		sbJSON(w, 200, map[string]any{"manual": stripeManual})
 	})
 	mux.HandleFunc(prefix+"{twin}/veris/data", func(w http.ResponseWriter, r *http.Request) {
+		// A slow count or add sleeps before taking the lock, so the other
+		// requests around it are answered meanwhile, as a twin would.
+		f.mu.Lock()
+		delay := time.Duration(0)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("entity_type") == "":
+			delay = f.countDelay
+		case r.Method == http.MethodPost:
+			delay = f.addDelay
+		}
+		f.mu.Unlock()
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if r.PathValue("twin") == "postgres" {
@@ -215,6 +236,7 @@ func newDataTwins(t *testing.T) *dataTwins {
 		case http.MethodGet:
 			entity := r.URL.Query().Get("entity_type")
 			if entity == "" {
+				f.countReads++
 				sbJSON(w, 200, map[string]any{"counts": f.counts, "state_version": f.version})
 				return
 			}
@@ -243,7 +265,7 @@ func newDataTwins(t *testing.T) *dataTwins {
 				}
 			}
 			f.version++
-			sbJSON(w, 200, map[string]any{"added": added, "warnings": []string{}})
+			sbJSON(w, 200, map[string]any{"added": added, "warnings": []string{}, "state_version": f.version})
 		case http.MethodPatch, http.MethodDelete:
 			var body struct {
 				Data map[string]any `json:"data"`
@@ -305,6 +327,12 @@ func (f *dataTwins) script(fn func(f *dataTwins)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fn(f)
+}
+
+func (f *dataTwins) countsRead() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.countReads
 }
 
 func (f *dataTwins) addedTo() []string {

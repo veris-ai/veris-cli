@@ -125,6 +125,16 @@ func TestEveryRouteSendsWhatTheTwinExpects(t *testing.T) {
 			want:   &Write{Added: map[string]int{"customers": 1}, Warnings: []string{"faults[0]: never fires"}},
 		},
 		{
+			name: "add carries the state_version a twin sends back",
+			call: func(c *Client) (any, error) {
+				return c.Add(ctx, map[string]any{"customers": []any{map[string]any{"id": "cus_1"}}})
+			},
+			method: "POST", path: "/s/sbx_1/stripe/veris/data",
+			body:   `{"data":{"customers":[{"id":"cus_1"}]}}`,
+			answer: `{"added":{"customers":1},"state_version":15}`,
+			want:   &Write{Added: map[string]int{"customers": 1}, StateVersion: 15},
+		},
+		{
 			name:   "add with a nil map sends an empty object, not null",
 			call:   func(c *Client) (any, error) { return c.Add(ctx, nil) },
 			method: "POST", path: "/s/sbx_1/stripe/veris/data",

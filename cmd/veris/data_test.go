@@ -358,7 +358,119 @@ func TestSandboxDataAdd(t *testing.T) {
 		}
 	})
 
+	// fresh puts the twins back to the world the first case saw, with the
+	// count reads, adds and delays cleared.
+	fresh := func(t *testing.T) {
+		t.Helper()
+		twins.script(func(f *dataTwins) {
+			f.version, f.countReads, f.adds = 3, 0, nil
+			f.countDelay, f.addDelay = 0, 0
+			f.counts["customers"], f.counts["payment_methods"] = 41, 13
+		})
+	}
+	// quickCounts shortens the deadline each count read gets, so a twin
+	// scripted slow is slow past it without the test waiting 5 s.
+	quickCounts := func(t *testing.T) {
+		t.Helper()
+		was := countsDeadline
+		countsDeadline = 50 * time.Millisecond
+		t.Cleanup(func() { countsDeadline = was })
+	}
+	added := `{"stripe": {
+		"customers": [{"id": "cus_dev_ada", "email": "ada@example.com"}],
+		"payment_methods": [{"id": "pm_dev_visa", "customer": "cus_dev_ada"}]}}`
+
+	t.Run("--no-counts makes neither read and carries the add's own state_version", func(t *testing.T) {
+		fresh(t)
+		file := write("dev-customers.json", added)
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "add", file, "--no-counts")
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		if want := "✓ stripe: added customers 1, payment_methods 1   (state_version 4)\n"; !strings.Contains(stderr, want) {
+			t.Errorf("want %q in:\n%s", want, stderr)
+		}
+		if got := twins.countsRead(); got != 0 {
+			t.Errorf("count reads = %d, want none", got)
+		}
+		if got := twins.addedTo(); len(got) != 1 || got[0] != "stripe" {
+			t.Errorf("adds = %v, want one to stripe", got)
+		}
+	})
+
+	t.Run("--quiet makes neither read, and prints nothing for a landed add", func(t *testing.T) {
+		fresh(t)
+		file := write("dev-customers.json", added)
+		code, stdout, stderr := runSandboxCLI(t, "-q", "sandbox", "data", "add", file)
+		if code != 0 || stdout != "" || stderr != "" {
+			t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+		}
+		if got := twins.countsRead(); got != 0 {
+			t.Errorf("count reads = %d, want none", got)
+		}
+		if got := twins.addedTo(); len(got) != 1 || got[0] != "stripe" {
+			t.Errorf("adds = %v, want one to stripe", got)
+		}
+	})
+
+	t.Run("a count that outlasts its deadline drops the totals and keeps the add", func(t *testing.T) {
+		fresh(t)
+		quickCounts(t)
+		twins.script(func(f *dataTwins) { f.countDelay = 2 * time.Second })
+		file := write("dev-customers.json", added)
+		start := time.Now()
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "add", file)
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		if want := "✓ stripe: added customers 1, payment_methods 1   (state_version 4)\n"; !strings.Contains(stderr, want) {
+			t.Errorf("want %q in:\n%s", want, stderr)
+		}
+		if strings.Contains(stderr, "✗") || strings.Contains(stderr, "cannot reach") {
+			t.Errorf("a slow count is not a failed add:\n%s", stderr)
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Errorf("the add waited %s on its counts; each read has 50 ms", took)
+		}
+		if got := twins.addedTo(); len(got) != 1 || got[0] != "stripe" {
+			t.Errorf("adds = %v, want one to stripe", got)
+		}
+	})
+
+	t.Run("a count that answers in time still prints the totals", func(t *testing.T) {
+		fresh(t)
+		quickCounts(t)
+		twins.script(func(f *dataTwins) { f.countDelay = 5 * time.Millisecond })
+		file := write("dev-customers.json", added)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "add", file)
+		if want := "✓ stripe: added customers 1, payment_methods 1   (state_version 3 → 4; customers now 42, payment_methods 14)\n"; code != 0 || !strings.Contains(stderr, want) {
+			t.Errorf("exit %d, want %q in:\n%s", code, want, stderr)
+		}
+		if got := twins.countsRead(); got != 2 {
+			t.Errorf("count reads = %d, want one before and one after", got)
+		}
+	})
+
+	t.Run("--timeout bounds the POST itself", func(t *testing.T) {
+		fresh(t)
+		twins.script(func(f *dataTwins) { f.addDelay = 300 * time.Millisecond })
+		file := write("dev-customers.json", added)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "add", file, "--no-counts", "--timeout", "50ms")
+		if code != 1 || !strings.Contains(stderr, "✗ Failed to add to stripe: cannot reach the twin at ") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+		code, _, stderr = runSandboxCLI(t, "sandbox", "data", "add", file, "--no-counts", "--timeout", "2s")
+		if code != 0 || !strings.Contains(stderr, "✓ stripe: added customers 1, payment_methods 1") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+		code, _, stderr = runSandboxCLI(t, "sandbox", "data", "add", file, "--timeout", "0")
+		if code != 1 || !strings.Contains(stderr, "veris: --timeout must be positive (got 0s)") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
 	t.Run("a refusal is printed reason by reason and stops the run", func(t *testing.T) {
+		fresh(t)
 		twins.script(func(f *dataTwins) { f.addStatus = 422; f.adds = nil })
 		defer twins.script(func(f *dataTwins) { f.addStatus = 0 })
 		file := write("bad.json", `{"stripe": {"customers": [{"id": 1}]}, "zendesk": {"tickets": [{"id": "t_1"}]}}`)

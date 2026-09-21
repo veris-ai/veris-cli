@@ -120,13 +120,16 @@ type Rows struct {
 }
 
 // Write is what the three /veris/data writes return: the per-table counts
-// under the key that names the verb, and any warnings the write raised
-// (a fault row that will never fire, a clock moved backwards).
+// under the key that names the verb, any warnings the write raised (a
+// fault row that will never fire, a clock moved backwards), and the
+// state_version the write left behind when the twin says it; 0 when it
+// does not.
 type Write struct {
-	Added    map[string]int `json:"added,omitempty"`
-	Updated  map[string]int `json:"updated,omitempty"`
-	Deleted  map[string]int `json:"deleted,omitempty"`
-	Warnings []string       `json:"warnings,omitempty"`
+	Added        map[string]int `json:"added,omitempty"`
+	Updated      map[string]int `json:"updated,omitempty"`
+	Deleted      map[string]int `json:"deleted,omitempty"`
+	Warnings     []string       `json:"warnings,omitempty"`
+	StateVersion int            `json:"state_version,omitempty"`
 }
 
 // ResetRequest chooses what world replaces the current one. At most one of

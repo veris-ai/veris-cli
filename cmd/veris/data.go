@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/veris-ai/veris-cli/internal/api"
@@ -26,14 +27,26 @@ const (
 	schemaLineWidth = 90
 	// cellWidth is where one cell of a row listing is cut.
 	cellWidth = 40
+	// defaultAddTimeout bounds one POST /veris/data of `data add`. A bulk
+	// add of a large file legitimately runs for minutes, well past the
+	// twin client's 30 s default.
+	defaultAddTimeout = 10 * time.Minute
 )
+
+// countsDeadline bounds each of the two bare GET /veris/data reads `data
+// add` makes around its POST, for the "customers now N" parenthetical. On
+// a twin with a million rows a count takes longer than the add itself, so
+// a read past this is dropped rather than failing an add that landed. A
+// variable so tests can shorten it.
+var countsDeadline = 5 * time.Second
 
 // sandboxDataCommand is `veris sandbox data …`: schemas, rows, and adding,
 // editing and removing your own data in a running sandbox.
 func sandboxDataCommand() *cli.Command {
 	var schemaID, schemaTable, getID, addID, setID, deleteID string
 	var limit, offset int
-	var all bool
+	var all, noCounts bool
+	var addTimeout time.Duration
 	return &cli.Command{
 		Name:    "data",
 		Summary: "A sandbox's data: schema, get, add, set, delete",
@@ -108,20 +121,31 @@ func sandboxDataCommand() *cli.Command {
 			{
 				Name:    "add",
 				Summary: "Add rows of your own from files keyed by twin name",
-				Usage:   "veris sandbox data add FILE… [--id ID]",
+				Usage:   "veris sandbox data add FILE… [--id ID] [--no-counts] [--timeout D]",
 				Help: "Each FILE is {twin: {table: [rows]}}; a postgres twin takes {\"sql\": PATH} instead, with PATH\n" +
 					"relative to the project directory as in up's data files. Every twin validates its rows and\n" +
 					"answers with what it added; a refusal is printed reason by reason and stops the run, with\n" +
 					"nothing applied for that twin. Rows are additive: keep them with veris snapshot create or\n" +
-					"veris baseline promote.",
+					"veris baseline promote.\n" +
+					"\n" +
+					"The success line ends with the twin's state_version before and after and the new totals of\n" +
+					"the tables written, from a count of every table read before and after the add. Counting a\n" +
+					"large twin is slower than the add itself, so each read gets 5 s and the line then carries\n" +
+					"only what the add answered; --no-counts (or --quiet) skips the reads outright. The POST is\n" +
+					"given --timeout (default 10m): a bulk add runs for minutes.",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&addID, "id", "", "sandbox id (default: this folder's)")
+					fs.BoolVar(&noCounts, "no-counts", false, "do not read table counts before and after the add")
+					fs.DurationVar(&addTimeout, "timeout", defaultAddTimeout, "how long one twin may take to add a file's rows")
 				},
 				Run: func(ctx *cli.Context, args []string) error {
 					if len(args) == 0 {
 						return errors.New("sandbox data add needs at least one FILE")
 					}
-					return dataAdd(ctx, addID, args)
+					if addTimeout <= 0 {
+						return fmt.Errorf("--timeout must be positive (got %s)", addTimeout)
+					}
+					return dataAdd(ctx, addID, args, noCounts || ctx.Globals.Quiet, addTimeout)
 				},
 			},
 			{
@@ -914,17 +938,40 @@ func cellText(v any) string {
 //
 //	✓ stripe: added customers 1, payment_methods 1   (state_version 14 → 15; customers now 41, payment_methods 13)
 //
+// The parenthetical comes from a count of every table read before and
+// after the POST. Those reads are bookkeeping, not the add: each is bounded
+// by countsDeadline and one that does not make it leaves the line with
+// what the POST itself answered (its added counts, and its state_version
+// when the twin sends one). skipCounts, from --no-counts or --quiet, makes
+// neither read. timeout bounds each POST: a bulk add of a large file runs
+// for minutes, and the twin client's 30 s default would cut it off with
+// "cannot reach the twin" while the twin went on committing the rows.
+//
 // A twin's refusal (422) is printed reason by reason and stops the run:
 // nothing was applied for that twin, and the twins after it are untouched.
 // FILE is as given, relative to the working directory; a {"sql": PATH}
 // inside it resolves as up resolves the same file: against the project
 // directory, or the file's own directory when no project is loaded.
-func dataAdd(ctx *cli.Context, idFlag string, files []string) error {
+func dataAdd(ctx *cli.Context, idFlag string, files []string, skipCounts bool, timeout time.Duration) error {
 	s, _, sb, err := openSandboxServices(ctx, idFlag)
 	if err != nil {
 		return err
 	}
 	bg := context.Background()
+	// counts is one bounded, best-effort read: nil when skipped, and nil
+	// when the read did not make it, which writeDelta takes as no reading.
+	counts := func(tw *twin.Client) *twin.Counts {
+		if skipCounts {
+			return nil
+		}
+		cctx, cancel := context.WithTimeout(bg, countsDeadline)
+		defer cancel()
+		c, err := tw.Counts(cctx)
+		if err != nil {
+			return nil
+		}
+		return c
+	}
 	for _, file := range files {
 		raw, err := os.ReadFile(file)
 		if err != nil {
@@ -951,6 +998,7 @@ func dataAdd(ctx *cli.Context, idFlag string, files []string) error {
 				return printed(1)
 			}
 			tw := s.twin(svc.ControlURL)
+			tw.HTTP.Timeout = timeout
 			data := byTwin[name]
 			if sqlRef, ok := data["sql"].(string); ok {
 				sql, err := os.ReadFile(projectPath(refDir, sqlRef))
@@ -963,7 +1011,7 @@ func dataAdd(ctx *cli.Context, idFlag string, files []string) error {
 				s.ui.Success("%s: seeded %s (%d bytes)", name, sqlRef, len(sql))
 				continue
 			}
-			before, _ := tw.Counts(bg)
+			before := counts(tw)
 			w, err := tw.Add(bg, data)
 			if err != nil {
 				return s.fail("add", "to "+name, err)
@@ -971,11 +1019,24 @@ func dataAdd(ctx *cli.Context, idFlag string, files []string) error {
 			for _, warn := range w.Warnings {
 				s.ui.Warn("%s: %s", name, warn)
 			}
-			after, _ := tw.Counts(bg)
-			s.ui.Success("%s: added %s%s", name, countsLine(w.Added), addDelta(w.Added, before, after))
+			after := counts(tw)
+			s.ui.Success("%s: added %s%s", name, countsLine(w.Added), writeDelta(w, before, after))
 		}
 	}
 	return nil
+}
+
+// writeDelta is addDelta when both count reads made it, and otherwise the
+// one thing the write itself said about the world after it: its
+// state_version, when the twin sends one, and nothing when it does not.
+func writeDelta(w *twin.Write, before, after *twin.Counts) string {
+	if before != nil && after != nil {
+		return addDelta(w.Added, before, after)
+	}
+	if w.StateVersion == 0 {
+		return ""
+	}
+	return fmt.Sprintf("   (state_version %d)", w.StateVersion)
 }
 
 // addDelta is the parenthetical after a write: the state_version before and
