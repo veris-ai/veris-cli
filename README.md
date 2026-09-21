@@ -986,6 +986,15 @@ Stop writers while collecting pages: this is not an atomic snapshot. A changed
 total, stalled page, or failed request fails the command without emitting a
 partial JSON array. Filter the complete array locally to count rows from a run.
 
+### Adding rows to a large twin
+
+`veris sandbox data add FILE` reads every table's count before and after its
+POST to print `state_version a → b; customers now N`. On a twin with a million
+rows that count is slower than the add, so each read is given 5 s and a slower
+one leaves the line with what the POST answered; `--no-counts` (or `--quiet`)
+skips both reads. The POST itself has `--timeout` (default `10m`) because a
+bulk add legitimately runs for minutes.
+
 ### Import file bodies
 
 `veris sandbox files import google-drive ./pdfs --owner OWNER --prefix Corpus`
