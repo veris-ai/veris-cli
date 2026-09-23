@@ -527,10 +527,26 @@ func snapshotList(ctx *cli.Context) error {
 	rows := make([][]string, 0, len(snaps))
 	for _, sn := range snaps {
 		rows = append(rows, []string{"  " + sn.ID, dashIfBlank(sn.Name), sn.RevisionID, sn.ClockRestore,
-			sizeText(sn.SizeBytes), shortID(sn.SourceSandbox), sn.CreatedAt.Local().Format("2006-01-02 15:04")})
+			sizeText(sn.SizeBytes), shortID(sn.SourceSandbox), sn.CreatedAt.Local().Format("2006-01-02 15:04"),
+			defaultMark(sn.IsDefault)})
 	}
-	s.ui.Table([]string{"  ID", "Name", "Revision", "Clock", "Size", "Source", "Created"}, rows)
+	s.ui.Table([]string{"  ID", "Name", "Revision", "Clock", "Size", "Source", "Created", "Default"}, rows)
 	return nil
+}
+
+// defaultMark is the Default column: which snapshot a plain `veris up` boots.
+func defaultMark(isDefault bool) string {
+	if isDefault {
+		return "yes"
+	}
+	return "—"
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
 }
 
 func dashIfBlank(v string) string {
@@ -561,6 +577,7 @@ func snapshotGet(ctx *cli.Context, ref string) error {
 	s.ui.Info("Size:        %s", sizeText(sn.SizeBytes))
 	s.ui.Info("Source:      sandbox %s", sn.SourceSandbox)
 	s.ui.Info("Created:     %s", stampOf(sn.CreatedAt))
+	s.ui.Info("Default:     %s", yesNo(sn.IsDefault))
 	s.ui.Next("veris up --snapshot " + sn.ID)
 	return nil
 }
