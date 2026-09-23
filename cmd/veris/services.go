@@ -254,14 +254,15 @@ func isSingleton(table string) bool {
 // twinTables is one twin's row counts from the bare GET /veris/data with the
 // singletons hidden, and the state_version the read carried. A twin with no
 // control URL, no rows route, or nothing but the singletons is the data
-// plane: nil counts and no error. An error is a twin that did not answer.
-func twinTables(ctx context.Context, s *session, svc api.ServiceInfo) (map[string]int, int, error) {
+// plane: nil counts and no error. An error is a twin that did not answer
+// within timeout.
+func twinTables(ctx context.Context, s *session, svc api.ServiceInfo, timeout time.Duration) (map[string]int, int, error) {
 	if svc.ControlURL == "" {
 		return nil, 0, nil
 	}
-	pctx, cancel := context.WithTimeout(ctx, twinProbeTimeout)
+	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	counts, err := s.twin(svc.ControlURL).Counts(pctx)
+	counts, err := boundedTwin(s, svc.ControlURL, timeout).Counts(pctx)
 	if errors.Is(err, twin.ErrNotSupported) {
 		return nil, 0, nil
 	}
@@ -319,8 +320,8 @@ type serviceRow struct {
 	err error
 }
 
-func readServiceRow(ctx context.Context, s *session, svc api.ServiceInfo) serviceRow {
-	tables, version, err := twinTables(ctx, s, svc)
+func readServiceRow(ctx context.Context, s *session, svc api.ServiceInfo, timeout time.Duration) serviceRow {
+	tables, version, err := twinTables(ctx, s, svc, timeout)
 	row := serviceRow{ServiceInfo: svc, Tables: tables, StateVersion: version, err: err}
 	if err != nil {
 		row.Error = err.Error()
@@ -357,7 +358,7 @@ func servicesList(ctx *cli.Context, idFlag string) error {
 	bg := context.Background()
 	rows := make([]serviceRow, 0, len(sb.Services))
 	for _, svc := range sb.Services {
-		rows = append(rows, readServiceRow(bg, s, svc))
+		rows = append(rows, readServiceRow(bg, s, svc, twinProbeTimeout))
 	}
 	if s.ctx.Globals.JSON {
 		return printJSON(s.ctx.Stdout, rows)
@@ -410,7 +411,7 @@ func servicesGet(ctx *cli.Context, idFlag, name string) error {
 		return err
 	}
 	bg := context.Background()
-	row := readServiceRow(bg, s, *svc)
+	row := readServiceRow(bg, s, *svc, twinProbeTimeout)
 	if s.ctx.Globals.JSON {
 		return printJSON(s.ctx.Stdout, row)
 	}
