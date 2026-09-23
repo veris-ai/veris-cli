@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,11 @@ const (
 	// add of a large file legitimately runs for minutes, well past the
 	// twin client's 30 s default.
 	defaultAddTimeout = 10 * time.Minute
+	// defaultReadTimeout bounds each GET /veris/data of `data get`: one
+	// twin's counts, or one page of a table. It is not status's 5 s probe:
+	// a twin whose world lives in a real engine counts it there, and that
+	// can take seconds on a large world while the twin is perfectly well.
+	defaultReadTimeout = 30 * time.Second
 )
 
 // countsDeadline bounds each of the two bare GET /veris/data reads `data
@@ -46,7 +52,7 @@ func sandboxDataCommand() *cli.Command {
 	var schemaID, schemaTable, getID, addID, setID, deleteID string
 	var limit, offset int
 	var all, noCounts bool
-	var addTimeout time.Duration
+	var addTimeout, getTimeout time.Duration
 	return &cli.Command{
 		Name:    "data",
 		Summary: "A sandbox's data: schema, get, add, set, delete",
@@ -85,12 +91,13 @@ func sandboxDataCommand() *cli.Command {
 			{
 				Name:    "get",
 				Summary: "Row counts per table, or a page of one table's rows",
-				Usage:   "veris sandbox data get [NAME [TABLE]] [--limit N] [--offset N | --all] [--id ID] [--json]",
+				Usage:   "veris sandbox data get [NAME [TABLE]] [--limit N] [--offset N | --all] [--timeout D] [--id ID] [--json]",
 				Flags: func(fs *flag.FlagSet) {
 					fs.StringVar(&getID, "id", "", "sandbox id (default: this folder's)")
 					fs.IntVar(&limit, "limit", defaultDataLimit, "rows per page (1..1000)")
 					fs.IntVar(&offset, "offset", 0, "rows to skip")
 					fs.BoolVar(&all, "all", false, "read every page; stop writers while reading")
+					fs.DurationVar(&getTimeout, "timeout", defaultReadTimeout, "how long one twin may take to answer each read")
 				},
 				Run: func(ctx *cli.Context, args []string) error {
 					if len(args) > 2 {
@@ -108,6 +115,9 @@ func sandboxDataCommand() *cli.Command {
 					if limit <= 0 {
 						return fmt.Errorf("--limit must be positive (got %d)", limit)
 					}
+					if getTimeout <= 0 {
+						return fmt.Errorf("--timeout must be positive (got %s)", getTimeout)
+					}
 					name, table := "", ""
 					if len(args) > 0 {
 						name = args[0]
@@ -115,7 +125,7 @@ func sandboxDataCommand() *cli.Command {
 					if len(args) > 1 {
 						table = args[1]
 					}
-					return dataGet(ctx, getID, name, table, limit, offset, all)
+					return dataGet(ctx, getID, name, table, limit, offset, all, getTimeout)
 				},
 			},
 			{
@@ -724,7 +734,7 @@ func printTableSchema(s *session, svc api.ServiceInfo, doc *schemaDoc, table str
 
 // dataGet is counts per table for every twin (or the named one), or with a
 // TABLE the newest rows of that table.
-func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, all bool) error {
+func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, all bool, timeout time.Duration) error {
 	s, _, sb, err := openSandboxServices(ctx, idFlag)
 	if err != nil {
 		return err
@@ -735,7 +745,7 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, al
 		if err != nil {
 			return err
 		}
-		return dataRows(bg, s, *svc, table, limit, offset, all)
+		return dataRows(bg, s, *svc, table, limit, offset, all, timeout)
 	}
 	targets := sb.Services
 	if name != "" {
@@ -747,14 +757,14 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, al
 	}
 	rows := make([]serviceRow, 0, len(targets))
 	for _, svc := range targets {
-		rows = append(rows, readServiceRow(bg, s, svc))
+		rows = append(rows, readServiceRow(bg, s, svc, timeout))
 	}
 	if s.ctx.Globals.JSON {
 		// A twin that did not answer has no counts to print; null on stdout
 		// would read as a data-plane twin, so the failure is said instead.
 		for _, r := range rows {
 			if r.err != nil {
-				return s.fail("read", "tables of "+r.Name, r.err)
+				return s.fail("read", "tables of "+r.Name, slowRead(r.err, timeout))
 			}
 		}
 		if name != "" {
@@ -768,6 +778,9 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, al
 	}
 	for _, r := range rows {
 		switch {
+		case r.err != nil && isTimeout(r.err):
+			s.ui.Warn("%s did not answer within %s; a large twin can take longer", r.Name, timeout)
+			s.ui.Next(fmt.Sprintf("veris sandbox data get %s --timeout %s", r.Name, longerTimeout(timeout)))
 		case r.err != nil:
 			s.ui.Warn("%s did not answer: %v", r.Name, r.err)
 		case r.Tables == nil:
@@ -784,25 +797,81 @@ func dataGet(ctx *cli.Context, idFlag, name, table string, limit, offset int, al
 	return nil
 }
 
+// boundedTwin is a twin client whose own HTTP cap is no shorter than
+// timeout: the client's 30 s default would otherwise cut a longer --timeout
+// short with a less helpful error.
+func boundedTwin(s *session, controlURL string, timeout time.Duration) *twin.Client {
+	tw := s.twin(controlURL)
+	if tw.HTTP != nil && timeout > tw.HTTP.Timeout {
+		tw.HTTP.Timeout = timeout
+	}
+	return tw
+}
+
+// isTimeout is a read that ran out of time — its context's deadline or the
+// HTTP client's own cap — rather than one the twin refused or never took.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// slowRead turns a read that ran out of time into one that says so and names
+// the flag that allows more; every other error is returned as it is.
+func slowRead(err error, timeout time.Duration) error {
+	if err == nil || !isTimeout(err) {
+		return err
+	}
+	return fmt.Errorf("no answer within %s; a large twin can take longer, retry with --timeout %s", timeout, longerTimeout(timeout))
+}
+
+// longerTimeout is the --timeout the retry hint suggests: four times the one
+// that ran out, at least two minutes, written the way a person types it
+// ("2m", "90s", "1h") rather than Go's "2m0s".
+func longerTimeout(timeout time.Duration) string {
+	next := 4 * timeout
+	if next < 2*time.Minute {
+		next = 2 * time.Minute
+	}
+	text := next.Round(time.Second).String()
+	if strings.HasSuffix(text, "m0s") {
+		text = strings.TrimSuffix(text, "0s")
+	}
+	if strings.HasSuffix(text, "h0m") {
+		text = strings.TrimSuffix(text, "0m")
+	}
+	return text
+}
+
 // dataRows prints one page of a table as a table whose columns are the
 // rows' keys in the schema's order with id first. The order is the twin's
 // own: GET /veris/data takes a table, a limit and an offset, and no sort,
 // so a row written a moment ago may be on any page. To see what a run just
 // sent, read the trace, which is ordered.
-func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string, limit, offset int, all bool) error {
+func dataRows(ctx context.Context, s *session, svc api.ServiceInfo, table string, limit, offset int, all bool, timeout time.Duration) error {
 	if svc.ControlURL == "" {
 		s.ui.Fail("%s has no control URL to read rows through (data plane; query it with your own client at %s)", svc.Name, svc.URL)
 		return printed(1)
 	}
-	tw := s.twin(svc.ControlURL)
-	page, err := tw.Rows(ctx, table, limit, offset)
+	tw := boundedTwin(s, svc.ControlURL, timeout)
+	// Each page gets the whole timeout: --all on a large table is many
+	// reads, and one budget across all of them would cut off a healthy twin.
+	readPage := func(at int) (*twin.Rows, error) {
+		pctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		page, err := tw.Rows(pctx, table, limit, at)
+		return page, slowRead(err, timeout)
+	}
+	page, err := readPage(offset)
 	if err != nil {
 		return s.fail("read", fmt.Sprintf("table %s of %s", table, svc.Name), err)
 	}
 	if all {
 		for len(page.Rows) < page.Total {
 			nextOffset := len(page.Rows)
-			next, err := tw.Rows(ctx, table, limit, nextOffset)
+			next, err := readPage(nextOffset)
 			if err != nil {
 				return s.fail("read", fmt.Sprintf("table %s of %s at offset %d", table, svc.Name, nextOffset), err)
 			}

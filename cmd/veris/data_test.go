@@ -326,6 +326,86 @@ func TestSandboxDataGet(t *testing.T) {
 	})
 }
 
+// TestSandboxDataGetTimeout pins that data get waits on a slow twin for its
+// own --timeout (30 s by default), not status's short probe, and that a read
+// which still runs out of time says so and names the flag.
+func TestSandboxDataGetTimeout(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newDataTwins(t)
+	dataBench(t, plane, twins.services())
+	// status's probe is shortened far below the twin's delay: a data get
+	// that still used it would fail every case below that expects success.
+	was := twinProbeTimeout
+	twinProbeTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { twinProbeTimeout = was })
+	slow := func(t *testing.T, counts, rows time.Duration) {
+		t.Helper()
+		twins.script(func(f *dataTwins) { f.countDelay, f.rowsDelay = counts, rows })
+		t.Cleanup(func() { twins.script(func(f *dataTwins) { f.countDelay, f.rowsDelay = 0, 0 }) })
+	}
+
+	t.Run("a slow twin's counts are read past the status probe", func(t *testing.T) {
+		slow(t, 200*time.Millisecond, 0)
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe")
+		if code != 0 || stdout != "" || !strings.Contains(stderr, "stripe  (state_version 3)\n") {
+			t.Errorf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+	})
+
+	t.Run("counts that outlast --timeout name the flag", func(t *testing.T) {
+		slow(t, 2*time.Second, 0)
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe", "--timeout", "50ms")
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		sbInOrder(t, stderr,
+			"! stripe did not answer within 50ms; a large twin can take longer\n",
+			"→ Next: veris sandbox data get stripe --timeout 2m\n")
+		code, stdout, stderr = runSandboxCLI(t, "sandbox", "data", "get", "stripe", "--timeout", "50ms", "--json")
+		if code != 1 || stdout != "" || !strings.Contains(stderr, "✗ Failed to read tables of stripe: no answer within 50ms; a large twin can take longer, retry with --timeout 2m\n") {
+			t.Errorf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+	})
+
+	t.Run("a page that outlasts --timeout names the flag", func(t *testing.T) {
+		slow(t, 0, 2*time.Second)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe", "customers", "--timeout", "50ms")
+		if code != 1 || !strings.Contains(stderr, "✗ Failed to read table customers of stripe: no answer within 50ms; a large twin can take longer, retry with --timeout 2m\n") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("a slow page within --timeout is read", func(t *testing.T) {
+		slow(t, 0, 100*time.Millisecond)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "get", "stripe", "customers", "--timeout", "5s")
+		if code != 0 || !strings.Contains(stderr, "stripe.customers · 2 of 41 rows\n") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("--timeout must be positive", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "data", "get", "--timeout", "0s")
+		if code != 1 || !strings.Contains(stderr, "veris: --timeout must be positive (got 0s)") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("the retry hint is a longer timeout, written as typed", func(t *testing.T) {
+		for in, want := range map[time.Duration]string{
+			50 * time.Millisecond: "2m",
+			30 * time.Second:      "2m",
+			45 * time.Second:      "3m",
+			100 * time.Second:     "6m40s",
+			20 * time.Minute:      "1h20m",
+			time.Hour:             "4h",
+		} {
+			if got := longerTimeout(in); got != want {
+				t.Errorf("longerTimeout(%s) = %q, want %q", in, got, want)
+			}
+		}
+	})
+}
+
 func TestSandboxDataAdd(t *testing.T) {
 	plane := newSandboxPlane(t)
 	twins := newDataTwins(t)

@@ -986,6 +986,12 @@ Stop writers while collecting pages: this is not an atomic snapshot. A changed
 total, stalled page, or failed request fails the command without emitting a
 partial JSON array. Filter the complete array locally to count rows from a run.
 
+Each read of `data get` — one twin's counts, or one page — waits up to
+`--timeout` (default `30s`), not the 5 s `status` probes with: a twin whose
+world lives in a real engine can take seconds to count a large one. A read
+that still runs out says `did not answer within 30s` and suggests a longer
+`--timeout`.
+
 ### Adding rows to a large twin
 
 `veris sandbox data add FILE` reads every table's count before and after its

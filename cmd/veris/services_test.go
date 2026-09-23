@@ -141,6 +141,7 @@ type dataTwins struct {
 	counts     map[string]int              // the HTTP twins' GET /veris/data counts, singletons included
 	countReads int                         // how many bare GET /veris/data the HTTP twins answered
 	countDelay time.Duration               // how long each bare GET /veris/data takes to answer
+	rowsDelay  time.Duration               // how long each GET /veris/data?entity_type=… takes to answer
 	addDelay   time.Duration               // how long each POST /veris/data takes to answer
 	version    int                         // their state_version
 	health     int                         // the HTTP twins' GET /veris/health status (0 → 200)
@@ -211,6 +212,8 @@ func newDataTwins(t *testing.T) *dataTwins {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Query().Get("entity_type") == "":
 			delay = f.countDelay
+		case r.Method == http.MethodGet:
+			delay = f.rowsDelay
 		case r.Method == http.MethodPost:
 			delay = f.addDelay
 		}
