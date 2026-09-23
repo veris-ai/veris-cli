@@ -38,6 +38,9 @@ type EnvironmentBaseline struct {
 	RevisionID    string `json:"revision_id"`
 	PromotedAt    Time   `json:"promoted_at"`
 	SourceSandbox string `json:"source_sandbox"`
+	// SnapshotID is the snapshot this default is; empty from a control
+	// plane that does not link the two, or for a pin no snapshot names.
+	SnapshotID string `json:"snapshot_id,omitempty"`
 }
 
 // Environment is a named set of services; sandboxes are deployed from it.
@@ -134,6 +137,8 @@ func (u SandboxUpdate) MarshalJSON() ([]byte, error) {
 type PromoteRequest struct {
 	ClockRestore             string `json:"clock_restore,omitempty"`
 	KeepExternalDestinations bool   `json:"keep_external_destinations"`
+	// Name labels the snapshot the promote records.
+	Name string `json:"name,omitempty"`
 }
 
 // PromoteResponse is what a promote returns: the pinned baseline plus what
@@ -146,6 +151,9 @@ type PromoteResponse struct {
 	SizeBytes            int64               `json:"size_bytes"`
 	CuratorClockRestored bool                `json:"curator_clock_restored"`
 	Scrubbed             map[string][]string `json:"scrubbed"`
+	// Snapshot is the snapshot the promote recorded and pinned; nil from a
+	// control plane that records none.
+	Snapshot *Snapshot `json:"snapshot,omitempty"`
 }
 
 // Snapshot is a captured sandbox world kept beside its environment
@@ -160,6 +168,8 @@ type Snapshot struct {
 	SourceSandbox string `json:"source_sandbox"`
 	ClockRestore  string `json:"clock_restore"`
 	SizeBytes     int64  `json:"size_bytes"`
+	// IsDefault marks the snapshot the environment boots when none is named.
+	IsDefault bool `json:"is_default"`
 }
 
 // CreateSnapshotRequest is POST /v1/environments/{id}/snapshots' body.

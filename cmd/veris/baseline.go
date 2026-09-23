@@ -23,6 +23,7 @@ import (
 func baselineCommand() *cli.Command {
 	var promote captureOptions
 	var keepSource bool
+	var promoteName string
 	return &cli.Command{
 		Name:    "baseline",
 		Summary: "What every new sandbox boots: get, promote, set, clear, list",
@@ -45,19 +46,20 @@ func baselineCommand() *cli.Command {
 			{
 				Name:    "promote",
 				Summary: "Capture a sandbox and pin it as the baseline",
-				Usage:   "veris baseline promote [--sandbox ID] [--clock-restore today|frozen|rebase] [--keep-external] [--keep-source] [--timeout 1800s] [--request-id ID] [--yes] [--json]",
+				Usage:   "veris baseline promote [--name NAME] [--sandbox ID] [--clock-restore today|frozen|rebase] [--keep-external] [--keep-source] [--timeout 1800s] [--request-id ID] [--yes] [--json]",
 				Help: "Tracks a durable capture operation when supported by the API. Reuse --request-id after\n" +
 					"an interrupted wait. Terminal failures retain the source. Older APIs use legacy capture\n" +
 					"and baseline polling. Use --keep-source until a fresh boot has verified the saved data.",
 				Flags: func(fs *flag.FlagSet) {
 					promote.bind(fs)
 					fs.BoolVar(&keepSource, "keep-source", false, "keep the captured sandbox (it is left frozen and scrubbed)")
+					fs.StringVar(&promoteName, "name", "", "label for the snapshot the promote records")
 				},
 				Run: func(ctx *cli.Context, args []string) error {
 					if err := noPositionals(ctx, args); err != nil {
 						return err
 					}
-					return baselinePromote(ctx, promote, keepSource)
+					return baselinePromote(ctx, promote, keepSource, promoteName)
 				},
 			},
 			{
@@ -192,6 +194,7 @@ func printBaseline(s *session, env *api.Environment) {
 	b := env.Baseline
 	s.ui.Info("Baseline of %s (%s)", baselineName(s, env), shortID(env.ID))
 	s.ui.Info("Revision:  %s", dashIfBlank(b.RevisionID))
+	s.ui.Info("Snapshot:  %s", dashIfBlank(b.SnapshotID))
 	s.ui.Info("Image:     %s", b.Image)
 	s.ui.Info("Promoted:  %s", stampOf(b.PromotedAt))
 	s.ui.Info("Source:    sandbox %s", dashIfBlank(b.SourceSandbox))
@@ -202,7 +205,7 @@ func printBaseline(s *session, env *api.Environment) {
 // baselinePromote captures the sandbox and pins the image as its
 // environment's baseline, reading the pin back when the answer is lost,
 // then deletes the frozen source unless asked to keep it.
-func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool) error {
+func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool, snapshotName string) error {
 	timeout, err := parseUpTimeout(o.timeout)
 	if err != nil {
 		return err
@@ -242,7 +245,7 @@ func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool) error 
 	}
 
 	start := time.Now()
-	req := api.PromoteRequest{ClockRestore: o.clockRestore, KeepExternalDestinations: o.keepExternal}
+	req := api.PromoteRequest{Name: snapshotName, ClockRestore: o.clockRestore, KeepExternalDestinations: o.keepExternal}
 	var resp *api.PromoteResponse
 	var pinned *api.EnvironmentBaseline
 	call := captureCall{
@@ -250,7 +253,7 @@ func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool) error 
 		pollFor: fmt.Sprintf("GET /v1/environments/%s for baseline.source_sandbox=%s", envID, shortID(id)),
 		post: func(ctx context.Context) error {
 			var result api.PromoteResponse
-			if supported, err := durableCapture(ctx, s, envID, api.CaptureRequest{SandboxID: id, Kind: "promote", RequestID: o.requestID, ClockRestore: o.clockRestore, KeepExternalDestinations: o.keepExternal}, &result); supported {
+			if supported, err := durableCapture(ctx, s, envID, api.CaptureRequest{SandboxID: id, Kind: "promote", RequestID: o.requestID, Name: snapshotName, ClockRestore: o.clockRestore, KeepExternalDestinations: o.keepExternal}, &result); supported {
 				resp = &result
 				return err
 			}
@@ -287,6 +290,9 @@ func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool) error 
 		s.ui.Success("Baseline pinned: %s (clock_restore %s, promoted %s, %s)",
 			revisionOf(pinned, ""), clock, hhmmss(pinned.PromotedAt), elapsedText(time.Since(start)))
 		s.ui.Detail("%s", pinned.Image)
+		if pinned.SnapshotID != "" {
+			s.ui.Detail("snapshot %s", pinned.SnapshotID)
+		}
 		s.ui.Detail("scrub details unavailable: the load balancer dropped the response")
 	} else {
 		pinned = &resp.Baseline
@@ -298,6 +304,9 @@ func baselinePromote(ctx *cli.Context, o captureOptions, keepSource bool) error 
 			revisionOf(pinned, ""), sizeText(resp.SizeBytes), resp.ClockRestore,
 			hhmmss(pinned.PromotedAt), elapsedText(time.Since(start)), restored)
 		s.ui.Detail("%s", pinned.Image)
+		if resp.Snapshot != nil {
+			s.ui.Detail("snapshot %s", resp.Snapshot.ID)
+		}
 		printScrubbed(s.ui, resp.Scrubbed, o.keepExternal)
 		if !resp.CuratorClockRestored {
 			s.ui.Warn("the source sandbox %s could not be handed its clock back; it stays frozen with delivery paused", id)
