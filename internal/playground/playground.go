@@ -1,7 +1,8 @@
 // Package playground is the CLI's client for a bench Playground's screen:
 // the bench API's world-ssh routes that redeem a one-time connect code and
-// issue desktop tickets, and the WebSocket that carries the desktop's RFB
-// stream.
+// issue desktop tickets, and the WebSocket that carries a Mac desktop's RFB
+// stream. A Windows desktop's ticket is a base URL for Amazon DCV instead,
+// which package dcvrelay relays.
 //
 // The bench API is a different service from the control plane the rest of
 // the CLI talks to, and nothing here reads a login, profile or API key: the
@@ -100,13 +101,29 @@ type Session struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
-// Ticket admits one WebSocket connection to the desktop relay at URL, for
-// about a minute. Ticket is a secret and is never printed.
+// The desktop protocols a screen ticket can be for.
+const (
+	// ProtocolRFB is a Mac's screen: one WebSocket per viewer carrying RFB.
+	// A bench API that names no protocol means this one.
+	ProtocolRFB = "rfb"
+	// ProtocolDCV is a Windows desktop's Amazon DCV server, reached under
+	// BaseURL by as many WebSockets and resource requests as the client makes.
+	ProtocolDCV = "dcv"
+)
+
+// Ticket admits the desktop. For ProtocolRFB it admits one WebSocket
+// connection to the desktop relay at URL, for about a minute. For
+// ProtocolDCV it admits every request under BaseURL until ExpiresAt. Ticket
+// and BaseURL are secrets and are never printed.
 type Ticket struct {
+	Protocol    string `json:"protocol"`
 	Ticket      string `json:"ticket"`
 	URL         string `json:"url"`
 	Subprotocol string `json:"subprotocol"`
-	ExpiresAt   string `json:"expires_at"`
+	// BaseURL, for ProtocolDCV, ends in "/"; a DCV client's request path,
+	// without its leading "/", is appended to it.
+	BaseURL   string `json:"base_url"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 // Redeem exchanges a one-time connect code for a session. A 404 is an
@@ -124,7 +141,8 @@ func (c *Client) Redeem(ctx context.Context, code string) (*Session, error) {
 	return &s, nil
 }
 
-// ScreenTicket asks for a fresh desktop ticket under token. A 401 matches
+// ScreenTicket asks for a fresh desktop ticket under token. Its Protocol is
+// always set: ProtocolRFB when the bench API names none. A 401 matches
 // ErrTokenRejected; a 404 or 409 matches ErrSessionEnded.
 func (c *Client) ScreenTicket(ctx context.Context, token string) (*Ticket, error) {
 	var t Ticket
@@ -136,11 +154,24 @@ func (c *Client) ScreenTicket(ctx context.Context, token string) (*Ticket, error
 	if err != nil {
 		return nil, err
 	}
-	if t.URL == "" || t.Ticket == "" {
-		return nil, errors.New("the bench API issued a desktop ticket with no url or ticket")
-	}
-	if t.Subprotocol == "" {
-		t.Subprotocol = Subprotocol
+	switch t.Protocol {
+	case "", ProtocolRFB:
+		t.Protocol = ProtocolRFB
+		if t.URL == "" || t.Ticket == "" {
+			return nil, errors.New("the bench API issued a desktop ticket with no url or ticket")
+		}
+		if t.Subprotocol == "" {
+			t.Subprotocol = Subprotocol
+		}
+	case ProtocolDCV:
+		if !strings.HasPrefix(t.BaseURL, "https://") && !strings.HasPrefix(t.BaseURL, "http://") {
+			return nil, errors.New("the bench API issued a DCV ticket with no http(s) base_url")
+		}
+		if !strings.HasSuffix(t.BaseURL, "/") {
+			t.BaseURL += "/"
+		}
+	default:
+		return nil, fmt.Errorf("the bench API issued a ticket for desktop protocol %q, which this veris does not speak: update veris", t.Protocol)
 	}
 	return &t, nil
 }
