@@ -356,7 +356,7 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 				"  veris run       [--fresh]",
 				"  snapshot     Recorded worlds: create, list, get, delete\n",
 				"  baseline     What every new sandbox boots: get, promote, set, clear, list\n",
-				"  playground   A bench Playground's cloud Mac, from this machine: screen\n",
+				"  playground   A bench Playground's cloud Mac or Windows desktop, from this machine: screen\n",
 				"veris snapshot,\nveris baseline",
 			},
 			stderrNone: true,
