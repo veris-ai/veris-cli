@@ -62,6 +62,7 @@ type fakeBench struct {
 	mu        sync.Mutex
 	protocols []string // the Sec-WebSocket-Protocol the relay was dialled with
 	auth      []string // the Authorization of each screen-ticket request
+	queries   []string // the query string of each screen-ticket request
 	agent     string   // the User-Agent of the connect request
 }
 
@@ -86,6 +87,7 @@ func (f *fakeBench) handler() http.Handler {
 	mux.HandleFunc("POST /v1/world-ssh/screen-ticket", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.auth = append(f.auth, r.Header.Get("Authorization"))
+		f.queries = append(f.queries, r.URL.RawQuery)
 		f.mu.Unlock()
 		if f.tickets.Add(1) > 1 {
 			writeJSON(w, f.ticketStatus, map[string]string{"detail": "the session was closed from the console"})
@@ -222,11 +224,13 @@ func viewer33(t *testing.T, addr, password string) []byte {
 // A connect code redeems, a Screen Sharing-shaped viewer is let in with the
 // one-time password and receives the desktop's ServerInit through the
 // relay, and when the session ends the next viewer's ticket is refused and
-// the command exits 0 saying so. The token and ticket are never printed.
+// the command exits 0 saying so. The token and ticket are never printed. A
+// bench API that names no protocols is asked for none.
 func TestPlaygroundScreenRelaysAViewerUntilTheSessionEnds(t *testing.T) {
 	var opened atomic.Value
 	openViewer = func(u string) error { opened.Store(u); return nil }
-	t.Cleanup(func() { openViewer = openInBrowser })
+	clientOS = "darwin"
+	t.Cleanup(func() { openViewer, clientOS = openWithDefaultApp, runtime.GOOS })
 
 	f := &fakeBench{t: t, connectStatus: http.StatusOK, ticketStatus: http.StatusConflict}
 	api := httptest.NewServer(f.handler())
@@ -274,14 +278,15 @@ func TestPlaygroundScreenRelaysAViewerUntilTheSessionEnds(t *testing.T) {
 	if len(f.auth) != 2 || f.auth[0] != "Bearer "+fakeToken || f.auth[1] != "Bearer "+fakeToken {
 		t.Errorf("screen-ticket Authorization %q, want the session token as Bearer on each", f.auth)
 	}
+	if strings.Join(f.queries, "") != "" {
+		t.Errorf("screen-ticket queries %q, want none for a bench API that names no protocols", f.queries)
+	}
 	if f.agent != "veris/"+version {
 		t.Errorf("User-Agent %q, want veris/%s", f.agent, version)
 	}
-	if runtime.GOOS == "darwin" {
-		port := addr[strings.LastIndex(addr, ":")+1:]
-		if got, _ := opened.Load().(string); got != "vnc://:"+password+"@localhost:"+port {
-			t.Errorf("opened %q, want Screen Sharing at vnc://:<password>@localhost:%s", got, port)
-		}
+	port := addr[strings.LastIndex(addr, ":")+1:]
+	if got, _ := opened.Load().(string); got != "vnc://:"+password+"@localhost:"+port {
+		t.Errorf("opened %q, want Screen Sharing at vnc://:<password>@localhost:%s", got, port)
 	}
 }
 

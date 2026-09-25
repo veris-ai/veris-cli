@@ -71,7 +71,7 @@ func TestScreenTicketRefusals(t *testing.T) {
 			w.WriteHeader(status)
 			_, _ = io.WriteString(w, `{"detail":"desktop not ready"}`)
 		}))
-		_, err := New(srv.URL, "").ScreenTicket(context.Background(), "tok")
+		_, err := New(srv.URL, "").ScreenTicket(context.Background(), "tok", "")
 		srv.Close()
 		var e *Error
 		if !errors.Is(err, want) || !errors.As(err, &e) || e.Detail != "desktop not ready" {
@@ -109,6 +109,18 @@ func TestScreenTicketProtocols(t *testing.T) {
 			body: `{"protocol":"dcv","base_url":"https://b/dcv/t"}`,
 			want: Ticket{Protocol: ProtocolDCV, BaseURL: "https://b/dcv/t/"},
 		},
+		{
+			name: "rdp",
+			body: `{"protocol":"rdp","ticket":"tkt_1","url":"wss://b/rdp","subprotocol":"veris-rdp","expires_at":"x","username":".\\vp-abc123","password":"pw_1"}`,
+			want: Ticket{Protocol: ProtocolRDP, Ticket: "tkt_1", URL: "wss://b/rdp", Subprotocol: SubprotocolRDP, ExpiresAt: "x", Username: `.\vp-abc123`, Password: "pw_1"},
+		},
+		{
+			name: "rdp without its subprotocol",
+			body: `{"protocol":"rdp","ticket":"tkt_1","url":"wss://b/rdp","username":"u","password":"p"}`,
+			want: Ticket{Protocol: ProtocolRDP, Ticket: "tkt_1", URL: "wss://b/rdp", Subprotocol: SubprotocolRDP, Username: "u", Password: "p"},
+		},
+		{name: "rdp without a password", body: `{"protocol":"rdp","ticket":"tkt_1","url":"wss://b/rdp","username":"u"}`, err: "no username or password"},
+		{name: "rdp without a ticket", body: `{"protocol":"rdp","url":"wss://b/rdp","username":"u","password":"p"}`, err: "no url or ticket"},
 		{name: "dcv without a base url", body: `{"protocol":"dcv"}`, err: "base_url"},
 		{name: "rfb without a ticket", body: `{"protocol":"rfb","url":"wss://b/desktop"}`, err: "no url or ticket"},
 		{name: "unknown", body: `{"protocol":"spice"}`, err: `"spice"`},
@@ -119,7 +131,7 @@ func TestScreenTicketProtocols(t *testing.T) {
 				_, _ = io.WriteString(w, c.body)
 			}))
 			defer srv.Close()
-			got, err := New(srv.URL, "").ScreenTicket(context.Background(), "tok")
+			got, err := New(srv.URL, "").ScreenTicket(context.Background(), "tok", "")
 			if c.err != "" {
 				if err == nil || !strings.Contains(err.Error(), c.err) {
 					t.Errorf("ScreenTicket = %+v, %v; want an error naming %s", got, err, c.err)
@@ -130,5 +142,44 @@ func TestScreenTicketProtocols(t *testing.T) {
 				t.Errorf("ScreenTicket = %+v, %v; want %+v", got, err, c.want)
 			}
 		})
+	}
+}
+
+// A protocol asked for rides the query string; none asked for sends none,
+// which an older bench API never sees.
+func TestScreenTicketAsksForAProtocol(t *testing.T) {
+	for _, protocol := range []string{"", ProtocolRDP} {
+		var query string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			query = r.URL.RawQuery
+			_, _ = io.WriteString(w, `{"protocol":"rdp","ticket":"t","url":"wss://b/rdp","username":"u","password":"p"}`)
+		}))
+		_, err := New(srv.URL, "").ScreenTicket(context.Background(), "tok", protocol)
+		srv.Close()
+		want := ""
+		if protocol != "" {
+			want = "protocol=" + protocol
+		}
+		if err != nil || query != want {
+			t.Errorf("protocol %q: query %q, %v; want %q", protocol, query, err, want)
+		}
+	}
+}
+
+// A connect code redeems for the protocols the session offers, primary
+// first; an older bench API names none.
+func TestRedeemReadsTheOfferedProtocols(t *testing.T) {
+	for body, want := range map[string][]string{
+		`{"token":"tok","protocols":["dcv","rfb","rdp"]}`: {"dcv", "rfb", "rdp"},
+		`{"token":"tok"}`: nil,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		s, err := New(srv.URL, "").Redeem(context.Background(), "vpc_1")
+		srv.Close()
+		if err != nil || strings.Join(s.Protocols, ",") != strings.Join(want, ",") || (want == nil) != (s.Protocols == nil) {
+			t.Errorf("%s: Protocols %q, %v; want %q", body, s.Protocols, err, want)
+		}
 	}
 }

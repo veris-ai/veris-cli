@@ -1,8 +1,8 @@
 // Package playground is the CLI's client for a bench Playground's screen:
 // the bench API's world-ssh routes that redeem a one-time connect code and
-// issue desktop tickets, and the WebSocket that carries a Mac desktop's RFB
-// stream. A Windows desktop's ticket is a base URL for Amazon DCV instead,
-// which package dcvrelay relays.
+// issue desktop tickets, and the WebSocket that carries a desktop's RFB (VNC)
+// or RDP stream. A Windows desktop's DCV ticket is a base URL for Amazon DCV
+// instead, which package dcvrelay relays.
 //
 // The bench API is a different service from the control plane the rest of
 // the CLI talks to, and nothing here reads a login, profile or API key: the
@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -28,8 +29,12 @@ import (
 )
 
 // Subprotocol is the WebSocket subprotocol the desktop relay speaks and
-// echoes back.
+// echoes back for RFB.
 const Subprotocol = "veris-desktop"
+
+// SubprotocolRDP is the WebSocket subprotocol the desktop relay speaks and
+// echoes back for RDP.
+const SubprotocolRDP = "veris-rdp"
 
 // maxBody bounds what is read of any answer; every real one is a few
 // hundred bytes.
@@ -99,22 +104,29 @@ type Session struct {
 	SessionID string `json:"session_id"`
 	Token     string `json:"token"`
 	ExpiresAt string `json:"expires_at"`
+	// Protocols are the desktop protocols the session can open, its primary
+	// first. A bench API that predates the choice sends none: nil.
+	Protocols []string `json:"protocols"`
 }
 
 // The desktop protocols a screen ticket can be for.
 const (
-	// ProtocolRFB is a Mac's screen: one WebSocket per viewer carrying RFB.
-	// A bench API that names no protocol means this one.
+	// ProtocolRFB is a VNC server's screen: one WebSocket per viewer
+	// carrying RFB. A bench API that names no protocol means this one.
 	ProtocolRFB = "rfb"
 	// ProtocolDCV is a Windows desktop's Amazon DCV server, reached under
 	// BaseURL by as many WebSockets and resource requests as the client makes.
 	ProtocolDCV = "dcv"
+	// ProtocolRDP is a Windows desktop's Remote Desktop: one WebSocket per
+	// TCP connection carrying the raw RDP stream, signed in as Username.
+	ProtocolRDP = "rdp"
 )
 
-// Ticket admits the desktop. For ProtocolRFB it admits one WebSocket
-// connection to the desktop relay at URL, for about a minute. For
-// ProtocolDCV it admits every request under BaseURL until ExpiresAt. Ticket
-// and BaseURL are secrets and are never printed.
+// Ticket admits the desktop. For ProtocolRFB and ProtocolRDP it admits one
+// WebSocket connection to the desktop relay at URL, for about a minute. For
+// ProtocolDCV it admits every request under BaseURL until ExpiresAt. Ticket,
+// BaseURL and Password are secrets; only Password is ever shown, to the
+// person who has to type it.
 type Ticket struct {
 	Protocol    string `json:"protocol"`
 	Ticket      string `json:"ticket"`
@@ -124,6 +136,10 @@ type Ticket struct {
 	// without its leading "/", is appended to it.
 	BaseURL   string `json:"base_url"`
 	ExpiresAt string `json:"expires_at"`
+	// Username and Password, for ProtocolRDP, sign in to Windows. Username
+	// is as a Remote Desktop client should be given it, e.g. `.\vp-abc123`.
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 // Redeem exchanges a one-time connect code for a session. A 404 is an
@@ -141,12 +157,18 @@ func (c *Client) Redeem(ctx context.Context, code string) (*Session, error) {
 	return &s, nil
 }
 
-// ScreenTicket asks for a fresh desktop ticket under token. Its Protocol is
-// always set: ProtocolRFB when the bench API names none. A 401 matches
-// ErrTokenRejected; a 404 or 409 matches ErrSessionEnded.
-func (c *Client) ScreenTicket(ctx context.Context, token string) (*Ticket, error) {
+// ScreenTicket asks for a fresh desktop ticket under token, for protocol or,
+// when protocol is empty, the session's primary one. Its Protocol is always
+// set: ProtocolRFB when the bench API names none. A 401 matches
+// ErrTokenRejected; a 404 or 409 matches ErrSessionEnded (a 409 is also a
+// protocol the session does not offer, in the bench API's Detail).
+func (c *Client) ScreenTicket(ctx context.Context, token, protocol string) (*Ticket, error) {
+	path := "/v1/world-ssh/screen-ticket"
+	if protocol != "" {
+		path += "?protocol=" + url.QueryEscape(protocol)
+	}
 	var t Ticket
-	err := c.post(ctx, "/v1/world-ssh/screen-ticket", token, nil, &t, map[int]error{
+	err := c.post(ctx, path, token, nil, &t, map[int]error{
 		http.StatusUnauthorized: ErrTokenRejected,
 		http.StatusNotFound:     ErrSessionEnded,
 		http.StatusConflict:     ErrSessionEnded,
@@ -163,6 +185,16 @@ func (c *Client) ScreenTicket(ctx context.Context, token string) (*Ticket, error
 		if t.Subprotocol == "" {
 			t.Subprotocol = Subprotocol
 		}
+	case ProtocolRDP:
+		if t.URL == "" || t.Ticket == "" {
+			return nil, errors.New("the bench API issued a Remote Desktop ticket with no url or ticket")
+		}
+		if t.Username == "" || t.Password == "" {
+			return nil, errors.New("the bench API issued a Remote Desktop ticket with no username or password")
+		}
+		if t.Subprotocol == "" {
+			t.Subprotocol = SubprotocolRDP
+		}
 	case ProtocolDCV:
 		if !strings.HasPrefix(t.BaseURL, "https://") && !strings.HasPrefix(t.BaseURL, "http://") {
 			return nil, errors.New("the bench API issued a DCV ticket with no http(s) base_url")
@@ -177,7 +209,7 @@ func (c *Client) ScreenTicket(ctx context.Context, token string) (*Ticket, error
 }
 
 // DialDesktop opens the desktop relay's WebSocket with t and returns it as
-// a byte stream of RFB. The ticket rides the Sec-WebSocket-Protocol header
+// a byte stream, of RFB or RDP as t says. The ticket rides the Sec-WebSocket-Protocol header
 // as the second subprotocol, after the one the relay echoes. A close code
 // of 4000 or above ends a Read with an error carrying the relay's reason.
 func (c *Client) DialDesktop(ctx context.Context, t *Ticket) (net.Conn, error) {
@@ -206,7 +238,7 @@ func (c *Client) DialDesktop(ctx context.Context, t *Ticket) (net.Conn, error) {
 		_ = ws.Close(websocket.StatusProtocolError, "unexpected subprotocol")
 		return nil, fmt.Errorf("the desktop relay answered with subprotocol %q, not %q", got, t.Subprotocol)
 	}
-	// RFB framebuffer updates arrive as messages of any size; the library's
+	// Framebuffer updates arrive as messages of any size; the library's
 	// default 32 KiB limit would cut the first large one.
 	ws.SetReadLimit(-1)
 	return &desktopConn{Conn: websocket.NetConn(context.Background(), ws, websocket.MessageBinary)}, nil

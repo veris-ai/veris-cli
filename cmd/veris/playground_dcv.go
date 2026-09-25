@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,8 +32,8 @@ const dcvResponseHeaderTimeout = time.Minute
 // the file over.
 const openConnectionFileTimeout = 10 * time.Second
 
-// openConnectionFile hands a .dcv file to the app registered for it; a
-// variable so a test never launches the DCV client.
+// openConnectionFile hands a connection file (.dcv, .rdp) to the app
+// registered for it; a variable so a test never launches a client.
 var openConnectionFile = openWithDefaultApp
 
 // serveDCV offers a Windows desktop to the Amazon DCV client: a TLS relay on
@@ -46,30 +45,16 @@ func (s *screen) serveDCV(first *playground.Ticket) error {
 	if err != nil {
 		return err
 	}
-	want := 0
-	if o.port.set {
-		want = o.port.n
-	}
-	ln, err := listenLocal(want)
+	ln, port, err := s.listen(0)
 	if err != nil {
-		return fail(u, "listen", "on 127.0.0.1", err)
+		return err
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if want != 0 && port != want {
-		u.Warn("Port %d is not available; using %d instead", want, port)
-	}
-	dir, err := os.MkdirTemp("", "veris-playground-")
+	file, remove, err := writeConnectionFile("playground.dcv", dcvrelay.ConnectionFile{Port: port}.Render())
 	if err != nil {
 		_ = ln.Close()
 		return fail(u, "write", "the DCV connection file", err)
 	}
-	defer os.RemoveAll(dir)
-	file := filepath.Join(dir, "playground.dcv")
-	body := dcvrelay.ConnectionFile{Port: port}.Render()
-	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
-		_ = ln.Close()
-		return fail(u, "write", "the DCV connection file", err)
-	}
+	defer remove()
 
 	u.Success("Playground Windows desktop on 127.0.0.1:%d (Amazon DCV)", port)
 	// Written past Quiet: it is what the DCV client's certificate prompt shows.
@@ -96,7 +81,7 @@ func (s *screen) dcvServer(first *playground.Ticket) *dcvrelay.Server {
 	return &dcvrelay.Server{
 		First: dcvTicket(first),
 		Ticket: func(ctx context.Context) (dcvrelay.Ticket, error) {
-			t, err := s.client.ScreenTicket(ctx, s.session.Token)
+			t, err := s.client.ScreenTicket(ctx, s.session.Token, s.protocol)
 			if sessionOver(err) {
 				return dcvrelay.Ticket{}, &dcvrelay.StopError{Err: err}
 			}
@@ -159,6 +144,22 @@ func announceDCV(u *ui.UI, file string, port int, noOpen bool) {
 	fmt.Fprintf(u.Out, "  Connection file: %s\n", file)
 	u.Info("Open that file in the Amazon DCV client, or connect it to 127.0.0.1:%d#%s and choose Trust & Connect.",
 		port, dcvrelay.ConsoleSession)
+}
+
+// writeConnectionFile writes body, readable by this user only, as name in a
+// directory of its own, and returns its path and what removes it.
+func writeConnectionFile(name, body string) (string, func(), error) {
+	dir, err := os.MkdirTemp("", "veris-playground-")
+	if err != nil {
+		return "", nil, err
+	}
+	remove := func() { _ = os.RemoveAll(dir) }
+	file := filepath.Join(dir, name)
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		remove()
+		return "", nil, err
+	}
+	return file, remove, nil
 }
 
 // openWithDefaultApp opens path with the application the OS has for it and
