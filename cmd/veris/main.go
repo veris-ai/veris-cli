@@ -76,7 +76,7 @@ Exit codes:
 // root is the command tree. Each group lives in its own file and is
 // registered here in the order the help lists them: login · logout · whoami ·
 // profile · env · init · up · status · down · sandbox · snapshot · baseline ·
-// run · serve · check · doctor · version · playground. run, serve and check parse
+// run · serve · check · doctor · version. run, serve and check parse
 // their own flags and answer --help
 // themselves, so they take their arguments untouched; the tree only finds
 // them -- by exact name or a unique prefix -- and prints the help that lists
@@ -103,8 +103,7 @@ func root() *cli.Command {
 			"  Keep a world veris snapshot create|list|get|delete · veris baseline get|promote|set|clear|list\n" +
 			"  Proxy        veris serve [--sandbox <id>] [--transparent] [--print-routes] · veris check\n" +
 			"               serve is the proxy as a process; at a keyboard use up --proxy\n" +
-			"  Diagnose     veris doctor [--env NAME] [--json] · veris version\n" +
-			"  Playground   veris playground screen --code CODE [--api URL]   (the bench console prints it; no login)",
+			"  Diagnose     veris doctor [--env NAME] [--json] · veris version",
 		Help: rootHelp,
 		Flags: func(fs *flag.FlagSet) {
 			fs.BoolVar(&showVersion, "version", false, "print the version and exit")
@@ -117,7 +116,6 @@ func root() *cli.Command {
 	r.Sub = append(r.Sub, snapshotCommand(), baselineCommand())
 	r.Sub = append(r.Sub, routingCommands()...)
 	r.Sub = append(r.Sub, doctorCommand(), versionCommand())
-	r.Sub = append(r.Sub, playgroundCommand())
 	// `veris` alone is a mistake, not a request for help: the usage goes to
 	// stderr and the exit is 1, so a script that forgot its command notices.
 	// --version is the one flag that makes a bare `veris` an answer.
