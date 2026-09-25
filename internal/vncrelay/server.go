@@ -2,23 +2,19 @@ package vncrelay
 
 import (
 	"context"
-	"errors"
-	"io"
 	"net"
-	"sync"
+
+	"github.com/veris-ai/veris-cli/internal/tcprelay"
 )
 
 // ErrRelayClosed is a desktop relay that ended the stream while the viewer
 // was still connected, without saying why.
-var ErrRelayClosed = errors.New("the desktop relay closed the connection")
+var ErrRelayClosed = tcprelay.ErrRelayClosed
 
 // StopError wraps an error from Server.Dial after which no later viewer can
 // be served either -- the session behind the relay has ended. Serve closes
 // the listener, disconnects every viewer and returns it.
-type StopError struct{ Err error }
-
-func (e *StopError) Error() string { return e.Err.Error() }
-func (e *StopError) Unwrap() error { return e.Err }
+type StopError = tcprelay.StopError
 
 // Server relays each viewer that connects to its listener to an upstream of
 // its own. Viewers are independent: each gets a fresh Dial.
@@ -38,97 +34,19 @@ type Server struct {
 // Serve accepts viewers on ln until ctx is done or a Dial returns a
 // *StopError, and closes ln either way. It returns nil when ctx ended it,
 // the *StopError when the session did, and an Accept failure otherwise;
-// every viewer's connection is closed before it returns.
+// every viewer's connection is closed before it returns. Each viewer and
+// its upstream complete their RFB handshakes before the streams are joined.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	ctx, cancel := context.WithCancelCause(ctx)
-	var wg sync.WaitGroup
-	defer func() {
-		cancel(nil)
-		wg.Wait()
-	}()
-	context.AfterFunc(ctx, func() { _ = ln.Close() })
-
-	for id := 1; ; id++ {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() == nil {
+	relay := &tcprelay.Server{
+		Dial: s.Dial,
+		Handshake: func(viewer, up net.Conn) error {
+			if err := UpstreamHandshake(up); err != nil {
 				return err
 			}
-			var stop *StopError
-			if errors.As(context.Cause(ctx), &stop) {
-				return stop
-			}
-			return nil
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if s.OnOpen != nil {
-				s.OnOpen(id)
-			}
-			err := s.relay(ctx, conn)
-			if s.OnClose != nil {
-				s.OnClose(id, err)
-			}
-			var stop *StopError
-			if errors.As(err, &stop) {
-				cancel(stop)
-			}
-		}()
+			return ViewerHandshake(viewer, s.Password, nil)
+		},
+		OnOpen:  s.OnOpen,
+		OnClose: s.OnClose,
 	}
-}
-
-// relay serves one viewer: a fresh upstream, both handshakes, then the two
-// streams joined until either side ends. A connection cut short because
-// Serve is stopping reports nil.
-func (s *Server) relay(ctx context.Context, viewer net.Conn) error {
-	defer viewer.Close()
-	defer context.AfterFunc(ctx, func() { _ = viewer.Close() })()
-
-	up, err := s.Dial(ctx)
-	if err != nil {
-		return err
-	}
-	defer up.Close()
-	defer context.AfterFunc(ctx, func() { _ = up.Close() })()
-
-	err = UpstreamHandshake(up)
-	if err == nil {
-		err = ViewerHandshake(viewer, s.Password, nil)
-	}
-	if err == nil {
-		err = pump(viewer, up)
-	}
-	if ctx.Err() != nil {
-		return nil
-	}
-	return err
-}
-
-// pump copies both ways until one direction ends, then closes both. What
-// the relay sent past its handshake is already waiting on up and reaches
-// the viewer first. A viewer that left is nil; a relay that ended the
-// stream is its error, or ErrRelayClosed when it gave none.
-func pump(viewer, up net.Conn) error {
-	type result struct {
-		fromRelay bool
-		err       error
-	}
-	done := make(chan result, 2)
-	go func() {
-		_, err := io.Copy(up, viewer)
-		done <- result{false, err}
-	}()
-	go func() {
-		_, err := io.Copy(viewer, up)
-		done <- result{true, err}
-	}()
-	first := <-done
-	_ = viewer.Close()
-	_ = up.Close()
-	<-done
-	if first.fromRelay && first.err == nil {
-		return ErrRelayClosed
-	}
-	return first.err
+	return relay.Serve(ctx, ln)
 }

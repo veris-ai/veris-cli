@@ -11,13 +11,16 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/veris-ai/veris-cli/internal/cli"
 	"github.com/veris-ai/veris-cli/internal/playground"
+	"github.com/veris-ai/veris-cli/internal/tcprelay"
 	"github.com/veris-ai/veris-cli/internal/ui"
 	"github.com/veris-ai/veris-cli/internal/vncrelay"
 )
@@ -29,7 +32,26 @@ const defaultScreenPort = 5901
 
 // openViewer hands a vnc:// URL to the desktop; a variable so a test never
 // launches Screen Sharing.
-var openViewer = openInBrowser
+var openViewer = openWithDefaultApp
+
+// clientOS is the OS this veris runs on, which decides the app a desktop is
+// opened in; a variable so a test can be any OS.
+var clientOS = runtime.GOOS
+
+// The --app values, and the desktop protocol each opens.
+var appProtocols = map[string]string{
+	"vnc": playground.ProtocolRFB,
+	"rdp": playground.ProtocolRDP,
+	"dcv": playground.ProtocolDCV,
+}
+
+// preferredProtocols is the order --app auto tries a session's protocols in
+// on each client OS: the app the OS has built in first.
+var preferredProtocols = map[string][]string{
+	"darwin":  {playground.ProtocolRFB, playground.ProtocolDCV, playground.ProtocolRDP},
+	"linux":   {playground.ProtocolRFB, playground.ProtocolRDP, playground.ProtocolDCV},
+	"windows": {playground.ProtocolRDP, playground.ProtocolDCV, playground.ProtocolRFB},
+}
 
 // playgroundContext is the command's lifetime: until Ctrl-C or SIGTERM.
 // A variable so a test can end the command itself.
@@ -41,6 +63,7 @@ var playgroundContext = func() (context.Context, context.CancelFunc) {
 type screenOptions struct {
 	code   string
 	api    string
+	app    string
 	port   portFlag
 	noOpen bool
 }
@@ -70,33 +93,46 @@ func (p *portFlag) Set(s string) error {
 // control plane, and the console's one-time connect code is the whole
 // credential.
 func playgroundCommand() *cli.Command {
-	o := screenOptions{port: portFlag{n: defaultScreenPort}}
+	o := screenOptions{app: "auto", port: portFlag{n: defaultScreenPort}}
 	screen := &cli.Command{
 		Name:    "screen",
-		Summary: "Open a Playground's screen: a Mac in Screen Sharing, Windows in the Amazon DCV client",
-		Usage:   "veris playground screen --code CODE [--api URL] [--port N] [--no-open]",
+		Summary: "Open a Playground's screen in a VNC viewer, Remote Desktop or the Amazon DCV client",
+		Usage:   "veris playground screen --code CODE [--api URL] [--app auto|vnc|rdp|dcv] [--port N] [--no-open]",
 		Help: `Copy the command from the Playground's Screen Share tab in the bench
 console; it carries a one-time connect code and the bench API to redeem it
 at. The code needs no login and no SSH key, and works once.
 
-A Mac's screen is offered on 127.0.0.1 only, behind a one-time password
-printed here. On macOS Screen Sharing is opened already logged in;
-elsewhere, or with --no-open, point a VNC viewer at the address printed.
-Each viewer that connects gets its own connection to the Playground.
+--app picks the app the desktop opens in. A Mac offers vnc; a Windows
+desktop offers dcv, vnc and rdp. auto, the default, picks the one this
+machine has built in: vnc on macOS and Linux, rdp (Remote Desktop) on
+Windows.
 
-A Windows desktop is offered on 127.0.0.1 only, over TLS with a certificate
-made for this run, to the Amazon DCV client (free, https://www.amazondcv.com/).
+vnc offers the screen on 127.0.0.1 only, behind a one-time password printed
+here. On macOS Screen Sharing is opened already logged in; on Linux the
+desktop's vnc:// handler (Remmina, say) is opened; elsewhere, or with
+--no-open, point a VNC viewer at the address printed.
+
+rdp offers Windows' Remote Desktop on 127.0.0.1 only, and opens it signed
+in as the Playground's user: Windows App on macOS, Remote Desktop
+Connection on Windows, FreeRDP or Remmina on Linux. The password is printed
+where the client has to be given it. While Remote Desktop is connected the
+browser view shows the Windows sign-in screen.
+
+dcv offers the desktop on 127.0.0.1 only, over TLS with a certificate made
+for this run, to the Amazon DCV client (free, https://www.amazondcv.com/).
 A connection file is written and opened in it; with --no-open, or when it
 cannot be opened, open that file in the DCV client yourself.
 
-The command runs until Ctrl-C or until the Playground session ends.
+Each client connection gets its own connection to the Playground. The
+command runs until Ctrl-C or until the Playground session ends.
 
 --code defaults to $VERIS_PLAYGROUND_CODE and --api to $VERIS_BENCH_API.
---port falls back to a free port when the one asked for is taken; a Windows
-desktop is on a free port unless --port is given.`,
+--port falls back to a free port when the one asked for is taken; rdp and
+dcv are on a free port unless --port is given.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&o.code, "code", "", "the one-time connect `CODE` from the Screen Share tab")
 			fs.StringVar(&o.api, "api", "", "the bench API's base `URL`")
+			fs.StringVar(&o.app, "app", o.app, "the `APP` to open the desktop in: auto, vnc, rdp or dcv")
 			fs.Var(&o.port, "port", "the local `PORT` to offer the screen on")
 			fs.BoolVar(&o.noOpen, "no-open", false, "print where to connect instead of opening the viewer")
 		},
@@ -120,6 +156,8 @@ desktop is on a free port unless --port is given.`,
 			return usage("--code is required: copy the command from the Playground's Screen Share tab")
 		case o.api == "":
 			return usage("--api is required (or set VERIS_BENCH_API): copy the command from the Playground's Screen Share tab")
+		case o.app != "auto" && appProtocols[o.app] == "":
+			return usage(fmt.Sprintf("--app %q is not one of auto, vnc, rdp, dcv", o.app))
 		case o.port.n < 0 || o.port.n > 65535:
 			return usage(fmt.Sprintf("--port %d is not a port", o.port.n))
 		}
@@ -131,21 +169,21 @@ desktop is on a free port unless --port is given.`,
 	return &cli.Command{
 		Name:    "playground",
 		Summary: "A bench Playground's cloud Mac or Windows desktop, from this machine: screen",
-		Usage:   "veris playground screen --code CODE [--api URL] [--port N] [--no-open]",
+		Usage:   "veris playground screen --code CODE [--api URL] [--app auto|vnc|rdp|dcv] [--port N] [--no-open]",
 		Sub:     []*cli.Command{screen},
 	}
 }
 
 // firstTicketFresh is how long the ticket asked for up front, to learn the
-// desktop's protocol, is handed to a Mac's first viewer: well inside the
-// bench API's minute, so it is still good when the viewer's dial reaches
-// the relay.
+// desktop's protocol, is handed to the first VNC or Remote Desktop
+// connection: well inside the bench API's minute, so it is still good when
+// the connection's dial reaches the relay.
 const firstTicketFresh = 30 * time.Second
 
-// playgroundScreen redeems the connect code, asks for a first ticket to
-// learn whether the desktop is a Mac's (RFB) or Windows (DCV), offers it on
-// a local port and relays until the session ends or the user stops it. A
-// session that ends is the normal way out and exits 0.
+// playgroundScreen redeems the connect code, picks the protocol --app and
+// the session's offer settle on, asks for a first ticket for it, offers the
+// desktop on a local port and relays until the session ends or the user
+// stops it. A session that ends is the normal way out and exits 0.
 func playgroundScreen(ctx *cli.Context, o screenOptions) error {
 	u := ui.New(ctx.Stderr, os.Stdin)
 	// Viewers come and go on their own goroutines; their lines must not
@@ -167,16 +205,76 @@ func playgroundScreen(ctx *cli.Context, o screenOptions) error {
 	if err != nil {
 		return fail(u, "redeem", "the connect code", err)
 	}
-	first, err := client.ScreenTicket(bg, session.Token)
+	protocol, err := chooseProtocol(o.app, clientOS, session.Protocols)
+	if err != nil {
+		u.Fail("%v", err)
+		return printed(1)
+	}
+	first, err := client.ScreenTicket(bg, session.Token, protocol)
 	fetched := time.Now()
 	if err != nil {
 		return screenEnded(u, err)
 	}
-	s := &screen{u: u, bg: bg, client: client, session: session, opts: o}
-	if first.Protocol == playground.ProtocolDCV {
+	if protocol != "" && first.Protocol != protocol {
+		u.Fail("The bench API opened %s when %s was asked for; it may be too old for --app.",
+			appName(first.Protocol), appName(protocol))
+		return printed(1)
+	}
+	s := &screen{u: u, bg: bg, client: client, session: session, opts: o, protocol: protocol}
+	switch first.Protocol {
+	case playground.ProtocolDCV:
 		return s.serveDCV(first)
+	case playground.ProtocolRDP:
+		return s.serveRDP(first, fetched)
 	}
 	return s.serveRFB(first, fetched)
+}
+
+// chooseProtocol is the protocol to ask the bench API for: the one --app
+// names, or for auto the first of the session's offer in goos's order of
+// preference. A session whose offer is unknown (an older bench API) gets
+// "" for auto, which is its primary. An app the session does not offer is
+// an error naming what it does.
+func chooseProtocol(app, goos string, offered []string) (string, error) {
+	if app != "auto" {
+		protocol := appProtocols[app]
+		if offered != nil && !slices.Contains(offered, protocol) {
+			return "", fmt.Errorf("this Playground session cannot be opened with --app %s; it offers %s", app, appNames(offered))
+		}
+		return protocol, nil
+	}
+	if len(offered) == 0 {
+		return "", nil
+	}
+	order, ok := preferredProtocols[goos]
+	if !ok {
+		order = preferredProtocols["linux"]
+	}
+	for _, p := range order {
+		if slices.Contains(offered, p) {
+			return p, nil
+		}
+	}
+	return offered[0], nil
+}
+
+// appName is the --app value that opens protocol.
+func appName(protocol string) string {
+	for app, p := range appProtocols {
+		if p == protocol {
+			return app
+		}
+	}
+	return protocol
+}
+
+// appNames lists protocols as --app values: "vnc, rdp".
+func appNames(protocols []string) string {
+	names := make([]string, len(protocols))
+	for i, p := range protocols {
+		names[i] = appName(p)
+	}
+	return strings.Join(names, ", ")
 }
 
 // screen is one `playground screen` run past the redeemed code.
@@ -186,75 +284,113 @@ type screen struct {
 	client  *playground.Client
 	session *playground.Session
 	opts    screenOptions
+	// protocol is what every ticket is asked for: "" when the bench API
+	// did not say what the session offers, so its primary.
+	protocol string
 }
 
-// serveRFB offers a Mac's screen to VNC viewers. The first viewer is given
-// first, the ticket that named the protocol, while it is fresh; every other
-// viewer asks for its own.
+// offers reports whether the session is known to offer protocol.
+func (s *screen) offers(protocol string) bool {
+	return slices.Contains(s.session.Protocols, protocol)
+}
+
+// serveRFB offers the screen to VNC viewers, each one's RFB stream relayed
+// over a WebSocket of its own.
 func (s *screen) serveRFB(first *playground.Ticket, fetched time.Time) error {
-	u, bg, client, session, o := s.u, s.bg, s.client, s.session, s.opts
+	u, o := s.u, s.opts
+	password, err := vncrelay.NewPassword(nil)
+	if err != nil {
+		return err
+	}
+	ln, port, err := s.listen(defaultScreenPort)
+	if err != nil {
+		return err
+	}
+	u.Success("Playground screen on localhost:%d", port)
+	// Written past Quiet: without it a viewer that prompts cannot connect.
+	fmt.Fprintf(u.Out, "  One-time password: %s\n", password)
+	s.announceViewer(port, password, o.noOpen)
+	u.Info("Press Ctrl-C to stop.")
+
+	onOpen, onClose := connectionEvents(u, "Viewer")
+	srv := &vncrelay.Server{
+		Password: password,
+		Dial:     s.ticketDial(first, fetched),
+		OnOpen:   onOpen,
+		OnClose:  onClose,
+	}
+	if err := srv.Serve(s.bg, ln); err != nil {
+		return screenEnded(u, err)
+	}
+	u.Info("Stopped.")
+	return nil
+}
+
+// ticketDial opens the desktop relay's WebSocket for one VNC or Remote
+// Desktop connection. The first connection is given first, the ticket that
+// named the protocol, while it is fresh; every other one asks for its own. A
+// refusal after which no ticket can be issued stops the relay.
+func (s *screen) ticketDial(first *playground.Ticket, fetched time.Time) func(context.Context) (net.Conn, error) {
 	var firstOnce sync.Once
-	takeFirst := func() (t *playground.Ticket) {
+	return func(ctx context.Context) (net.Conn, error) {
+		var t *playground.Ticket
 		firstOnce.Do(func() {
 			if time.Since(fetched) < firstTicketFresh {
 				t = first
 			}
 		})
-		return t
+		if t == nil {
+			var err error
+			t, err = s.client.ScreenTicket(ctx, s.session.Token, s.protocol)
+			if sessionOver(err) {
+				return nil, &tcprelay.StopError{Err: err}
+			}
+			if err != nil {
+				return nil, err
+			}
+			if t.Protocol != first.Protocol {
+				return nil, fmt.Errorf("the bench API switched this session's desktop to %q", t.Protocol)
+			}
+		}
+		return s.client.DialDesktop(ctx, t)
 	}
+}
 
-	password, err := vncrelay.NewPassword(nil)
-	if err != nil {
-		return err
+// connectionEvents are a relay's OnOpen and OnClose, telling the terminal
+// "<noun> 1 connected" and how it ended.
+func connectionEvents(u *ui.UI, noun string) (func(int), func(int, error)) {
+	onOpen := func(id int) { u.Info("%s %d connected", noun, id) }
+	onClose := func(id int, err error) {
+		var stop *tcprelay.StopError
+		switch {
+		case errors.As(err, &stop):
+			// Said once, when Serve returns it.
+		case err != nil:
+			u.Warn("%s %d disconnected: %v", noun, id, err)
+		default:
+			u.Info("%s %d disconnected", noun, id)
+		}
 	}
-	ln, err := listenLocal(o.port.n)
+	return onOpen, onClose
+}
+
+// listen listens on 127.0.0.1 where --port asks, or on def when it does
+// not (0: a free port), saying so when that port is taken and another is
+// used instead.
+func (s *screen) listen(def int) (net.Listener, int, error) {
+	want := def
+	if s.opts.port.set {
+		want = s.opts.port.n
+	}
+	ln, err := listenLocal(want)
 	if err != nil {
-		return fail(u, "listen", "on 127.0.0.1", err)
+		return nil, 0, fail(s.u, "listen", "on 127.0.0.1", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	if o.port.n != 0 && port != o.port.n {
-		u.Warn("Port %d is not available; using %d instead", o.port.n, port)
+	if want != 0 && port != want {
+		s.u.Warn("Port %d is not available; using %d instead", want, port)
 	}
-	u.Success("Playground screen on localhost:%d", port)
-	// Written past Quiet: without it a viewer that prompts cannot connect.
-	fmt.Fprintf(u.Out, "  One-time password: %s\n", password)
-	announceViewer(u, port, password, o.noOpen)
-	u.Info("Press Ctrl-C to stop.")
-
-	srv := &vncrelay.Server{
-		Password: password,
-		Dial: func(ctx context.Context) (net.Conn, error) {
-			t := takeFirst()
-			if t == nil {
-				var err error
-				t, err = client.ScreenTicket(ctx, session.Token)
-				if sessionOver(err) {
-					return nil, &vncrelay.StopError{Err: err}
-				}
-				if err != nil {
-					return nil, err
-				}
-			}
-			return client.DialDesktop(ctx, t)
-		},
-		OnOpen: func(id int) { u.Info("Viewer %d connected", id) },
-		OnClose: func(id int, err error) {
-			var stop *vncrelay.StopError
-			switch {
-			case errors.As(err, &stop):
-				// Said once, below, when Serve returns it.
-			case err != nil:
-				u.Warn("Viewer %d disconnected: %v", id, err)
-			default:
-				u.Info("Viewer %d disconnected", id)
-			}
-		},
-	}
-	if err := srv.Serve(bg, ln); err != nil {
-		return screenEnded(u, err)
-	}
-	u.Info("Stopped.")
-	return nil
+	return ln, port, nil
 }
 
 // sessionOver reports a ticket refusal after which no later ticket can be
@@ -279,21 +415,42 @@ func screenEnded(u *ui.UI, err error) error {
 	return fail(u, "serve", "the Playground screen", err)
 }
 
-// announceViewer opens Screen Sharing already logged in on macOS, or says
-// where to point a viewer everywhere else. The password in the URL is what
-// lets Screen Sharing skip its prompt; it is one-time and good only on
-// this machine's loopback.
-func announceViewer(u *ui.UI, port int, password string, noOpen bool) {
+// announceViewer opens a VNC viewer, or says where to point one. On macOS
+// Screen Sharing is opened already logged in: the password in the URL is
+// what lets it skip its prompt; it is one-time and good only on this
+// machine's loopback. On Linux the desktop's vnc:// handler is opened.
+// Windows has no VNC viewer built in, so it is told of Remote Desktop when
+// the session offers it.
+func (s *screen) announceViewer(port int, password string, noOpen bool) {
+	u := s.u
 	addr := "localhost:" + strconv.Itoa(port)
-	if runtime.GOOS == "darwin" && !noOpen {
-		err := openViewer("vnc://:" + password + "@" + addr)
-		if err == nil {
-			u.Info("Opening Screen Sharing…")
-			return
+	switch clientOS {
+	case "darwin":
+		if !noOpen {
+			err := openViewer("vnc://:" + password + "@" + addr)
+			if err == nil {
+				u.Info("Opening Screen Sharing…")
+				return
+			}
+			u.Warn("Could not open Screen Sharing: %v", err)
 		}
-		u.Warn("Could not open Screen Sharing: %v", err)
+		u.Info("Connect a VNC viewer (Screen Sharing, RealVNC Viewer, TigerVNC) to %s with the password above.", addr)
+	case "windows":
+		u.Info("Windows has no VNC viewer built in: connect one (TigerVNC, RealVNC Viewer) to 127.0.0.1:%d with the password above.", port)
+		if s.offers(playground.ProtocolRDP) {
+			u.Info("Or use Remote Desktop: copy a fresh command from the Screen Share tab and add --app rdp.")
+		}
+	default:
+		if !noOpen {
+			err := openViewer("vnc://127.0.0.1:" + strconv.Itoa(port))
+			if err == nil {
+				u.Info("Opening your VNC viewer…")
+				return
+			}
+			u.Warn("Could not open a VNC viewer: %v", err)
+		}
+		u.Info("Connect a VNC viewer to 127.0.0.1:%d with the password above: Remmina, or TigerVNC's vncviewer 127.0.0.1::%d", port, port)
 	}
-	u.Info("Connect a VNC viewer (Screen Sharing, RealVNC Viewer, TigerVNC) to %s with the password above.", addr)
 }
 
 // listenLocal listens on 127.0.0.1:port, or on a port the OS picks when
