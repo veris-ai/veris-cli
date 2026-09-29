@@ -171,9 +171,11 @@ func configFromSandbox(src configSources, sandboxID, via string) (*config.Config
 // overridden -- and saying so beats silently intercepting nothing.
 func applyOverridesToFileConfig(cfg *config.Config, overrides map[string][]routes.Entry) error {
 	upstreams := make(map[string]string)
+	controls := make(map[string]string)
 	for _, svc := range cfg.Services {
 		if _, seen := upstreams[svc.Name]; !seen {
 			upstreams[svc.Name] = svc.Upstream
+			controls[svc.Name] = svc.Control
 		}
 	}
 	kept := cfg.Services[:0]
@@ -193,7 +195,7 @@ func applyOverridesToFileConfig(cfg *config.Config, overrides map[string][]route
 		for _, entry := range entries {
 			cfg.Services = append(cfg.Services, config.Service{
 				Name: name, Hosts: []string{entry.Host}, Paths: entry.Paths,
-				Upstream: upstream,
+				Upstream: upstream, Control: controls[name],
 			})
 		}
 	}

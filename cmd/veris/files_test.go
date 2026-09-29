@@ -68,3 +68,19 @@ func TestSandboxFilesImportAndResume(t *testing.T) {
 		t.Fatal("acknowledged upload replayed")
 	}
 }
+
+// Older planes advertised an http control URL through an https plane; files
+// import upgrades it, and only then, on the same host.
+func TestFilesImportUpgradesOnlyItsOwnPlanesHTTPControlURL(t *testing.T) {
+	cases := []struct{ control, plane, want string }{
+		{"http://plane.test/c/sb/drive", "https://plane.test", "https://plane.test/c/sb/drive"},
+		{"https://plane.test/c/sb/drive", "https://plane.test", "https://plane.test/c/sb/drive"},
+		{"http://other.test/c/sb/drive", "https://plane.test", "http://other.test/c/sb/drive"},
+		{"http://plane.test/c/sb/drive", "http://plane.test", "http://plane.test/c/sb/drive"},
+	}
+	for _, c := range cases {
+		if got := upgradedControlURL(c.control, c.plane); got != c.want {
+			t.Errorf("upgradedControlURL(%q, %q) = %q, want %q", c.control, c.plane, got, c.want)
+		}
+	}
+}

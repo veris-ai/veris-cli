@@ -125,6 +125,13 @@ type Service struct {
 
 	// Upstream optionally overrides the derived target for this service.
 	Upstream string `json:"upstream,omitempty"`
+
+	// Control is the service's control URL, where its /veris/* lives, when
+	// the control plane served one apart from Upstream: a split sandbox
+	// serves /veris/* only at /c/<sandbox>/<service>, behind the Veris API
+	// key. Empty means the control plane lives under the data URL, as on an
+	// older sandbox.
+	Control string `json:"control,omitempty"`
 }
 
 // Load reads and validates a config file.
@@ -384,8 +391,9 @@ func (c *Config) Resolve(host, path string) (*Target, bool) {
 	return &Target{Service: best.Name, Upstream: u, Prefix: bestPrefix}, true
 }
 
-// ServiceEndpoints is each service's base URL, which is also where its
-// /veris/* control plane lives.
+// ServiceEndpoints is each service's base URL and, when the sandbox serves
+// one apart from it, its control URL. An endpoint with no ControlURL keeps
+// its /veris/* under BaseURL.
 //
 // Derived here rather than by the caller: the sandbox-and-name path shape is
 // this file's knowledge, and a second copy of it would be a second thing to
@@ -402,15 +410,25 @@ func (c *Config) ServiceEndpoints() []ServiceEndpoint {
 				"/s/" + url.PathEscape(c.SandboxID) +
 				"/" + url.PathEscape(s.Name)
 		}
-		out = append(out, ServiceEndpoint{Name: s.Name, BaseURL: raw})
+		out = append(out, ServiceEndpoint{Name: s.Name, BaseURL: raw, ControlURL: s.Control})
 	}
 	return out
 }
 
 // ServiceEndpoint names one service and where to reach it.
 type ServiceEndpoint struct {
-	Name    string
-	BaseURL string
+	Name       string
+	BaseURL    string
+	ControlURL string
+}
+
+// Control is where this endpoint's /veris/* lives: ControlURL when the
+// sandbox served one, else the data URL.
+func (e ServiceEndpoint) Control() string {
+	if e.ControlURL != "" {
+		return e.ControlURL
+	}
+	return e.BaseURL
 }
 
 // matchPath reports which of the service's prefixes claims path, and how

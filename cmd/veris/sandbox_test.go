@@ -112,6 +112,7 @@ type sandboxTwins struct {
 	healthFailures int            // stripe /veris/health answers 502 this many times first
 	healthDelay    time.Duration  // stripe /veris/health waits this long times the probe's number, so each answer is slower
 	healthCalls    int            // stripe health probes seen
+	controlCalls   int            // stripe health probes on its /c/ control URL
 	addStatus      int            // stripe POST /veris/data status (0 → 200)
 	addBody        map[string]any // what the last POST /veris/data carried
 	counts         map[string]int // stripe GET /veris/data counts
@@ -136,6 +137,14 @@ func newSandboxTwins(t *testing.T) *sandboxTwins {
 			_, _ = w.Write([]byte("<html>502 Bad Gateway</html>"))
 			return
 		}
+		sbJSON(w, 200, map[string]any{"status": "ok", "service": "stripe", "state_version": 3})
+	})
+	// A split sandbox's control URL: the api's /c/ proxy, which reaches the
+	// member in-cluster and so answers whatever the gateway is doing.
+	mux.HandleFunc("/c/"+sbID+"/stripe/veris/health", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.controlCalls++
+		f.mu.Unlock()
 		sbJSON(w, 200, map[string]any{"status": "ok", "service": "stripe", "state_version": 3})
 	})
 	mux.HandleFunc("/s/"+sbID+"/postgres/veris/health", func(w http.ResponseWriter, r *http.Request) {
@@ -687,6 +696,30 @@ func TestUpTimesOutAndKeepsTheSandbox(t *testing.T) {
 			"→ Next: veris status\n")
 		if strings.Contains(stderr, "routable  ") {
 			t.Errorf("stripe must not be reported routable:\n%s", stderr)
+		}
+	})
+
+	t.Run("a split sandbox is routable only once its data URL answers through the gateway", func(t *testing.T) {
+		plane := newSandboxPlane(t)
+		twins := newSandboxTwins(t)
+		b := sandboxBench(t, plane.srv.URL)
+		b.twoEnvs()
+		twins.script(func(f *sandboxTwins) { f.healthFailures = 1 << 30 })
+		services := twins.services(false)
+		services[0].ControlURL = twins.srv.URL + "/c/" + sbID + "/stripe"
+		plane.script(func(p *sandboxPlane) {
+			p.answer = func(int) *api.Sandbox { return readySandbox(services, time.Now().Add(time.Hour)) }
+		})
+		code, _, stderr := runSandboxCLI(t, "up", "ci", "--timeout", "200ms")
+		if code != 4 {
+			t.Errorf("exit %d, want 4 -- the control URL answering proves nothing about the gateway:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr,
+			"! Sandbox "+sbID+" is ready but not routable after 200ms (stripe: 502 from gateway); it is kept and may still come up\n")
+		twins.mu.Lock()
+		defer twins.mu.Unlock()
+		if twins.controlCalls == 0 || twins.healthCalls == 0 {
+			t.Errorf("probes: control %d, data %d; want both asked", twins.controlCalls, twins.healthCalls)
 		}
 	})
 

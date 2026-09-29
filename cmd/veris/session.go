@@ -99,9 +99,11 @@ func (s *session) plane() *api.Client {
 	return c
 }
 
-// twin returns a client for one service's control_url.
+// twin returns a client for one service's control_url, carrying the same
+// key the session sends the control plane: a split sandbox's /c/ control
+// URL is served only to it, and a legacy /s/ one ignores it.
 func (s *session) twin(controlURL string) *twin.Client {
-	return twin.New(controlURL)
+	return twin.NewWithKey(controlURL, s.res.APIKey)
 }
 
 // consoleURL is the profile's console_url without a trailing slash, or ""
@@ -120,8 +122,14 @@ func (s *session) fail(verb, noun string, err error) error {
 	// plane's key. Say where the key came from and how to stop that.
 	if status, _ := describe(err); status == http.StatusUnauthorized && s.res.APIKeySource == cfg.SourceEnv {
 		var ae *api.Error
+		var te *twin.Error
 		if errors.As(err, &ae) {
 			s.ui.Fail("%s from your shell was rejected by %s: %s", cfg.EnvAPIKey, s.res.APIBase, ae.Error())
+			s.ui.Next(fmt.Sprintf("unset %s to use profile '%s', or export a key for %s", cfg.EnvAPIKey, s.res.ProfileName, s.res.APIBase))
+			return printed(1)
+		}
+		if errors.Is(err, twin.ErrUnauthorized) && errors.As(err, &te) {
+			s.ui.Fail("%s from your shell was rejected by a twin's control URL: %s", cfg.EnvAPIKey, te.Error())
 			s.ui.Next(fmt.Sprintf("unset %s to use profile '%s', or export a key for %s", cfg.EnvAPIKey, s.res.ProfileName, s.res.APIBase))
 			return printed(1)
 		}

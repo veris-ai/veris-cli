@@ -36,6 +36,9 @@ type ingressOptions struct {
 	Token    string
 	Hostname string
 	Binary   string
+	// APIKey is the Veris API key the callback clients send, because a
+	// split sandbox's control URL refuses /veris/* without it.
+	APIKey string
 }
 
 // A remotely managed tunnel's service URL is configured in Cloudflare, so it
@@ -128,8 +131,9 @@ func startIngress(
 		// through them, and without it a --environment run gets no verdict on
 		// whether the sandbox can actually reach it.
 		for _, ep := range cfg.ServiceEndpoints() {
-			in.clients = append(in.clients, callback.New(ep.BaseURL, callback.Options{
+			in.clients = append(in.clients, callback.New(ep.Control(), callback.Options{
 				AuthValue:          os.Getenv(cfg.Upstream.AuthValueEnv),
+				APIKey:             opts.APIKey,
 				InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
 			}))
 		}
@@ -191,7 +195,7 @@ func startIngress(
 	}
 
 	in := &ingress{URL: tun.URL(), Inbound: inbound, tunnel: tun, server: srv, log: log, named: opts.Token != ""}
-	if err := in.register(ctx, cfg); err != nil {
+	if err := in.register(ctx, cfg, opts.APIKey); err != nil {
 		_ = in.Stop(context.Background())
 		return nil, err
 	}
@@ -207,7 +211,7 @@ func startIngress(
 // it. `client.default_base_url` is sandbox-wide -- one world schema shared by
 // every service -- so one service is written to rather than all of them; the
 // rest are tried only if that one cannot be reached.
-func (in *ingress) register(ctx context.Context, cfg *config.Config) error {
+func (in *ingress) register(ctx context.Context, cfg *config.Config, apiKey string) error {
 	endpoints := cfg.ServiceEndpoints()
 	if len(endpoints) == 0 {
 		return errors.New(
@@ -217,8 +221,9 @@ func (in *ingress) register(ctx context.Context, cfg *config.Config) error {
 
 	var lastErr error
 	for _, ep := range endpoints {
-		c := callback.New(ep.BaseURL, callback.Options{
+		c := callback.New(ep.Control(), callback.Options{
 			AuthValue:          os.Getenv(cfg.Upstream.AuthValueEnv),
+			APIKey:             apiKey,
 			InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify,
 		})
 		// Held before the write, not after it: a PATCH that lands and a probe

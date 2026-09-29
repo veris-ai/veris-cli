@@ -40,12 +40,11 @@ func sandboxFilesCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
-			// Older deployments advertised HTTP even through an HTTPS control plane.
-			advertised, _ := url.Parse(tw.ControlURL)
-			plane, _ := url.Parse(s.plane().Base)
-			if advertised != nil && plane != nil && advertised.Host == plane.Host && plane.Scheme == "https" {
-				advertised.Scheme = "https"
-				tw.ControlURL = advertised.String()
+			// Older deployments advertised HTTP even through an HTTPS control
+			// plane. The client is rebuilt on the upgraded URL, so its key
+			// rides the origin the uploads actually go to.
+			if upgraded := upgradedControlURL(tw.ControlURL, s.plane().Base); upgraded != tw.ControlURL {
+				tw = s.twin(upgraded)
 			}
 			if checkpoint == "" {
 				checkpoint = filepath.Join(".veris", "file-import-"+sb.ID+"-"+args[0]+".json")
@@ -67,4 +66,16 @@ func sandboxFilesCommand() *cli.Command {
 			return nil
 		},
 	}}}
+}
+
+// upgradedControlURL is controlURL on https when the plane it came from is
+// served over https on the same host, and controlURL unchanged otherwise.
+func upgradedControlURL(controlURL, planeBase string) string {
+	advertised, _ := url.Parse(controlURL)
+	plane, _ := url.Parse(planeBase)
+	if advertised == nil || plane == nil || advertised.Host != plane.Host || plane.Scheme != "https" || advertised.Scheme == "https" {
+		return controlURL
+	}
+	advertised.Scheme = "https"
+	return advertised.String()
 }

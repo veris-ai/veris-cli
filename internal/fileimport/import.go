@@ -219,9 +219,12 @@ func Run(ctx context.Context, httpClient *http.Client, o Options, progress func(
 		if err = json.Unmarshal(previous, receipt); err != nil {
 			return nil, err
 		}
-		if receipt.Version != 1 || !reflect.DeepEqual(receipt.Files, files) || receipt.Options.Source != o.Source || receipt.Options.ControlURL != o.ControlURL || receipt.Options.Owner != o.Owner || receipt.Options.Prefix != o.Prefix || receipt.Options.BatchBytes != o.BatchBytes {
+		if receipt.Version != 1 || !reflect.DeepEqual(receipt.Files, files) || receipt.Options.Source != o.Source || !sameTarget(receipt.Options.ControlURL, o.ControlURL) || receipt.Options.Owner != o.Owner || receipt.Options.Prefix != o.Prefix || receipt.Options.BatchBytes != o.BatchBytes {
 			return nil, fmt.Errorf("checkpoint does not match the source, target, or batch settings")
 		}
+		// The twin's address may have moved from /s/ to /c/ under the same
+		// target; the checkpoint follows it so the next save is current.
+		receipt.Options.ControlURL = o.ControlURL
 		if len(receipt.Pending) > 0 {
 			return receipt, fmt.Errorf("last batch outcome is unknown; reconcile the listed pending files with the service before changing the checkpoint; replay could create revisions")
 		}
@@ -322,6 +325,10 @@ func upload(ctx context.Context, c *http.Client, base *url.URL, o Options, files
 	if err != nil {
 		return nil, false, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		// The /c/ control URL refused the Veris key; nothing was imported.
+		return nil, true, fmt.Errorf("file import returned HTTP 401: control plane rejected the Veris credential; run veris login (checkpoint retained)")
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 408, fmt.Errorf("file import returned HTTP %d; checkpoint retained", resp.StatusCode)
 	}
@@ -330,4 +337,35 @@ func upload(ctx context.Context, c *http.Client, base *url.URL, o Options, files
 		return nil, false, fmt.Errorf("invalid import response; outcome unknown (checkpoint retained)")
 	}
 	return body, false, nil
+}
+
+// sameTarget reports whether two control URLs address the same twin: equal,
+// or the same host and sandbox/twin with one on the legacy /s/ data mount
+// and the other on the /c/ control proxy that replaced it -- a checkpoint
+// written before the control plane moved a sandbox's control_url still
+// names the files that twin acknowledged.
+func sameTarget(a, b string) bool {
+	a, b = strings.TrimRight(a, "/"), strings.TrimRight(b, "/")
+	if a == b {
+		return true
+	}
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil || ua.Scheme != ub.Scheme || ua.Host != ub.Host {
+		return false
+	}
+	pa, pb := strings.Split(ua.Path, "/"), strings.Split(ub.Path, "/")
+	if len(pa) != len(pb) || len(pa) < 3 {
+		return false
+	}
+	mount := len(pa) - 3
+	for i := range pa {
+		if i == mount {
+			continue
+		}
+		if pa[i] != pb[i] {
+			return false
+		}
+	}
+	return (pa[mount] == "s" || pa[mount] == "c") && (pb[mount] == "s" || pb[mount] == "c")
 }

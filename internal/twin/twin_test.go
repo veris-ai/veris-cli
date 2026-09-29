@@ -849,3 +849,198 @@ func TestNewTrimsTheTrailingSlash(t *testing.T) {
 		t.Error("New left HTTP nil")
 	}
 }
+
+// A split sandbox serves /veris/* at /c/<sandbox>/<twin> only to a caller
+// holding the Veris key, so every request -- the client's own, and one a
+// caller builds on its HTTP (a file import, a raw trace read) -- carries it
+// as X-API-Key, the header /v1 already takes.
+func TestNewWithKeySendsTheKeyOnEveryControlRequest(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("X-API-Key"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","service":"stripe"}`)
+	}))
+	defer srv.Close()
+
+	c := NewWithKey(srv.URL+"/c/sbx_1/stripe", "vsk_test")
+	if _, err := c.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, c.ControlURL+"/veris/files", strings.NewReader("zip"))
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		t.Fatalf("raw POST: %v", err)
+	}
+	resp.Body.Close()
+	if req.Header.Get("X-API-Key") != "" {
+		t.Error("the transport wrote the key into the caller's own request")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[0] != "vsk_test" || keys[1] != "vsk_test" {
+		t.Errorf("X-API-Key seen = %q, want the key on both requests", keys)
+	}
+}
+
+// The key is the user's whole credential: a redirect off the control URL's
+// origin must not carry it along.
+func TestNewWithKeyDoesNotFollowARedirectWithTheKey(t *testing.T) {
+	var elsewhere string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhere = r.Header.Get("X-API-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer other.Close()
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer control.Close()
+
+	if _, err := NewWithKey(control.URL+"/c/sbx_1/stripe", "vsk_test").Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if elsewhere != "" {
+		t.Errorf("the redirect target received X-API-Key %q", elsewhere)
+	}
+}
+
+// A client with no key sends no header, as a legacy /s/ control URL needs.
+func TestNewSendsNoKey(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Values("X-API-Key")
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer srv.Close()
+	if _, err := New(srv.URL + "/s/sbx_1/stripe").Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if len(seen) != 0 {
+		t.Errorf("X-API-Key = %q, want none", seen)
+	}
+}
+
+// The /c/ proxy's 401 is the credential, and says what to do about it,
+// rather than a bare "[401] invalid or missing API key" from a twin.
+func TestControlProxy401NamesTheLogin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"detail":"invalid or missing API key"}`)
+	}))
+	defer srv.Close()
+
+	_, err := NewWithKey(srv.URL+"/c/sbx_1/stripe", "vsk_revoked").Counts(context.Background())
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+	if errors.Is(err, ErrNotSupported) || errors.Is(err, ErrSandboxNotFound) {
+		t.Errorf("a 401 also matched a 404 sentinel: %v", err)
+	}
+	want := "[401] control plane rejected the Veris credential; run veris login (invalid or missing API key)"
+	if err.Error() != want {
+		t.Errorf("err = %q, want %q", err.Error(), want)
+	}
+}
+
+// A 401 from a legacy /s/ URL with a vendor-shaped body is the vendor's
+// catch-all refusing an unauthenticated stray path, not the Veris key.
+func TestLegacyVendor401IsNotACredentialRefusal(t *testing.T) {
+	c, _ := fakeTwin(t, http.StatusUnauthorized, `{"error":{"message":"You did not provide an API key."}}`)
+	_, err := c.Seed(context.Background(), "create table t ();")
+	if errors.Is(err, ErrUnauthorized) {
+		t.Errorf("a vendor 401 on /s/ was read as the Veris credential: %v", err)
+	}
+}
+
+// The plane's own 404 for a sandbox the key's organisation does not own is
+// not "this twin has no such route", even on a route where every other 404
+// is.
+func TestSandboxNotFoundIsNotErrNotSupported(t *testing.T) {
+	c, _ := fakeTwin(t, http.StatusNotFound, `{"detail":"sandbox not found"}`)
+	_, err := c.Operations(context.Background())
+	if !errors.Is(err, ErrSandboxNotFound) {
+		t.Fatalf("err = %v, want ErrSandboxNotFound", err)
+	}
+	if errors.Is(err, ErrNotSupported) {
+		t.Errorf("sandbox not found was reported as a missing route: %v", err)
+	}
+	_, err = c.Counts(context.Background())
+	if !errors.Is(err, ErrSandboxNotFound) || errors.Is(err, ErrNotSupported) {
+		t.Errorf("Counts err = %v, want ErrSandboxNotFound only", err)
+	}
+}
+
+func TestIsControlProxy(t *testing.T) {
+	for url, want := range map[string]bool{
+		"https://svc.dev.api.veris.ai/c/sbx_1/stripe":  true,
+		"https://svc.dev.api.veris.ai/c/sbx_1/stripe/": true,
+		"http://localhost:8080/prefix/c/sbx_1/pg":      true,
+		"https://svc.dev.api.veris.ai/s/sbx_1/stripe":  false,
+		"https://svc.dev.api.veris.ai/c/sbx_1":         false,
+		"":                                             false,
+	} {
+		if got := IsControlProxy(url); got != want {
+			t.Errorf("IsControlProxy(%q) = %v, want %v", url, got, want)
+		}
+	}
+}
+
+// A Client built as a literal with a Key still sends it.
+func TestLiteralClientWithKeySendsIt(t *testing.T) {
+	var seen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("X-API-Key")
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer srv.Close()
+	c := &Client{ControlURL: srv.URL + "/c/sbx_1/stripe", Key: "vsk_test"}
+	if _, err := c.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if seen != "vsk_test" {
+		t.Errorf("X-API-Key = %q, want vsk_test", seen)
+	}
+}
+
+type recordingTransport struct{ keys map[string]string }
+
+func (r *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.keys[req.URL.String()] = req.Header.Get("X-API-Key")
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")), Header: http.Header{}, Request: req}, nil
+}
+
+// An older plane advertises http behind an https load balancer: the upload
+// (or the redirect) goes to https on the same host and still needs the key.
+// The key never goes out in clear, nor to another host.
+func TestTheKeyFollowsAnHTTPSUpgradeOfItsOwnHostOnly(t *testing.T) {
+	base := &recordingTransport{keys: map[string]string{}}
+	send := func(scheme, host string, rawURL string) {
+		rt := &keyTransport{base: base, scheme: scheme, host: host, key: "vsk_test"}
+		req, _ := http.NewRequest(http.MethodPost, rawURL, nil)
+		if _, err := rt.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send("http", "plane.test", "https://plane.test/c/sbx_1/drive/veris/files")
+	send("http", "plane.test", "http://plane.test/c/sbx_1/drive/veris/health")
+	send("http", "plane.test", "https://elsewhere.test/c/sbx_1/drive/veris/files")
+	send("https", "plane.test", "http://plane.test/c/sbx_1/drive/veris/data")
+	want := map[string]string{
+		"https://plane.test/c/sbx_1/drive/veris/files":     "vsk_test",
+		"http://plane.test/c/sbx_1/drive/veris/health":     "vsk_test",
+		"https://elsewhere.test/c/sbx_1/drive/veris/files": "",
+		"http://plane.test/c/sbx_1/drive/veris/data":       "",
+	}
+	for u, key := range want {
+		if base.keys[u] != key {
+			t.Errorf("%s: X-API-Key = %q, want %q", u, base.keys[u], key)
+		}
+	}
+}

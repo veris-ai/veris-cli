@@ -3,6 +3,7 @@ package callback
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -159,5 +160,83 @@ func TestTheSandboxCredentialIsSentOnEveryControlPlaneCall(t *testing.T) {
 		if got := seen[call]; got != "Bearer sk_sandbox_123" {
 			t.Errorf("%s sent Authorization %q", call, got)
 		}
+	}
+}
+
+// A split sandbox's /c/ control URL serves /veris/* only to the Veris key,
+// so every call the registration makes carries it.
+func TestEveryCallCarriesTheVerisKey(t *testing.T) {
+	var keys []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Method+" "+r.Header.Get("X-API-Key"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte(`{"rows":[]}`))
+		case http.MethodPost:
+			_, _ = w.Write([]byte(`{"probe_state":"answered","base_url_revision":1,"probed_revision":1}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL+"/c/sbx_1/stripe", Options{APIKey: "vsk_test"})
+	ctx := context.Background()
+	if _, err := c.Current(ctx); err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if _, err := c.Register(ctx, "https://odd-forest.trycloudflare.com"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := c.Clear(ctx); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	for _, k := range keys {
+		if !strings.HasSuffix(k, " vsk_test") {
+			t.Errorf("request %q went out without the key", k)
+		}
+	}
+}
+
+// A refused key says so and names the login, rather than "401 Unauthorized".
+func TestRefusedKeyNamesTheLogin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"detail":"invalid or missing API key"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL+"/c/sbx_1/stripe", Options{APIKey: "vsk_revoked"})
+	_, err := c.Current(context.Background())
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("Current err = %v, want ErrUnauthorized", err)
+	}
+	if !strings.Contains(err.Error(), "control plane rejected the Veris credential; run veris login") {
+		t.Errorf("err = %q", err)
+	}
+	if err := c.Clear(context.Background()); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("Clear err = %v, want ErrUnauthorized", err)
+	}
+}
+
+// The key does not follow a redirect off the control URL's origin.
+func TestKeyDoesNotFollowARedirectOffOrigin(t *testing.T) {
+	var elsewhere string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhere = r.Header.Get("X-API-Key")
+		_, _ = w.Write([]byte(`{"rows":[]}`))
+	}))
+	defer other.Close()
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+	}))
+	defer control.Close()
+
+	if _, err := New(control.URL, Options{APIKey: "vsk_test"}).Current(context.Background()); err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if elsewhere != "" {
+		t.Errorf("redirect target received X-API-Key %q", elsewhere)
 	}
 }

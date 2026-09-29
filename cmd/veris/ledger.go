@@ -205,6 +205,8 @@ func newProof(ctx context.Context, sandboxID string, c *api.Client, overrides ma
 		p.readErr = fmt.Errorf("no API key to read sandbox %s with (log in, or set %s)", sandboxID, discovery.EnvAPIKey)
 		return p
 	}
+	// The twins' control URLs want the key that read the sandbox.
+	p.twinFor = func(controlURL string) *twin.Client { return twin.NewWithKey(controlURL, c.Key) }
 	sb, err := c.GetSandbox(ctx, sandboxID)
 	if err != nil {
 		p.readErr = err
@@ -254,6 +256,10 @@ func (p *proof) watermark(ctx context.Context, w io.Writer, quiet bool) {
 		cancel()
 		var te *twin.Error
 		switch {
+		case errors.Is(err, twin.ErrSandboxNotFound):
+			// The control plane's refusal, not the twin's: it has a log
+			// this run cannot read.
+			m.err = err
 		case errors.Is(err, twin.ErrNotSupported), errors.As(err, &te) && te.Status == http.StatusNotFound:
 			m.noLog = true
 		case err != nil:
@@ -392,51 +398,15 @@ func rejectsSinceID(err error) bool {
 }
 
 // twinRequests is GET /veris/requests with an arbitrary query, which the
-// twin client's Requests does not take: since_id is newer than it. The
-// error shape is the client's, so callers read one kind.
+// twin client's Requests does not take: since_id is newer than it. It goes
+// through the client's Get, so the credential and the error shape are the
+// client's and callers read one kind.
 func twinRequests(ctx context.Context, c *twin.Client, q url.Values) ([]twin.Request, error) {
-	endpoint := c.ControlURL + "/veris/requests?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	hc := c.HTTP
-	if hc == nil {
-		hc = http.DefaultClient
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("cannot reach the twin at %s: %w", c.ControlURL, err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read GET /veris/requests: %w", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		e := &twin.Error{Status: resp.StatusCode, Method: http.MethodGet, Path: "/veris/requests?" + q.Encode()}
-		var envelope struct {
-			Detail json.RawMessage `json:"detail"`
-		}
-		if json.Unmarshal(raw, &envelope) == nil && len(envelope.Detail) > 0 {
-			var text string
-			if json.Unmarshal(envelope.Detail, &text) == nil {
-				e.Detail = text
-			} else {
-				e.Detail = string(envelope.Detail)
-			}
-		}
-		if e.Detail = strings.TrimSpace(e.Detail); e.Detail == "" {
-			e.Detail = http.StatusText(resp.StatusCode)
-		}
-		return nil, e
-	}
 	var out struct {
 		Requests []twin.Request `json:"requests"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("GET /veris/requests answered %d with a body that is not the trace log: %w", resp.StatusCode, err)
+	if err := c.Get(ctx, "/veris/requests", q, &out); err != nil {
+		return nil, err
 	}
 	return out.Requests, nil
 }
