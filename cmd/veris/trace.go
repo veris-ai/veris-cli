@@ -190,7 +190,7 @@ func (t *traceTwin) find(ctx context.Context, id int) (*twin.Request, error) {
 // failure to report.
 func noTrace(err error) bool {
 	var te *twin.Error
-	return errors.As(err, &te) && te.Status == http.StatusNotFound
+	return errors.As(err, &te) && te.Status == http.StatusNotFound && !errors.Is(err, twin.ErrSandboxNotFound)
 }
 
 // sandboxTrace is the whole verb: resolve the sandbox, read its ledger and

@@ -3,9 +3,17 @@
 // A twin is one mock vendor service inside a sandbox. Every twin serves the
 // same small control plane -- health, the world's rows, writes, reset, the
 // request trace, its manual -- and the control plane knows nothing about
-// which vendor the twin mocks, so one client serves every twin. There is no
-// authentication: the control URL the control plane hands out is the
-// capability, and whoever holds it may read and rewrite the world.
+// which vendor the twin mocks, so one client serves every twin.
+//
+// The control URL is authenticated. A split sandbox hands out
+// https://…/c/<sandbox>/<twin>, which the control plane serves only to a
+// caller holding a Veris API key for the owning organisation, the same
+// X-API-Key every /v1 call carries; the code under test holds the data URL
+// and cannot reach it. An older sandbox still hands out its /s/ data URL as
+// the control URL, which needs no key and ignores one, so the key is sent
+// either way and one client serves both. A 401 is ErrUnauthorized and a
+// 404 naming the sandbox is ErrSandboxNotFound, both distinct from
+// ErrNotSupported.
 //
 // Two shapes of twin exist. An HTTP twin (veris_core.VerisService) serves the
 // full surface. A data-plane twin (postgres) has no HTTP vendor to mock and
@@ -46,15 +54,99 @@ import (
 type Client struct {
 	ControlURL string
 	HTTP       *http.Client
+	// Key is the Veris API key sent as X-API-Key on every request. It is
+	// never written to a log or an error.
+	Key string
 }
 
-// New builds a client for one twin. A trailing slash on the URL is dropped
-// so the paths join cleanly.
+// New builds a client for one twin with no credential, which reaches only a
+// legacy /s/ control URL. A trailing slash on the URL is dropped so the
+// paths join cleanly.
 func New(controlURL string) *Client {
-	return &Client{
-		ControlURL: strings.TrimSuffix(controlURL, "/"),
-		HTTP:       &http.Client{Timeout: 30 * time.Second, Transport: direct.Transport()},
+	return NewWithKey(controlURL, "")
+}
+
+// NewWithKey builds a client that sends key as X-API-Key. The key rides on
+// the transport as well as on the client's own requests, so a caller that
+// takes HTTP and builds its requests itself (a file import, a raw trace
+// read) carries it too -- but only to the control URL's own origin: a
+// redirect elsewhere does not get the user's credential.
+func NewWithKey(controlURL, key string) *Client {
+	controlURL = strings.TrimSuffix(controlURL, "/")
+	var rt http.RoundTripper = direct.Transport()
+	if key != "" {
+		if u, err := url.Parse(controlURL); err == nil && u.Host != "" {
+			rt = &keyTransport{base: rt, scheme: u.Scheme, host: u.Host, key: key}
+		}
 	}
+	return &Client{
+		ControlURL: controlURL,
+		HTTP:       &http.Client{Timeout: 30 * time.Second, Transport: rt},
+		Key:        key,
+	}
+}
+
+// keyTransport adds X-API-Key to requests bound for one origin.
+type keyTransport struct {
+	base         http.RoundTripper
+	scheme, host string
+	key          string
+}
+
+// sameOrigin reports whether u is the control URL's origin. An http control
+// URL upgraded to https on the same host still is: an older plane advertises
+// http behind an https load balancer, which redirects there, and a caller
+// may upgrade it itself. Never the reverse -- the key does not go out in
+// clear because the URL started encrypted.
+func (t *keyTransport) sameOrigin(u *url.URL) bool {
+	if u.Host != t.host {
+		return false
+	}
+	return u.Scheme == t.scheme || (t.scheme == "http" && u.Scheme == "https")
+}
+
+func (t *keyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !t.sameOrigin(req.URL) || req.Header.Get("X-API-Key") == t.key {
+		return t.base.RoundTrip(req)
+	}
+	// A RoundTripper must not modify the request it was given.
+	req = req.Clone(req.Context())
+	req.Header.Set("X-API-Key", t.key)
+	return t.base.RoundTrip(req)
+}
+
+// keyed is hc with the key on its transport, for a Client built as a
+// literal rather than by NewWithKey. The key goes on the transport, never on
+// the request: a header set on the request follows a redirect to any host.
+func (c *Client) keyed(hc *http.Client) *http.Client {
+	if c.Key == "" {
+		return hc
+	}
+	if _, ok := hc.Transport.(*keyTransport); ok {
+		return hc
+	}
+	u, err := url.Parse(c.ControlURL)
+	if err != nil || u.Host == "" {
+		return hc
+	}
+	base := hc.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	copied := *hc
+	copied.Transport = &keyTransport{base: base, scheme: u.Scheme, host: u.Host, key: c.Key}
+	return &copied
+}
+
+// IsControlProxy reports whether controlURL is the control plane's
+// authenticated /c/<sandbox>/<twin> path rather than a legacy /s/ data URL.
+func IsControlProxy(controlURL string) bool {
+	u, err := url.Parse(strings.TrimSuffix(controlURL, "/"))
+	if err != nil {
+		return false
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	return len(segs) >= 3 && segs[len(segs)-3] == "c"
 }
 
 // ErrNotSupported is a 404 that means "this twin does not serve that route":
@@ -63,6 +155,18 @@ func New(controlURL string) *Client {
 // distinct from a 404 that names a missing entity type, which stays a plain
 // *Error. Test with errors.Is.
 var ErrNotSupported = errors.New("this twin does not serve that route")
+
+// ErrUnauthorized is a 401 from the control plane's /c/ proxy: the Veris
+// API key was missing, revoked, or for another plane. Test with errors.Is.
+var ErrUnauthorized = errors.New(unauthorizedMessage)
+
+// ErrSandboxNotFound is the control plane's 404 {"detail":"sandbox not
+// found"}: the sandbox is gone, or the credential's organisation does not
+// own it. It says nothing about which routes the twin serves, so it is never
+// ErrNotSupported, even on a route whose every other 404 is.
+var ErrSandboxNotFound = errors.New("sandbox not found")
+
+const unauthorizedMessage = "control plane rejected the Veris credential; run veris login"
 
 // Error is any non-2xx answer from a twin. Detail is the human line. A 422's
 // detail arrives as a list of strings (SeedError reasons), a list of
@@ -78,6 +182,10 @@ type Error struct {
 	// notSupported marks a 404 that is the framework's own answer for an
 	// unrouted path rather than a handler's answer for a missing thing.
 	notSupported bool
+	// unauthorized marks a 401 that refused the Veris credential, and
+	// sandboxGone the control plane's 404 for a sandbox it will not serve.
+	unauthorized bool
+	sandboxGone  bool
 }
 
 func (e *Error) Error() string {
@@ -88,7 +196,15 @@ func (e *Error) Error() string {
 // route is absent, while the *Error keeps its status and path for anyone
 // who wants them.
 func (e *Error) Is(target error) bool {
-	return target == ErrNotSupported && e.notSupported
+	switch target {
+	case ErrNotSupported:
+		return e.notSupported
+	case ErrUnauthorized:
+		return e.unauthorized
+	case ErrSandboxNotFound:
+		return e.sandboxGone
+	}
+	return false
 }
 
 // Health is GET /veris/health. The postgres twin reports only service and
@@ -399,7 +515,7 @@ func (c *Client) Operations(ctx context.Context) (*Operations, error) {
 // handler's refusal.
 func optional404(err error) error {
 	var te *Error
-	if errors.As(err, &te) && te.Status == http.StatusNotFound {
+	if errors.As(err, &te) && te.Status == http.StatusNotFound && !te.sandboxGone {
 		te.notSupported = true
 	}
 	return err
@@ -498,6 +614,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	if hc == nil {
 		hc = defaultHTTP
 	}
+	hc = c.keyed(hc)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return fmt.Errorf("cannot reach the twin at %s: %w", c.ControlURL, err)
@@ -513,7 +630,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		shown += "?" + query.Encode()
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return parseError(resp.StatusCode, method, shown, raw)
+		return c.classify(parseError(resp.StatusCode, method, shown, raw))
 	}
 	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
 		return nil
@@ -523,6 +640,33 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			method, shown, resp.StatusCode, err)
 	}
 	return nil
+}
+
+// Get is GET path with query, decoded into out, for a route this package
+// has no method for; the errors are the methods' own.
+func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
+	return c.do(ctx, http.MethodGet, path, query, nil, out)
+}
+
+// classify marks the control plane's own refusals. A 401 is the credential
+// when it carries the plane's detail or came through the /c/ proxy; from a
+// legacy /s/ URL, where no key is checked, a 401 is a vendor catch-all's and
+// is left alone. The plane's "sandbox not found" is never a missing route.
+func (c *Client) classify(e *Error) *Error {
+	switch {
+	case e.Status == http.StatusUnauthorized &&
+		(e.Detail == "invalid or missing API key" || IsControlProxy(c.ControlURL)):
+		e.unauthorized = true
+		if e.Detail != "" && e.Detail != http.StatusText(e.Status) {
+			e.Detail = unauthorizedMessage + " (" + e.Detail + ")"
+		} else {
+			e.Detail = unauthorizedMessage
+		}
+	case e.Status == http.StatusNotFound && e.Detail == "sandbox not found":
+		e.sandboxGone = true
+		e.notSupported = false
+	}
+	return e
 }
 
 // parseError turns a non-2xx body into *Error. FastAPI wraps every refusal

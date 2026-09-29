@@ -582,6 +582,7 @@ func cmdServe(args []string) error {
 			Host:     *exposeHost,
 			Token:    firstNonEmpty(*exposeToken, os.Getenv("VERIS_TUNNEL_TOKEN")),
 			Hostname: *exposeHostname,
+			APIKey:   firstNonEmpty(sources.APIKey, os.Getenv(discovery.EnvAPIKey)),
 		}, cfg, running, pending)
 		if err != nil {
 			return fmt.Errorf("open the callback path: %w", err)

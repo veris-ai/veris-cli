@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"github.com/veris-ai/veris-cli/internal/api"
 	"github.com/veris-ai/veris-cli/internal/cfg"
 	"github.com/veris-ai/veris-cli/internal/cli"
+	"github.com/veris-ai/veris-cli/internal/twin"
 	"github.com/veris-ai/veris-cli/internal/ui"
 )
 
@@ -574,6 +578,38 @@ func TestSessionFailRendersTheGrammar(t *testing.T) {
 			t.Errorf("declined: exit %d with %q", code, stderr.String())
 		}
 	})
+}
+
+// A twin's /c/ control URL is served only to the session's own key, sent as
+// the X-API-Key every /v1 call carries; a refusal names the login to redo.
+func TestSessionTwinSendsTheKeyAndNamesARefusal(t *testing.T) {
+	b := newBench(t)
+	b.global(cfg.Global{ActiveProfile: "dev", Profiles: map[string]cfg.Profile{"dev": {APIKey: "vsk_k"}}})
+	var seen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("X-API-Key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"detail":"invalid or missing API key"}`)
+	}))
+	defer srv.Close()
+
+	s, stderr := open(t, cli.Globals{}, "", "")
+	_, err := s.twin(srv.URL + "/c/sbx_1/stripe").Counts(context.Background())
+	if seen != "vsk_k" {
+		t.Errorf("X-API-Key = %q, want the profile's key", seen)
+	}
+	if !errors.Is(err, twin.ErrUnauthorized) {
+		t.Fatalf("err = %v, want twin.ErrUnauthorized", err)
+	}
+	if err := s.fail("read", "rows", err); !errors.Is(err, printed(1)) {
+		t.Errorf("err = %#v, want printed(1)", err)
+	}
+	want := "✗ Failed to read rows: [401] control plane rejected the Veris credential; run veris login (invalid or missing API key)\n" +
+		"→ Next: veris login --profile dev\n"
+	if stderr.String() != want {
+		t.Errorf("stderr %q, want %q", stderr.String(), want)
+	}
 }
 
 func TestSessionOutputHelpers(t *testing.T) {

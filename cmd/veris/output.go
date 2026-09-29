@@ -71,6 +71,17 @@ func failAs(u *ui.UI, profile, verb, noun string, err error) error {
 		if errors.As(err, &ae) {
 			return notLoggedIn(u, profile, ae.Error())
 		}
+		// A twin's /c/ control URL refused the key: the error already says
+		// so and names the login; the Next line makes it the profile's.
+		if errors.Is(err, twin.ErrUnauthorized) {
+			u.Fail("Failed to %s %s: %v", verb, noun, err)
+			if profile == "" {
+				u.Next("veris login")
+			} else {
+				u.Next("veris login --profile " + profile)
+			}
+			return printed(1)
+		}
 	}
 	if len(reasons) > 0 {
 		u.Fail("Failed to %s %s: [%d]", verb, noun, status)

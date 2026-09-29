@@ -243,7 +243,7 @@ func watchProbe(ctx context.Context, s *session, c *api.Client, id, envLine stri
 func probeTwin(ctx context.Context, s *session, svc api.ServiceInfo, last map[string]string) twinState {
 	start := time.Now()
 	pctx, cancel := context.WithTimeout(ctx, twinProbeTimeout)
-	h, err := s.twin(svc.ControlURL).Health(pctx)
+	h, err := probeRoutable(pctx, s, svc)
 	cancel()
 	if err == nil && h.Status == "ok" {
 		return twinState{name: svc.Name, status: "routable", detail: fmt.Sprintf("%d ms", time.Since(start).Milliseconds()), ok: true}

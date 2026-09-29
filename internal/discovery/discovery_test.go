@@ -494,3 +494,32 @@ func TestAnHTTPTwinWithNoRouteIsHandedOverLikeADSN(t *testing.T) {
 		t.Error("an override supplies the hostname, so yente is proxied")
 	}
 }
+
+// A split sandbox's control URL is its /c/ path, apart from the data URL
+// the proxy routes at; the derived config keeps it, so the callback
+// registration reaches /veris/* there rather than through the data plane.
+func TestTheControlURLRidesIntoTheConfig(t *testing.T) {
+	snapshot := &Snapshot{
+		SandboxID: "sbx_1",
+		Services: []Service{{
+			Name: "stripe", URL: "https://svc.dev/s/sbx_1/stripe", ControlURL: "https://svc.dev/c/sbx_1/stripe/",
+			Routes: []routes.Entry{{Host: "api.stripe.com"}},
+		}},
+	}
+	cfg, _, err := ToConfig(snapshot, nil)
+	if err != nil {
+		t.Fatalf("ToConfig: %v", err)
+	}
+	eps := cfg.ServiceEndpoints()
+	if len(eps) != 1 || eps[0].BaseURL != "https://svc.dev/s/sbx_1/stripe" || eps[0].Control() != "https://svc.dev/c/sbx_1/stripe" {
+		t.Errorf("endpoints = %+v", eps)
+	}
+
+	// A snapshot cached before control_url was kept falls back to the data
+	// URL, where an older sandbox serves /veris/*.
+	snapshot.Services[0].ControlURL = ""
+	cfg, _, _ = ToConfig(snapshot, nil)
+	if got := cfg.ServiceEndpoints()[0].Control(); got != "https://svc.dev/s/sbx_1/stripe" {
+		t.Errorf("legacy Control() = %q, want the data URL", got)
+	}
+}

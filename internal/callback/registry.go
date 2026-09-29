@@ -57,9 +57,10 @@ func (p ProbeState) DeadTunnel() string {
 
 // Client talks to one service's control plane.
 type Client struct {
-	base string
-	auth string
-	http *http.Client
+	base   string
+	auth   string
+	apiKey string
+	http   *http.Client
 }
 
 // Options carries the same access the proxy's own sandbox traffic uses. A
@@ -69,6 +70,10 @@ type Options struct {
 	// AuthValue is the credential sent as a bearer token, if the sandbox wants
 	// one.
 	AuthValue string
+	// APIKey is the Veris API key, sent as X-API-Key. A split sandbox serves
+	// /veris/* only at its /c/ control URL, which refuses a call without
+	// it; an older sandbox's data URL ignores it.
+	APIKey string
 	// InsecureSkipVerify matches upstream.insecure_skip_verify, so a local
 	// sandbox with a self-signed certificate is reachable here too.
 	InsecureSkipVerify bool
@@ -81,10 +86,27 @@ func New(serviceBaseURL string, opts Options) *Client {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // operator opt-in
 	}
 	return &Client{
-		base: strings.TrimSuffix(serviceBaseURL, "/"),
-		auth: opts.AuthValue,
-		http: &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		base:   strings.TrimSuffix(serviceBaseURL, "/"),
+		auth:   opts.AuthValue,
+		apiKey: opts.APIKey,
+		http: &http.Client{
+			Timeout: 30 * time.Second, Transport: transport,
+			CheckRedirect: keepKeyOnOrigin,
+		},
 	}
+}
+
+// keepKeyOnOrigin drops X-API-Key from a redirect that leaves the first
+// request's origin. Go strips Authorization on such a hop itself, but not a
+// header it does not know is a credential.
+func keepKeyOnOrigin(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if first := via[0].URL; req.URL.Scheme != first.Scheme || req.URL.Host != first.Host {
+		req.Header.Del("X-API-Key")
+	}
+	return nil
 }
 
 // authorize adds the sandbox credential to every control-plane call, so PATCH,
@@ -93,6 +115,9 @@ func New(serviceBaseURL string, opts Options) *Client {
 func (c *Client) authorize(req *http.Request) *http.Request {
 	if c.auth != "" {
 		req.Header.Set("Authorization", "Bearer "+c.auth)
+	}
+	if c.apiKey != "" {
+		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	return req
 }
@@ -110,6 +135,9 @@ func (c *Client) Current(ctx context.Context) (ProbeState, error) {
 	}
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err := unauthorized("read the callback registration", res); err != nil {
+		return ProbeState{}, err
+	}
 	if res.StatusCode != http.StatusOK {
 		return ProbeState{}, fmt.Errorf("read the callback registration: %s", res.Status)
 	}
@@ -224,6 +252,9 @@ func (c *Client) Probe(ctx context.Context) (ProbeState, error) {
 	}
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err := unauthorized("probe the callback URL", res); err != nil {
+		return ProbeState{}, err
+	}
 	if res.StatusCode != http.StatusOK {
 		return ProbeState{}, fmt.Errorf(
 			"probe the callback URL: %s said %s: %s",
@@ -243,10 +274,26 @@ func (c *Client) do(req *http.Request, what string) error {
 	}
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err := unauthorized(what, res); err != nil {
+		return err
+	}
 	if res.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s: %s said %s: %s", what, c.base, res.Status, snippet(raw))
 	}
 	return nil
+}
+
+// ErrUnauthorized is a 401 from the control URL: the Veris API key was
+// missing or refused. Test with errors.Is.
+var ErrUnauthorized = errors.New("control plane rejected the Veris credential; run veris login")
+
+// unauthorized is ErrUnauthorized, wrapped with what was being done, for a
+// 401; nil for anything else.
+func unauthorized(what string, res *http.Response) error {
+	if res.StatusCode != http.StatusUnauthorized {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", what, ErrUnauthorized)
 }
 
 func snippet(b []byte) string {

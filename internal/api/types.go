@@ -74,9 +74,15 @@ type ServiceInfo struct {
 	// URL is what the code under test points at: a gateway path for an http
 	// service, a DSN for postgres.
 	URL string `json:"url"`
-	// ControlURL is where /veris/* lives, always an http gateway path.
+	// ControlURL is where /veris/* lives, always an http URL: the control
+	// plane's /c/<sandbox>/<service> proxy, or on an older plane the data
+	// gateway path. Never hand it to the code under test.
 	ControlURL string `json:"control_url"`
-	EnvHint    string `json:"env_hint"`
+	// ControlAuth is "api_key" when ControlURL wants the caller's Veris API
+	// key as X-API-Key; nil from a plane that predates it. The CLI sends the
+	// key either way, so this is for --json readers.
+	ControlAuth *string `json:"control_auth"`
+	EnvHint     string  `json:"env_hint"`
 	// Routes are the measured vendor hostnames this service answers for, and
 	// the only source of them the proxy has. Null when the control plane has
 	// none for it: the proxy then intercepts nothing for this service and

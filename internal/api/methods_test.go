@@ -717,7 +717,7 @@ func TestJSONTagsMirrorModelsPy(t *testing.T) {
 		{"Environment", Environment{}, []string{"id", "name", "services", "created_at", "owner", "baseline"}},
 		{"EnvironmentBaseline", EnvironmentBaseline{SnapshotID: "s"}, []string{"image", "revision_id", "promoted_at", "source_sandbox", "snapshot_id"}},
 		{"Sandbox", Sandbox{}, []string{"id", "environment_id", "status", "created_at", "expires_at", "services", "failure_reason", "metadata", "snapshot_id"}},
-		{"ServiceInfo", ServiceInfo{}, []string{"name", "status", "url", "control_url", "env_hint", "routes"}},
+		{"ServiceInfo", ServiceInfo{}, []string{"name", "status", "url", "control_url", "control_auth", "env_hint", "routes"}},
 		{"Snapshot", Snapshot{}, []string{"id", "environment_id", "name", "image", "revision_id", "created_at", "source_sandbox", "clock_restore", "size_bytes", "is_default"}},
 		{"SnapshotResponse", SnapshotResponse{}, []string{"snapshot", "curator_clock_restored", "scrubbed"}},
 		{"PromoteResponse", PromoteResponse{Snapshot: &Snapshot{}}, []string{"environment_id", "sandbox_id", "baseline", "clock_restore", "size_bytes", "curator_clock_restored", "scrubbed", "snapshot"}},

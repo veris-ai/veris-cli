@@ -663,9 +663,9 @@ func (p *upSpinner) resume() {
 	}
 }
 
-// waitRoutable probes every twin's /veris/health through the gateway until
-// each answers ok, because the control plane measures ready from its own
-// node and the public ingress can lag it by seconds. Each twin prints its
+// waitRoutable probes every twin (probeRoutable) until each answers ok,
+// because the control plane measures ready from its own node and the public
+// ingress can lag it by seconds. Each twin prints its
 // line the first time it answers; a service with no control URL is data
 // plane, handed to the app rather than proxied, and needs no probe.
 func waitRoutable(ctx context.Context, s *session, sb *api.Sandbox, deadline time.Time, timeout time.Duration) error {
@@ -700,7 +700,7 @@ func waitRoutable(ctx context.Context, s *session, sb *api.Sandbox, deadline tim
 			start := time.Now()
 			probeDeadline := start.Add(twinProbeTimeout)
 			pctx, cancel := context.WithDeadline(ctx, minTime(deadline, probeDeadline))
-			h, err := s.twin(svc.ControlURL).Health(pctx)
+			h, err := probeRoutable(pctx, s, svc)
 			cancel()
 			ms := time.Since(start).Milliseconds()
 			if err == nil && h.Status == "ok" {
@@ -748,6 +748,49 @@ func waitRoutable(ctx context.Context, s *session, sb *api.Sandbox, deadline tim
 		case <-time.After(routableInterval):
 		}
 	}
+}
+
+// probeRoutable is one twin's routability probe: its own /veris/health on
+// its control URL, then -- for a service the code under test reaches over
+// HTTP -- its data URL through the public gateway, which is the path that
+// code dials. A split sandbox's control URL is the api's /c/ proxy, which
+// reaches the member in-cluster and so proves nothing about the gateway; an
+// older sandbox's control URL is its data URL, already proven by the first.
+func probeRoutable(ctx context.Context, s *session, svc api.ServiceInfo) (*twin.Health, error) {
+	h, err := s.twin(svc.ControlURL).Health(ctx)
+	if err != nil || h.Status != "ok" {
+		return h, err
+	}
+	if isHTTPURL(svc.URL) && strings.TrimSuffix(svc.URL, "/") != strings.TrimSuffix(svc.ControlURL, "/") {
+		if err := dataRouteAnswers(ctx, svc.URL); err != nil {
+			return h, err
+		}
+	}
+	return h, nil
+}
+
+// dataRouteAnswers reports whether the gateway routes a twin's data URL:
+// any answer below 500 came from the twin (with the legacy /veris mount
+// gone, /veris/health there is the vendor's own 404), while a 5xx is the
+// gateway's 502/503/504 for a backend it cannot reach yet. Sent without the
+// Veris key: the capability URL takes none, and the twin behind it has no
+// business seeing it.
+func dataRouteAnswers(ctx context.Context, dataURL string) error {
+	c := twin.New(dataURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ControlURL+"/veris/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode >= 500 {
+		return &twin.Error{Status: resp.StatusCode, Method: http.MethodGet, Path: "/veris/health", Detail: resp.Status}
+	}
+	return nil
 }
 
 // probeVerdict is the short reason a health probe did not count, for the

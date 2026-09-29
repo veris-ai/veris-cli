@@ -48,9 +48,14 @@ type Service struct {
 	// URL is where the code under test's traffic must be sent. Used verbatim:
 	// the control plane already knows the exact address, and rebuilding it here
 	// would be a second implementation of a routing rule it owns.
-	URL     string `json:"url"`
-	Status  string `json:"status"`
-	EnvHint string `json:"env_hint"`
+	URL string `json:"url"`
+	// ControlURL is where the service's /veris/* lives: the control plane's
+	// /c/ path on a split sandbox, which wants the Veris API key, or the
+	// data URL on an older one. Empty in a snapshot cached before it was
+	// kept, and callers then fall back to URL.
+	ControlURL string `json:"control_url,omitempty"`
+	Status     string `json:"status"`
+	EnvHint    string `json:"env_hint"`
 	// Routes are the real hostnames this service answers for -- generated on
 	// the control plane from the measured vendor backends, never authored, and
 	// served with the sandbox, so a service added to the platform is routable
@@ -371,6 +376,7 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 				Hosts:    []string{entry.Host},
 				Paths:    entry.Paths,
 				Upstream: strings.TrimSuffix(svc.URL, "/"),
+				Control:  strings.TrimSuffix(svc.ControlURL, "/"),
 			})
 		}
 	}
