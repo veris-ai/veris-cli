@@ -57,7 +57,7 @@ var (
 // sandboxCommands is up, status, down and the sandbox group: the everyday
 // verbs act on this folder's sandbox, the group takes an explicit --id.
 func sandboxBaseCommands() []*cli.Command {
-	var getID, deleteID, resetID, listEnv string
+	var getID, deleteID, resetID, resetSeedProfile, resetData, listEnv string
 	var downAll, listAll, statusWatch, getWatch bool
 	return []*cli.Command{
 		upCommand(),
@@ -157,17 +157,37 @@ func sandboxBaseCommands() []*cli.Command {
 				},
 				{
 					Name:    "reset",
-					Summary: "Restore every twin to its boot seed and set the clock live",
-					Usage:   "veris sandbox reset [--id ID] [--yes]",
-					Help:    "Refused (409) for a sandbox booted from a snapshot or a promoted baseline: that world is an image, and a fresh copy is `veris down && veris up`.",
+					Summary: "Restore every twin to its boot seed and set the clock live, or reset one twin",
+					Usage:   "veris sandbox reset [NAME [--seed-profile P | --data FILE]] [--id ID] [--yes] [--json]",
+					Help: "Without NAME every twin is restored to its boot seed and the clock is set live. Refused (409)\n" +
+						"for a sandbox booted from a snapshot or a promoted baseline: that world is an image, and a\n" +
+						"fresh copy is `veris down && veris up`.\n" +
+						"With NAME only that twin's world is replaced (POST /veris/reset on its control URL); the other\n" +
+						"twins and the clock are left alone. It restores the twin's boot profile, or --seed-profile P\n" +
+						"(one of the twin's packaged seed profiles), or exactly the rows of --data FILE. FILE is one\n" +
+						"twin's tables, {table: [rows]}; a file keyed by twin name, as data add and up take, is\n" +
+						"accepted too and its NAME entry is used. A twin that refuses the profile or the rows (422)\n" +
+						"prints its reasons and keeps its world.",
 					Flags: func(fs *flag.FlagSet) {
 						fs.StringVar(&resetID, "id", "", "sandbox id (default: this folder's)")
+						fs.StringVar(&resetSeedProfile, "seed-profile", "", "with NAME: reset to this packaged seed `profile` rather than the boot one")
+						fs.StringVar(&resetData, "data", "", "with NAME: reset to exactly the rows of this JSON `file`")
 					},
 					Run: func(ctx *cli.Context, args []string) error {
-						if err := noPositionals(ctx, args); err != nil {
+						name, err := atMostOneTwinName(ctx, args)
+						if err != nil {
 							return err
 						}
-						return sandboxReset(ctx, resetID)
+						if resetSeedProfile != "" && resetData != "" {
+							return &cli.UsageError{Msg: "sandbox reset takes --seed-profile or --data, not both"}
+						}
+						if name == "" {
+							if resetSeedProfile != "" || resetData != "" {
+								return &cli.UsageError{Msg: "--seed-profile and --data reset one twin; name it: veris sandbox reset NAME"}
+							}
+							return sandboxReset(ctx, resetID)
+						}
+						return twinReset(ctx, resetID, name, resetSeedProfile, resetData)
 					},
 				},
 			},
@@ -1466,6 +1486,149 @@ func seededTables(raw json.RawMessage) (int, bool) {
 		return 0, false
 	}
 	return len(detail.Seeded), true
+}
+
+// --- sandbox reset NAME -----------------------------------------------------
+
+// twinResult is what `sandbox reset NAME --json` prints: which twin, what it
+// was reset to, and the twin's own answer -- {reset, seeded} from an HTTP
+// twin, {ok} from the postgres twin.
+type twinResult struct {
+	Service     string         `json:"service"`
+	Sandbox     string         `json:"sandbox"`
+	SeedProfile string         `json:"seed_profile,omitempty"`
+	DataFile    string         `json:"data_file,omitempty"`
+	Reset       bool           `json:"reset"`
+	Seeded      map[string]int `json:"seeded,omitempty"`
+	OK          bool           `json:"ok,omitempty"`
+}
+
+// twinReset replaces one twin's world through its control URL (POST
+// /veris/reset) and leaves every other twin, and the sandbox clock, as they
+// are. The body is {} (the boot profile, as the twin was started with),
+// {profile} for --seed-profile, or {data} for --data FILE:
+//
+//	✓ stripe reset to seed profile 'empty': seeded customers 0, prices 0
+//
+// FILE is read and checked before anything is asked or sent, so a typo
+// costs nothing. A 422 is the twin refusing the profile or the rows; its
+// reasons are printed one per line and its world is untouched.
+func twinReset(ctx *cli.Context, idFlag, name, seedProfile, dataFile string) error {
+	var fileTop map[string]json.RawMessage
+	if dataFile != "" {
+		raw, err := os.ReadFile(dataFile)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, &fileTop); err != nil || fileTop == nil {
+			return fmt.Errorf("%s is not a JSON object of tables to rows", dataFile)
+		}
+	}
+	s, _, sb, err := openSandboxServices(ctx, idFlag)
+	if err != nil {
+		return err
+	}
+	svc, err := chooseTwin(s, sb, name, idFlag)
+	if err != nil {
+		return err
+	}
+	if svc.ControlURL == "" {
+		s.ui.Fail("%s has no control URL to reset through", svc.Name)
+		return printed(1)
+	}
+	req := twin.ResetRequest{Profile: seedProfile}
+	target := "its boot profile"
+	switch {
+	case seedProfile != "":
+		target = fmt.Sprintf("seed profile '%s'", seedProfile)
+	case dataFile != "":
+		data, err := resetData(fileTop, svc.Name, sb.Services)
+		if err != nil {
+			s.ui.Fail("%s: %v", dataFile, err)
+			return printed(1)
+		}
+		req.Data = data
+		if len(data) == 0 {
+			target = fmt.Sprintf("an empty world (%s holds no tables)", dataFile)
+		} else {
+			target = fmt.Sprintf("the rows of %s (%s)", dataFile, countsLine(rowCounts(data)))
+		}
+	}
+	if err := confirm(s.ui, fmt.Sprintf("Reset %s in %s to %s? Other twins and the clock are left alone.", svc.Name, sb.ID, target)); err != nil {
+		return err
+	}
+	res, err := boundedTwin(s, svc.ControlURL, defaultAddTimeout).Reset(context.Background(), req)
+	if err != nil {
+		return s.fail("reset", svc.Name, err)
+	}
+	if res.Reset {
+		s.ui.Success("%s reset to %s: seeded %s", svc.Name, target, countsLine(res.Seeded))
+	} else {
+		s.ui.Success("%s reset to its boot world", svc.Name)
+	}
+	if s.ctx.Globals.JSON {
+		return printJSON(s.ctx.Stdout, twinResult{
+			Service: svc.Name, Sandbox: sb.ID, SeedProfile: seedProfile, DataFile: dataFile,
+			Reset: res.Reset, Seeded: res.Seeded, OK: res.OK,
+		})
+	}
+	s.ui.Link(fmt.Sprintf("veris sandbox data get %s   (row counts now)", svc.Name))
+	return nil
+}
+
+// resetData is the {table: [rows]} a --data file holds for the twin called
+// name. The twin's reset takes one twin's tables; `data add` and up take a
+// file keyed by twin name. Both are accepted: a top-level key that is this
+// twin's name and holds an object (a table holds a list) is that twin's
+// entry and is used alone. A file keyed by other twins' names and not this
+// one is refused -- sent as-is, the twin would take every twin name for an
+// unknown table.
+func resetData(top map[string]json.RawMessage, name string, services []api.ServiceInfo) (map[string]any, error) {
+	isObject := func(raw json.RawMessage) bool {
+		t := strings.TrimSpace(string(raw))
+		return strings.HasPrefix(t, "{")
+	}
+	if entry, ok := top[name]; ok && isObject(entry) {
+		var data map[string]any
+		if err := json.Unmarshal(entry, &data); err != nil {
+			return nil, fmt.Errorf("'%s' must be an object of tables to rows", name)
+		}
+		return data, nil
+	}
+	var others []string
+	for key, raw := range top {
+		if findService(services, key) != nil && isObject(raw) {
+			others = append(others, key)
+		}
+	}
+	if len(others) > 0 {
+		sort.Strings(others)
+		return nil, fmt.Errorf("keyed by twin name (%s) with no '%s' entry; reset --data takes %s's tables, {table: [rows]}, or a twin-keyed file with a '%s' entry",
+			strings.Join(others, ", "), name, name, name)
+	}
+	data := make(map[string]any, len(top))
+	for key, raw := range top {
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, err
+		}
+		data[key] = v
+	}
+	return data, nil
+}
+
+// rowCounts is how many rows each table of a reset payload holds; a table
+// that is not a list counts as one row, as a singleton's object would.
+func rowCounts(data map[string]any) map[string]int {
+	counts := make(map[string]int, len(data))
+	for table, rows := range data {
+		if list, ok := rows.([]any); ok {
+			counts[table] = len(list)
+		} else {
+			counts[table] = 1
+		}
+	}
+	return counts
 }
 
 // --- up --proxy -------------------------------------------------------------

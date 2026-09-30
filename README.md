@@ -286,7 +286,7 @@ may yet come up, and `veris status` says. A folder already pointing at a
 sandbox is warned that the old one keeps running until its TTL.
 
 A twin verb that takes a name — `sandbox services get`, `sandbox services
-manual` — can be typed without one. A sandbox holding a single twin uses it,
+manual`, `sandbox services operations` — can be typed without one. A sandbox holding a single twin uses it,
 a terminal is asked which, and anything else is told the names the sandbox
 actually has, written out as the commands to run.
 
@@ -298,6 +298,38 @@ never silence. `sandbox reset` restores every twin to its boot seed and sets
 the clock live; it is refused (409) for a sandbox booted from a snapshot or a
 promoted baseline, because that world is an image, and the CLI prints the
 allowed move: `veris down && veris up`.
+
+A twin's `/veris/*` control routes live at its control URL, which a split
+sandbox serves only to your Veris API key. Every twin verb sends the key of
+the selected login (or `VERIS_API_KEY`) for you, so nothing needs the raw key
+in a `curl`:
+
+```sh
+veris sandbox reset stripe                          # this twin only, back to its boot profile
+veris sandbox reset stripe --seed-profile empty     # one of the twin's packaged seed profiles
+veris sandbox reset stripe --data world.json        # exactly these rows
+veris sandbox services operations stripe            # what the twin implements
+veris sandbox services operations stripe --surface mcp --json
+```
+
+`sandbox reset NAME [--seed-profile P | --data FILE]` replaces one twin's
+world (`POST /veris/reset` on its control URL) and leaves the other twins and
+the clock alone; with neither flag it restores the profile the twin booted
+with. `--seed-profile` rather than `--profile`, because `--profile` is the
+global flag that picks the login. `--data FILE` is one twin's tables,
+`{"customers": [...], "prices": [...]}`; a file keyed by twin name, as `data
+add` and `up` take, is accepted too and its NAME entry is used, and one keyed
+only by other twins is refused before anything is sent. A twin that refuses
+the profile or the rows answers 422 and its reasons are printed one per line;
+its world is unchanged. It asks first (`--yes` skips) and `--json` prints
+`{service, sandbox, reset, seeded}`. The postgres twin's reset restores its
+boot world and takes neither flag.
+
+`sandbox services operations [NAME] [--surface rest|graphql|mcp]` lists what
+a twin actually serves (`GET /veris/operations`): method and path template on
+a REST twin, operation type and field on a GraphQL twin, tool names on an MCP
+surface. `--json` prints the twin's document as it sent it; a twin that
+publishes no list says so and exits 0.
 
 ### What it saw: `sandbox trace`
 

@@ -138,20 +138,32 @@ type dataTwins struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 
-	counts     map[string]int              // the HTTP twins' GET /veris/data counts, singletons included
-	countReads int                         // how many bare GET /veris/data the HTTP twins answered
-	countDelay time.Duration               // how long each bare GET /veris/data takes to answer
-	rowsDelay  time.Duration               // how long each GET /veris/data?entity_type=… takes to answer
-	addDelay   time.Duration               // how long each POST /veris/data takes to answer
-	version    int                         // their state_version
-	health     int                         // the HTTP twins' GET /veris/health status (0 → 200)
-	rows       map[string][]map[string]any // rows per table, newest first
-	addStatus  int                         // POST /veris/data status (0 → 200)
-	adds       []string                    // twins that received a POST /veris/data, in order
-	edits      []dataEdit                  // every PATCH and DELETE /veris/data, in order
-	queries    []string                    // raw query of every GET /veris/data with an entity_type
-	seeds      []string                    // schema_sql of every POST /veris/seed
-	pgData404  bool                        // postgres GET /veris/data is FastAPI's 404 rather than the singletons
+	counts     map[string]int                                    // the HTTP twins' GET /veris/data counts, singletons included
+	countReads int                                               // how many bare GET /veris/data the HTTP twins answered
+	countDelay time.Duration                                     // how long each bare GET /veris/data takes to answer
+	rowsDelay  time.Duration                                     // how long each GET /veris/data?entity_type=… takes to answer
+	addDelay   time.Duration                                     // how long each POST /veris/data takes to answer
+	version    int                                               // their state_version
+	health     int                                               // the HTTP twins' GET /veris/health status (0 → 200)
+	rows       map[string][]map[string]any                       // rows per table, newest first
+	addStatus  int                                               // POST /veris/data status (0 → 200)
+	adds       []string                                          // twins that received a POST /veris/data, in order
+	edits      []dataEdit                                        // every PATCH and DELETE /veris/data, in order
+	queries    []string                                          // raw query of every GET /veris/data with an entity_type
+	seeds      []string                                          // schema_sql of every POST /veris/seed
+	pgData404  bool                                              // postgres GET /veris/data is FastAPI's 404 rather than the singletons
+	resets     []twinCall                                        // every POST /veris/reset, in order
+	resetReply func(twin string, body map[string]any) (int, any) // nil → a plain success
+	opsCalls   []twinCall                                        // every GET /veris/operations, in order
+}
+
+// twinCall is one control request as the twin received it: which twin, the
+// X-API-Key it carried, its raw query and its decoded body.
+type twinCall struct {
+	twin  string
+	key   string
+	query string
+	body  map[string]any
 }
 
 // dataEdit is one PATCH or DELETE of /veris/data as the twin received it.
@@ -317,6 +329,64 @@ func newDataTwins(t *testing.T) *dataTwins {
 		f.seeds = append(f.seeds, body.SchemaSQL)
 		sbJSON(w, 200, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("POST "+prefix+"{twin}/veris/reset", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		name := r.PathValue("twin")
+		f.resets = append(f.resets, twinCall{twin: name, key: r.Header.Get("X-API-Key"), body: body})
+		if f.resetReply != nil {
+			status, answer := f.resetReply(name, body)
+			sbJSON(w, status, answer)
+			return
+		}
+		if name == "postgres" {
+			sbJSON(w, 200, map[string]any{"ok": true})
+			return
+		}
+		seeded := map[string]int{"customers": 3, "prices": 12}
+		if data, ok := body["data"].(map[string]any); ok {
+			seeded = map[string]int{}
+			for table, rows := range data {
+				if list, ok := rows.([]any); ok {
+					seeded[table] = len(list)
+				}
+			}
+		}
+		sbJSON(w, 200, map[string]any{"reset": true, "seeded": seeded})
+	})
+	mux.HandleFunc("GET "+prefix+"{twin}/veris/operations", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		name := r.PathValue("twin")
+		f.opsCalls = append(f.opsCalls, twinCall{twin: name, key: r.Header.Get("X-API-Key"), query: r.URL.RawQuery})
+		surface := r.URL.Query().Get("surface")
+		switch name {
+		case "postgres":
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+		case "linear":
+			sbJSON(w, 200, map[string]any{"service": "linear", "total": 2, "operations": []map[string]string{
+				{"type": "query", "field": "issue"}, {"type": "mutation", "field": "issueCreate"}}})
+		default:
+			body := map[string]any{"service": name}
+			total := 0
+			if surface == "" || surface == "rest" {
+				body["operations"] = []map[string]string{
+					{"method": "GET", "path": "/v1/customers"},
+					{"method": "POST", "path": "/v1/customers"},
+					{"method": "GET", "path": "/v1/customers/{customer}"}}
+				total += 3
+			}
+			if surface == "" || surface == "mcp" {
+				body["mcp"] = map[string]any{"path": "/mcp", "auth": "bearer", "sign_in": "oauth",
+					"tools": []map[string]string{{"tool": "get_widget"}, {"tool": "list_widgets"}}}
+				total += 2
+			}
+			body["total"] = total
+			sbJSON(w, 200, body)
+		}
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		sbJSON(w, 404, map[string]string{"detail": "Not Found"})
@@ -354,6 +424,18 @@ func (f *dataTwins) rowQueries() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.queries...)
+}
+
+func (f *dataTwins) resetCalls() []twinCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]twinCall(nil), f.resets...)
+}
+
+func (f *dataTwins) operationsCalls() []twinCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]twinCall(nil), f.opsCalls...)
 }
 
 func (f *dataTwins) seeded() []string {
@@ -651,4 +733,146 @@ func TestSandboxServicesManual(t *testing.T) {
 			t.Errorf("renderManual = %q, want %q", got, want)
 		}
 	})
+}
+
+func TestSandboxServicesOperations(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newDataTwins(t)
+	dataBench(t, plane, twins.services("linear"))
+
+	t.Run("every surface, with the profile's key", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "services", "operations", "stripe")
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		sbInOrder(t, stderr,
+			"stripe · 5 operations\n",
+			"GET", "/v1/customers\n",
+			"POST", "/v1/customers\n",
+			"GET", "/v1/customers/{customer}\n",
+			"  MCP at /mcp (auth bearer) · 2 tools\n",
+			"    get_widget\n",
+			"    list_widgets\n")
+		calls := twins.operationsCalls()
+		last := calls[len(calls)-1]
+		if last.twin != "stripe" || last.key != sbTestKey || last.query != "" {
+			t.Errorf("GET /veris/operations = %+v; want stripe, the profile's key, no query", last)
+		}
+	})
+
+	t.Run("--surface is sent as the query", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "operations", "stripe", "--surface", "mcp")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		calls := twins.operationsCalls()
+		if last := calls[len(calls)-1]; last.query != "surface=mcp" {
+			t.Errorf("query %q, want surface=mcp", last.query)
+		}
+		sbInOrder(t, stderr, "stripe · 2 operations (mcp)\n", "  MCP at /mcp (auth bearer) · 2 tools\n")
+		if strings.Contains(stderr, "/v1/customers") {
+			t.Errorf("--surface mcp printed REST routes:\n%s", stderr)
+		}
+	})
+
+	t.Run("a GraphQL twin lists type and field", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "operations", "linear")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "linear · 2 operations\n", "query", "issue\n", "mutation", "issueCreate\n")
+	})
+
+	t.Run("--json is the twin's document as sent", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "services", "operations", "stripe", "--json")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+			t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+		}
+		mcp, _ := doc["mcp"].(map[string]any)
+		if doc["service"] != "stripe" || doc["total"] != float64(5) || mcp["sign_in"] != "oauth" {
+			t.Errorf("document lost fields:\n%s", stdout)
+		}
+	})
+
+	t.Run("a twin with no operations route", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "services", "operations", "postgres")
+		if code != 0 || stdout != "" || !strings.Contains(stderr, "! postgres publishes no operation list (GET /veris/operations is not served)\n") {
+			t.Errorf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		code, stdout, _ = runSandboxCLI(t, "sandbox", "services", "operations", "postgres", "--json")
+		if code != 0 || stdout != "{\n  \"operations\": null,\n  \"service\": \"postgres\"\n}\n" {
+			t.Errorf("--json: exit %d, stdout %q", code, stdout)
+		}
+	})
+
+	t.Run("an unknown surface is refused before any request", func(t *testing.T) {
+		before := len(twins.operationsCalls())
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "operations", "stripe", "--surface", "soap")
+		if code != 1 || !strings.Contains(stderr, `--surface must be rest, graphql or mcp (got "soap")`) || len(twins.operationsCalls()) != before {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+}
+
+// A split sandbox's /c/ control URL is served only to the profile's key; a
+// refusal there names the login to redo rather than a missing route.
+func TestTwinVerbsCarryTheKeyToAControlProxy(t *testing.T) {
+	plane := newSandboxPlane(t)
+	var mu sync.Mutex
+	var keys []string
+	refuse := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		keys = append(keys, r.Method+" "+r.URL.Path+" "+r.Header.Get("X-API-Key"))
+		if refuse {
+			sbJSON(w, 401, map[string]string{"detail": "invalid or missing API key"})
+			return
+		}
+		switch r.URL.Path {
+		case "/c/" + sbID + "/stripe/veris/reset":
+			sbJSON(w, 200, map[string]any{"reset": true, "seeded": map[string]int{"customers": 3}})
+		case "/c/" + sbID + "/stripe/veris/operations":
+			sbJSON(w, 200, map[string]any{"service": "stripe", "total": 0, "operations": []any{}})
+		default:
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	control := srv.URL + "/c/" + sbID + "/stripe"
+	dataBench(t, plane, []api.ServiceInfo{{Name: "stripe", Status: "ready", URL: srv.URL + "/s/" + sbID + "/stripe", ControlURL: control}})
+
+	for _, argv := range [][]string{
+		{"sandbox", "reset", "stripe", "--yes"},
+		{"sandbox", "services", "operations", "stripe"},
+	} {
+		if code, _, stderr := runSandboxCLI(t, argv...); code != 0 {
+			t.Errorf("%v: exit %d:\n%s", argv, code, stderr)
+		}
+	}
+	mu.Lock()
+	want := []string{
+		"POST /c/" + sbID + "/stripe/veris/reset " + sbTestKey,
+		"GET /c/" + sbID + "/stripe/veris/operations " + sbTestKey,
+	}
+	if strings.Join(keys, "|") != strings.Join(want, "|") {
+		t.Errorf("requests %q, want %q", keys, want)
+	}
+	refuse = true
+	mu.Unlock()
+
+	for _, argv := range [][]string{
+		{"sandbox", "reset", "stripe", "--yes"},
+		{"sandbox", "services", "operations", "stripe"},
+	} {
+		code, _, stderr := runSandboxCLI(t, argv...)
+		if code != 1 || !strings.Contains(stderr, "[401] control plane rejected the Veris credential; run veris login (invalid or missing API key)\n") ||
+			!strings.Contains(stderr, "→ Next: veris login --profile default\n") {
+			t.Errorf("%v: exit %d:\n%s", argv, code, stderr)
+		}
+	}
 }

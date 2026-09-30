@@ -1359,12 +1359,180 @@ func TestSandboxCommandsRefuseStrayWords(t *testing.T) {
 	plane := newSandboxPlane(t)
 	b := sandboxBench(t, plane.srv.URL)
 	b.twoEnvs()
-	for _, argv := range [][]string{{"status", "x"}, {"down", "dev"}, {"sandbox", "get", "x"}, {"sandbox", "list", "x"}, {"sandbox", "delete", "x"}, {"sandbox", "reset", "x"}} {
+	for _, argv := range [][]string{{"status", "x"}, {"down", "dev"}, {"sandbox", "get", "x"}, {"sandbox", "list", "x"}, {"sandbox", "delete", "x"}} {
 		code, _, stderr := runSandboxCLI(t, argv...)
 		if code != 1 || !strings.Contains(stderr, "takes no arguments") {
 			t.Errorf("%v: exit %d:\n%s", argv, code, stderr)
 		}
 	}
+	// reset takes one twin NAME, and no more.
+	code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "zendesk")
+	if code != 1 || !strings.Contains(stderr, `sandbox reset takes one twin name (got "stripe zendesk")`) {
+		t.Errorf("reset with two names: exit %d:\n%s", code, stderr)
+	}
+}
+
+func TestSandboxResetOneTwin(t *testing.T) {
+	plane := newSandboxPlane(t)
+	twins := newDataTwins(t)
+	dataBench(t, plane, twins.services("zendesk"))
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	lastReset := func(t *testing.T) twinCall {
+		t.Helper()
+		calls := twins.resetCalls()
+		if len(calls) == 0 {
+			t.Fatal("no POST /veris/reset")
+		}
+		return calls[len(calls)-1]
+	}
+	body := func(c twinCall) string {
+		b, _ := json.Marshal(c.body)
+		return string(b)
+	}
+
+	t.Run("no flag restores the boot profile, and only that twin", func(t *testing.T) {
+		planeResets := plane.resetCount()
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--yes")
+		if code != 0 || stdout != "" {
+			t.Fatalf("exit %d, stdout %q:\n%s", code, stdout, stderr)
+		}
+		sbInOrder(t, stderr,
+			"Reset stripe in "+sbID+" to its boot profile? Other twins and the clock are left alone. y\n",
+			"✓ stripe reset to its boot profile: seeded customers 3, prices 12\n",
+			"→ veris sandbox data get stripe   (row counts now)\n")
+		c := lastReset(t)
+		if c.twin != "stripe" || body(c) != "{}" || c.key != sbTestKey {
+			t.Errorf("reset = %+v; want stripe, {} and the profile's key", c)
+		}
+		if plane.resetCount() != planeResets {
+			t.Errorf("a one-twin reset must not call the sandbox-wide reset")
+		}
+	})
+
+	t.Run("--seed-profile sends the profile; --json is the twin's answer", func(t *testing.T) {
+		code, stdout, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--seed-profile", "empty", "--yes", "--json")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if c := lastReset(t); body(c) != `{"profile":"empty"}` {
+			t.Errorf("body %s", body(c))
+		}
+		if !strings.Contains(stderr, "✓ stripe reset to seed profile 'empty': seeded customers 3, prices 12\n") {
+			t.Errorf("stderr:\n%s", stderr)
+		}
+		var got twinResult
+		if err := json.Unmarshal([]byte(stdout), &got); err != nil || got.Service != "stripe" || got.Sandbox != sbID ||
+			got.SeedProfile != "empty" || !got.Reset || got.Seeded["prices"] != 12 {
+			t.Errorf("stdout %s (%v)", stdout, err)
+		}
+	})
+
+	t.Run("--data sends one twin's tables", func(t *testing.T) {
+		file := write("tables.json", `{"customers": [{"id": "cus_1"}, {"id": "cus_2"}], "prices": []}`)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--data", file, "--yes")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if c := lastReset(t); body(c) != `{"data":{"customers":[{"id":"cus_1"},{"id":"cus_2"}],"prices":[]}}` {
+			t.Errorf("body %s", body(c))
+		}
+		sbInOrder(t, stderr, "Reset stripe in "+sbID+" to the rows of "+file+" (customers 2, prices 0)?",
+			"✓ stripe reset to the rows of "+file+" (customers 2, prices 0): seeded customers 2, prices 0\n")
+	})
+
+	t.Run("--data takes a file keyed by twin name and uses NAME's entry", func(t *testing.T) {
+		file := write("seed.json", `{"stripe": {"customers": [{"id": "cus_9"}]}, "zendesk": {"tickets": []}}`)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--data", file, "--yes")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		if c := lastReset(t); c.twin != "stripe" || body(c) != `{"data":{"customers":[{"id":"cus_9"}]}}` {
+			t.Errorf("reset = %s %s", c.twin, body(c))
+		}
+	})
+
+	t.Run("--data keyed by other twins is refused before anything is sent", func(t *testing.T) {
+		before := len(twins.resetCalls())
+		file := write("other.json", `{"zendesk": {"tickets": []}}`)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--data", file, "--yes")
+		if code != 1 || len(twins.resetCalls()) != before ||
+			!strings.Contains(stderr, "✗ "+file+": keyed by twin name (zendesk) with no 'stripe' entry; reset --data takes stripe's tables, {table: [rows]}") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("a file that is not an object is refused", func(t *testing.T) {
+		file := write("list.json", `[1, 2]`)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--data", file, "--yes")
+		if code != 1 || !strings.Contains(stderr, file+" is not a JSON object of tables to rows") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("flags that conflict or need NAME", func(t *testing.T) {
+		before := len(twins.resetCalls())
+		for argv, want := range map[string]string{
+			"sandbox reset stripe --seed-profile a --data f.json": "sandbox reset takes --seed-profile or --data, not both",
+			"sandbox reset --seed-profile a":                      "--seed-profile and --data reset one twin; name it: veris sandbox reset NAME",
+			"sandbox reset --data f.json":                         "--seed-profile and --data reset one twin; name it: veris sandbox reset NAME",
+		} {
+			code, _, stderr := runSandboxCLI(t, append(strings.Fields(argv), "--yes")...)
+			if code != 1 || !strings.Contains(stderr, want) {
+				t.Errorf("%s: exit %d:\n%s", argv, code, stderr)
+			}
+		}
+		if len(twins.resetCalls()) != before {
+			t.Errorf("a refused command reached the twin")
+		}
+	})
+
+	t.Run("a 422 prints the twin's reasons", func(t *testing.T) {
+		twins.script(func(f *dataTwins) {
+			f.resetReply = func(string, map[string]any) (int, any) {
+				return 422, map[string]any{"detail": []string{"unknown seed profile 'nope'; available: default, empty"}}
+			}
+		})
+		t.Cleanup(func() { twins.script(func(f *dataTwins) { f.resetReply = nil }) })
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--seed-profile", "nope", "--yes")
+		if code != 1 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "✗ Failed to reset stripe: [422]\n", "  unknown seed profile 'nope'; available: default, empty\n")
+	})
+
+	t.Run("the postgres twin restores its boot world and takes no profile", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "postgres", "--yes")
+		if code != 0 || !strings.Contains(stderr, "✓ postgres reset to its boot world\n") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+		code, _, stderr = runSandboxCLI(t, "sandbox", "reset", "postgres", "--seed-profile", "default", "--yes")
+		if code != 1 || !strings.Contains(stderr, "this twin's reset takes no profile or data; it restores the boot world only") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("off a TTY without --yes nothing is posted", func(t *testing.T) {
+		before := len(twins.resetCalls())
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe")
+		if code != 1 || !strings.Contains(stderr, "--yes") || len(twins.resetCalls()) != before {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("an unknown twin names the ones there are", func(t *testing.T) {
+		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "strip", "--yes")
+		if code != 1 || !strings.Contains(stderr, "No twin named 'strip' in sandbox "+sbID) ||
+			!strings.Contains(stderr, "veris sandbox reset stripe") {
+			t.Errorf("exit %d:\n%s", code, stderr)
+		}
+	})
 }
 
 // --- --json on every get and list ---------------------------------------------

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,14 +26,15 @@ const dataPlaneNote = "(data plane; schema from your SQL)"
 // sandboxServicesCommand is `veris sandbox services …`: the twins of a
 // sandbox, their status, env hints, row counts and manuals.
 func sandboxServicesCommand() *cli.Command {
-	var listID, getID, manualID string
+	var listID, getID, manualID, opsID, opsSurface string
 	var raw bool
 	return &cli.Command{
 		Name:    "services",
-		Summary: "The twins of a sandbox: list, get, manual",
+		Summary: "The twins of a sandbox: list, get, manual, operations",
 		Usage:   "veris sandbox services <command> [--id ID] [flags]",
 		Help: "A twin is one vendor service inside the sandbox. list shows every twin with its row counts,\n" +
-			"get adds the URLs and every table, manual prints the twin's own testing notes (GET /veris/manual).\n" +
+			"get adds the URLs and every table, manual prints the twin's own testing notes (GET /veris/manual),\n" +
+			"operations lists what the twin actually implements (GET /veris/operations).\n" +
 			"Each verb acts on this folder's sandbox unless --id names another.",
 		Sub: []*cli.Command{
 			{
@@ -87,6 +89,35 @@ func sandboxServicesCommand() *cli.Command {
 						return err
 					}
 					return servicesManual(ctx, manualID, name, raw)
+				},
+			},
+			{
+				Name:    "operations",
+				Summary: "What the twin implements: REST routes, GraphQL fields, MCP tools (GET /veris/operations)",
+				Usage:   "veris sandbox services operations [NAME] [--surface rest|graphql|mcp] [--id ID] [--json]",
+				Help: "The operations a twin actually serves, as opposed to everything its vendor documents: method\n" +
+					"and path template on a REST twin, operation type and field on a GraphQL twin, tool names on an\n" +
+					"MCP surface. A twin may serve a REST and an MCP surface both; --surface keeps one. --json\n" +
+					"prints the twin's document as it sent it. A twin that publishes no list (the data plane, and\n" +
+					"twins that opt out) says so and exits 0.\n" +
+					"NAME is the twin's own name, the first column of `veris sandbox services list`. Left out,\n" +
+					"a sandbox with one twin uses it, a terminal is asked which, and anything else is told the\n" +
+					"names the sandbox actually has.",
+				Flags: func(fs *flag.FlagSet) {
+					fs.StringVar(&opsID, "id", "", "sandbox id (default: this folder's)")
+					fs.StringVar(&opsSurface, "surface", "", "only this `surface`: rest, graphql or mcp")
+				},
+				Run: func(ctx *cli.Context, args []string) error {
+					name, err := atMostOneTwinName(ctx, args)
+					if err != nil {
+						return err
+					}
+					switch opsSurface {
+					case "", twin.SurfaceREST, twin.SurfaceGraphQL, twin.SurfaceMCP:
+					default:
+						return &cli.UsageError{Msg: fmt.Sprintf("--surface must be rest, graphql or mcp (got %q)", opsSurface)}
+					}
+					return servicesOperations(ctx, opsID, name, opsSurface)
 				},
 			},
 		},
@@ -482,6 +513,99 @@ func servicesManual(ctx *cli.Context, idFlag, name string, raw bool) error {
 		s.ui.Info("%s", line)
 	}
 	s.ui.Link(fmt.Sprintf("veris sandbox services manual %s --raw   (the markdown itself)", svc.Name))
+	return nil
+}
+
+// --- services operations ----------------------------------------------------
+
+// servicesOperations prints what one twin implements:
+//
+//	stripe · 3 operations
+//	  GET   /v1/customers
+//	  POST  /v1/customers
+//	  GET   /v1/customers/{customer}
+//	  MCP at /mcp (auth bearer) · 2 tools
+//	    get_widget
+//	    list_widgets
+//
+// A twin with no /veris/operations route is a warning, as a missing manual
+// is: the answer to the question is that the twin publishes no list.
+func servicesOperations(ctx *cli.Context, idFlag, name, surface string) error {
+	s, _, sb, err := openSandboxServices(ctx, idFlag)
+	if err != nil {
+		return err
+	}
+	svc, err := chooseTwin(s, sb, name, idFlag)
+	if err != nil {
+		return err
+	}
+	if svc.ControlURL == "" {
+		return noOperations(s, svc.Name)
+	}
+	raw, err := s.twin(svc.ControlURL).OperationsRaw(context.Background(), surface)
+	if errors.Is(err, twin.ErrNotSupported) {
+		return noOperations(s, svc.Name)
+	}
+	if err != nil {
+		return s.fail("read", "operations of "+svc.Name, err)
+	}
+	if s.ctx.Globals.JSON {
+		return printJSON(s.ctx.Stdout, raw)
+	}
+	var ops twin.Operations
+	if err := json.Unmarshal(raw, &ops); err != nil {
+		return s.fail("read", "operations of "+svc.Name, fmt.Errorf("the answer is not an operation list: %w", err))
+	}
+	noun := "operations"
+	if ops.Total == 1 {
+		noun = "operation"
+	}
+	title := fmt.Sprintf("%s · %d %s", svc.Name, ops.Total, noun)
+	if surface != "" {
+		title += " (" + surface + ")"
+	}
+	s.ui.Info("%s", title)
+	if len(ops.Operations) > 0 {
+		lines := make([][]string, 0, len(ops.Operations))
+		for _, op := range ops.Operations {
+			if op.Method != "" || op.Path != "" {
+				lines = append(lines, []string{"  " + op.Method, op.Path})
+			} else {
+				lines = append(lines, []string{"  " + op.Type, op.Field})
+			}
+		}
+		s.ui.Table(nil, lines)
+	}
+	if ops.MCP != nil && (ops.MCP.Path != nil || len(ops.MCP.Tools) > 0) {
+		head := "  MCP"
+		if ops.MCP.Path != nil {
+			head += " at " + *ops.MCP.Path
+		}
+		if ops.MCP.Auth != nil {
+			head += " (auth " + *ops.MCP.Auth + ")"
+		}
+		tools := "tools"
+		if len(ops.MCP.Tools) == 1 {
+			tools = "tool"
+		}
+		s.ui.Info("%s · %d %s", head, len(ops.MCP.Tools), tools)
+		for _, t := range ops.MCP.Tools {
+			s.ui.Info("    %s", t.Tool)
+		}
+	}
+	if ops.Total == 0 {
+		s.ui.Info("  (none)")
+	}
+	return nil
+}
+
+// noOperations is a twin that publishes no operation list: a warning, and
+// under --json {service, operations: null}, so a pipe still reads a document.
+func noOperations(s *session, name string) error {
+	s.ui.Warn("%s publishes no operation list (GET /veris/operations is not served)", name)
+	if s.ctx.Globals.JSON {
+		return printJSON(s.ctx.Stdout, map[string]any{"service": name, "operations": nil})
+	}
 	return nil
 }
 
