@@ -322,8 +322,10 @@ add` and `up` take, is accepted too and its NAME entry is used, and one keyed
 only by other twins is refused before anything is sent. A twin that refuses
 the profile or the rows answers 422 and its reasons are printed one per line;
 its world is unchanged. It asks first (`--yes` skips) and `--json` prints
-`{service, sandbox, reset, seeded}`. The postgres twin's reset restores its
-boot world and takes neither flag.
+`{service, sandbox, reset, seeded}`. Numbers in FILE reach the twin exactly
+as written. The postgres twin's reset restores its boot world and takes
+neither flag; asking it for a profile or rows is refused before anything is
+sent, since its reset would wipe regardless.
 
 `sandbox services operations [NAME] [--surface rest|graphql|mcp]` lists what
 a twin actually serves (`GET /veris/operations`): method and path template on

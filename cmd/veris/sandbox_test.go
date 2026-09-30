@@ -1507,15 +1507,65 @@ func TestSandboxResetOneTwin(t *testing.T) {
 		sbInOrder(t, stderr, "✗ Failed to reset stripe: [422]\n", "  unknown seed profile 'nope'; available: default, empty\n")
 	})
 
-	t.Run("the postgres twin restores its boot world and takes no profile", func(t *testing.T) {
+	t.Run("--data keeps every number exactly as written", func(t *testing.T) {
+		for name, content := range map[string]string{
+			"big-tables.json": `{"customers": [{"id": "cus_1", "balance": 9007199254740993, "rate": 0.1000000000000000055511151231257827}]}`,
+			"big-seed.json":   `{"stripe": {"customers": [{"id": "cus_1", "balance": 9007199254740993, "rate": 0.1000000000000000055511151231257827}]}}`,
+		} {
+			file := write(name, content)
+			code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "stripe", "--data", file, "--yes")
+			if code != 0 {
+				t.Fatalf("%s: exit %d:\n%s", name, code, stderr)
+			}
+			want := `{"data":{"customers":[{"balance":9007199254740993,"id":"cus_1","rate":0.1000000000000000055511151231257827}]}}`
+			if got := lastReset(t).raw; got != want {
+				t.Errorf("%s: body %s\nwant %s", name, got, want)
+			}
+		}
+	})
+
+	t.Run("the postgres twin restores its boot world", func(t *testing.T) {
 		code, _, stderr := runSandboxCLI(t, "sandbox", "reset", "postgres", "--yes")
 		if code != 0 || !strings.Contains(stderr, "✓ postgres reset to its boot world\n") {
 			t.Errorf("exit %d:\n%s", code, stderr)
 		}
-		code, _, stderr = runSandboxCLI(t, "sandbox", "reset", "postgres", "--seed-profile", "default", "--yes")
-		if code != 1 || !strings.Contains(stderr, "this twin's reset takes no profile or data; it restores the boot world only") {
-			t.Errorf("exit %d:\n%s", code, stderr)
+		if c := lastReset(t); c.twin != "postgres" || c.raw != "{}" {
+			t.Errorf("reset = %s %s", c.twin, c.raw)
 		}
+	})
+
+	// The postgres twin ignores the body and wipes regardless, so a profile
+	// or rows asked of it must be refused before the POST, not after.
+	t.Run("a data-plane twin is refused a profile or rows before anything is sent", func(t *testing.T) {
+		file := write("pg.json", `{"users": []}`)
+		refuse := func(t *testing.T) {
+			t.Helper()
+			for _, extra := range [][]string{{"--seed-profile", "default"}, {"--data", file}} {
+				before := len(twins.resetCalls())
+				argv := append([]string{"sandbox", "reset", "postgres", "--yes"}, extra...)
+				code, _, stderr := runSandboxCLI(t, argv...)
+				if code != 1 || !strings.Contains(stderr, "✗ postgres is a data-plane twin: its reset restores the boot world only and takes no "+extra[0]+"; nothing was sent\n") {
+					t.Errorf("%v: exit %d:\n%s", extra, code, stderr)
+				}
+				if len(twins.resetCalls()) != before {
+					t.Errorf("%v: a POST /veris/reset reached the twin", extra)
+				}
+			}
+		}
+		t.Run("known by its DSN", refuse)
+		t.Run("known by its introspected schema", func(t *testing.T) {
+			services := twins.services("zendesk")
+			services[1].URL = services[1].ControlURL // an http URL: only the schema tells
+			plane.script(func(p *sandboxPlane) {
+				p.answer = func(int) *api.Sandbox { return readySandbox(services, time.Now().Add(time.Hour)) }
+			})
+			t.Cleanup(func() {
+				plane.script(func(p *sandboxPlane) {
+					p.answer = func(int) *api.Sandbox { return readySandbox(twins.services("zendesk"), time.Now().Add(time.Hour)) }
+				})
+			})
+			refuse(t)
+		})
 	})
 
 	t.Run("off a TTY without --yes nothing is posted", func(t *testing.T) {

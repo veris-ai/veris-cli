@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,6 +165,7 @@ type twinCall struct {
 	key   string
 	query string
 	body  map[string]any
+	raw   string // the body exactly as sent
 }
 
 // dataEdit is one PATCH or DELETE of /veris/data as the twin received it.
@@ -332,10 +334,11 @@ func newDataTwins(t *testing.T) *dataTwins {
 	mux.HandleFunc("POST "+prefix+"{twin}/veris/reset", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(raw, &body)
 		name := r.PathValue("twin")
-		f.resets = append(f.resets, twinCall{twin: name, key: r.Header.Get("X-API-Key"), body: body})
+		f.resets = append(f.resets, twinCall{twin: name, key: r.Header.Get("X-API-Key"), body: body, raw: string(raw)})
 		if f.resetReply != nil {
 			status, answer := f.resetReply(name, body)
 			sbJSON(w, status, answer)

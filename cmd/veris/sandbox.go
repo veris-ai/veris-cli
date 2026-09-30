@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1554,6 +1556,24 @@ func twinReset(ctx *cli.Context, idFlag, name, seedProfile, dataFile string) err
 			target = fmt.Sprintf("the rows of %s (%s)", dataFile, countsLine(rowCounts(data)))
 		}
 	}
+	// The postgres twin's reset reads no body and restores its boot world
+	// whatever it is sent, so a profile or rows asked of it must be refused
+	// here: once the POST is sent, its world is already gone.
+	if seedProfile != "" || dataFile != "" {
+		dataPlane, err := isDataPlaneTwin(context.Background(), s, *svc)
+		if err != nil {
+			return s.fail("read", "schema of "+svc.Name, err)
+		}
+		if dataPlane {
+			flagName := "--seed-profile"
+			if dataFile != "" {
+				flagName = "--data"
+			}
+			s.ui.Fail("%s is a data-plane twin: its reset restores the boot world only and takes no %s; nothing was sent", svc.Name, flagName)
+			s.ui.Next(twinCommand("sandbox reset", svc.Name, idFlag))
+			return printed(1)
+		}
+	}
 	if err := confirm(s.ui, fmt.Sprintf("Reset %s in %s to %s? Other twins and the clock are left alone.", svc.Name, sb.ID, target)); err != nil {
 		return err
 	}
@@ -1576,6 +1596,38 @@ func twinReset(ctx *cli.Context, idFlag, name, seedProfile, dataFile string) err
 	return nil
 }
 
+// isDataPlaneTwin reports whether svc is a data-plane twin (postgres),
+// whose reset takes no profile or rows. Its URL is a DSN rather than an HTTP
+// URL; failing that, its GET /veris/schema is the introspected {tables}
+// document rather than an HTTP twin's JSON Schema -- the same test data
+// schema uses to tell the two apart. Both are reads, so asking changes
+// nothing.
+func isDataPlaneTwin(ctx context.Context, s *session, svc api.ServiceInfo) (bool, error) {
+	if u, err := url.Parse(svc.URL); err == nil && u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https" {
+		return true, nil
+	}
+	doc, err := twinSchema(ctx, s, svc)
+	if err != nil {
+		return false, err
+	}
+	return doc.pg != nil, nil
+}
+
+// decodeExact decodes JSON keeping every number as the literal it was
+// written as (json.Number), so a row's 9007199254740993 reaches the twin as
+// itself rather than rounded through float64.
+func decodeExact(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errors.New("trailing data after the JSON value")
+	}
+	return nil
+}
+
 // resetData is the {table: [rows]} a --data file holds for the twin called
 // name. The twin's reset takes one twin's tables; `data add` and up take a
 // file keyed by twin name. Both are accepted: a top-level key that is this
@@ -1590,7 +1642,7 @@ func resetData(top map[string]json.RawMessage, name string, services []api.Servi
 	}
 	if entry, ok := top[name]; ok && isObject(entry) {
 		var data map[string]any
-		if err := json.Unmarshal(entry, &data); err != nil {
+		if err := decodeExact(entry, &data); err != nil {
 			return nil, fmt.Errorf("'%s' must be an object of tables to rows", name)
 		}
 		return data, nil
@@ -1609,7 +1661,7 @@ func resetData(top map[string]json.RawMessage, name string, services []api.Servi
 	data := make(map[string]any, len(top))
 	for key, raw := range top {
 		var v any
-		if err := json.Unmarshal(raw, &v); err != nil {
+		if err := decodeExact(raw, &v); err != nil {
 			return nil, err
 		}
 		data[key] = v
