@@ -389,7 +389,7 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			argv: []string{"sandbox", "services", "--help"},
 			code: 0,
 			stdoutHas: []string{"veris sandbox services - The twins of a sandbox", "Usage:\n  veris sandbox services <command> [--id ID]",
-				"Commands:\n  list", "  get ", "  manual "},
+				"Commands:\n  list", "  get ", "  manual ", "  operations "},
 			stderrNone: true,
 		},
 		{

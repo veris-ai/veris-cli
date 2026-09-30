@@ -228,7 +228,7 @@ func TestEveryRouteSendsWhatTheTwinExpects(t *testing.T) {
 		},
 		{
 			name:   "operations on a REST twin",
-			call:   func(c *Client) (any, error) { return c.Operations(ctx) },
+			call:   func(c *Client) (any, error) { return c.Operations(ctx, "") },
 			method: "GET", path: "/s/sbx_1/stripe/veris/operations",
 			answer: `{"service":"stripe","total":2,"operations":[{"method":"GET","path":"/v1/customers"},{"method":"POST","path":"/v1/customers"}]}`,
 			want: &Operations{Service: "stripe", Total: 2, Operations: []Operation{
@@ -237,7 +237,7 @@ func TestEveryRouteSendsWhatTheTwinExpects(t *testing.T) {
 		},
 		{
 			name:   "operations on a GraphQL twin",
-			call:   func(c *Client) (any, error) { return c.Operations(ctx) },
+			call:   func(c *Client) (any, error) { return c.Operations(ctx, "") },
 			method: "GET", path: "/s/sbx_1/stripe/veris/operations",
 			answer: `{"service":"linear","total":2,"operations":[{"type":"query","field":"issue"},{"type":"mutation","field":"issueCreate"}]}`,
 			want: &Operations{Service: "linear", Total: 2, Operations: []Operation{
@@ -246,11 +246,21 @@ func TestEveryRouteSendsWhatTheTwinExpects(t *testing.T) {
 		},
 		{
 			name:   "operations on an MCP twin",
-			call:   func(c *Client) (any, error) { return c.Operations(ctx) },
+			call:   func(c *Client) (any, error) { return c.Operations(ctx, "") },
 			method: "GET", path: "/s/sbx_1/stripe/veris/operations",
 			answer: `{"service":"mcp-surface-test","total":2,"mcp":{"path":"/mcp","tools":[{"tool":"get_widget"},{"tool":"list_widgets"}]}}`,
 			want: &Operations{Service: "mcp-surface-test", Total: 2, MCP: &MCPSurface{
 				Path: ptr("/mcp"), Tools: []MCPTool{{Tool: "get_widget"}, {Tool: "list_widgets"}},
+			}},
+		},
+		{
+			name:   "operations narrowed to one surface sends it as the query",
+			call:   func(c *Client) (any, error) { return c.Operations(ctx, SurfaceMCP) },
+			method: "GET", path: "/s/sbx_1/stripe/veris/operations",
+			query:  "surface=mcp",
+			answer: `{"service":"stripe","total":1,"mcp":{"path":"/mcp","auth":"bearer","sign_in":"oauth","tools":[{"tool":"get_widget"}]}}`,
+			want: &Operations{Service: "stripe", Total: 1, MCP: &MCPSurface{
+				Path: ptr("/mcp"), Auth: ptr("bearer"), SignIn: "oauth", Tools: []MCPTool{{Tool: "get_widget"}},
 			}},
 		},
 		{
@@ -594,7 +604,7 @@ func TestOperationsMapsEvery404ToNotSupported(t *testing.T) {
 	for _, body := range []string{`{"detail":"Not Found"}`, `{"detail":"gone"}`, ``, `not json`} {
 		t.Run(body, func(t *testing.T) {
 			c, _ := fakeTwin(t, http.StatusNotFound, body)
-			_, err := c.Operations(context.Background())
+			_, err := c.Operations(context.Background(), "")
 			if !errors.Is(err, ErrNotSupported) {
 				t.Fatalf("err = %v, want ErrNotSupported", err)
 			}
@@ -606,9 +616,24 @@ func TestOperationsMapsEvery404ToNotSupported(t *testing.T) {
 	}
 	// Other statuses stay what they are.
 	c, _ := fakeTwin(t, http.StatusInternalServerError, `{"detail":"boom"}`)
-	_, err := c.Operations(context.Background())
+	_, err := c.Operations(context.Background(), "")
 	if errors.Is(err, ErrNotSupported) {
 		t.Errorf("a 500 must not read as unsupported: %v", err)
+	}
+}
+
+// OperationsRaw hands back the document as the twin sent it, fields this
+// package does not model included, and refuses a surface the route has no
+// name for before sending anything.
+func TestOperationsRawAndSurfaces(t *testing.T) {
+	body := `{"service":"stripe","total":0,"operations":[],"future_field":{"x":1}}`
+	c, _ := fakeTwin(t, http.StatusOK, body)
+	raw, err := c.OperationsRaw(context.Background(), SurfaceREST)
+	if err != nil || string(raw) != body {
+		t.Errorf("raw = %s, %v; want the body as sent", raw, err)
+	}
+	if _, err := c.Operations(context.Background(), "soap"); err == nil || err.Error() != `surface "soap" is not one of rest, graphql, mcp` {
+		t.Errorf("err = %v", err)
 	}
 }
 
@@ -654,7 +679,7 @@ func TestVendorShaped404sAreNotSupportedOnOptionalRoutes(t *testing.T) {
 	}
 	calls := map[string]func(c *Client) error{
 		"seed":       func(c *Client) error { _, err := c.Seed(ctx, "select 1"); return err },
-		"operations": func(c *Client) error { _, err := c.Operations(ctx); return err },
+		"operations": func(c *Client) error { _, err := c.Operations(ctx, ""); return err },
 	}
 	for callName, call := range calls {
 		for bodyName, body := range bodies {
@@ -964,7 +989,7 @@ func TestLegacyVendor401IsNotACredentialRefusal(t *testing.T) {
 // is.
 func TestSandboxNotFoundIsNotErrNotSupported(t *testing.T) {
 	c, _ := fakeTwin(t, http.StatusNotFound, `{"detail":"sandbox not found"}`)
-	_, err := c.Operations(context.Background())
+	_, err := c.Operations(context.Background(), "")
 	if !errors.Is(err, ErrSandboxNotFound) {
 		t.Fatalf("err = %v, want ErrSandboxNotFound", err)
 	}

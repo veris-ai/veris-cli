@@ -314,10 +314,14 @@ type Operation struct {
 	Field  string `json:"field,omitempty"`
 }
 
-// MCPSurface is the hosted MCP endpoint and the tools it resolves.
+// MCPSurface is the hosted MCP endpoint and the tools it resolves. Auth is
+// what a client must present ("bearer" or "none"); SignIn is "oauth" when a
+// third-party MCP client can sign in through the twin, and empty otherwise.
 type MCPSurface struct {
-	Path  *string   `json:"path"`
-	Tools []MCPTool `json:"tools"`
+	Path   *string   `json:"path"`
+	Auth   *string   `json:"auth,omitempty"`
+	SignIn string    `json:"sign_in,omitempty"`
+	Tools  []MCPTool `json:"tools"`
 }
 
 // MCPTool is one implemented tool.
@@ -499,14 +503,45 @@ func (c *Client) Manual(ctx context.Context) (string, error) {
 	return manual, nil
 }
 
-// Operations is GET /veris/operations. A twin that publishes no operation
-// list has no such route; that 404 is ErrNotSupported.
-func (c *Client) Operations(ctx context.Context) (*Operations, error) {
-	var out Operations
-	if err := optional404(c.do(ctx, http.MethodGet, "/veris/operations", nil, nil, &out)); err != nil {
+// Surfaces GET /veris/operations can be narrowed to.
+const (
+	SurfaceREST    = "rest"
+	SurfaceGraphQL = "graphql"
+	SurfaceMCP     = "mcp"
+)
+
+// Operations is GET /veris/operations, every surface the twin serves when
+// surface is "", or only the one named (rest, graphql or mcp). A twin that
+// publishes no operation list has no such route; that 404 is
+// ErrNotSupported.
+func (c *Client) Operations(ctx context.Context, surface string) (*Operations, error) {
+	raw, err := c.OperationsRaw(ctx, surface)
+	if err != nil {
 		return nil, err
 	}
+	var out Operations
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("GET /veris/operations answered a body that is not an operation list: %w", err)
+	}
 	return &out, nil
+}
+
+// OperationsRaw is Operations as the twin sent it, for a caller that passes
+// the document through (--json) rather than reading it.
+func (c *Client) OperationsRaw(ctx context.Context, surface string) (json.RawMessage, error) {
+	q := url.Values{}
+	switch surface {
+	case "":
+	case SurfaceREST, SurfaceGraphQL, SurfaceMCP:
+		q.Set("surface", surface)
+	default:
+		return nil, fmt.Errorf("surface %q is not one of %s, %s, %s", surface, SurfaceREST, SurfaceGraphQL, SurfaceMCP)
+	}
+	var out json.RawMessage
+	if err := optional404(c.do(ctx, http.MethodGet, "/veris/operations", q, nil, &out)); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // optional404 marks any 404 from a route a twin may simply not have as
