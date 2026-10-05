@@ -285,6 +285,13 @@ func writeJSON(path string, value any) error {
 
 // --- turning a snapshot into a config ---------------------------------------
 
+// FilesystemService is the name the control plane gives the member that
+// holds a sandbox's folders. Its URL is a WebDAV root for people and tools
+// (`veris sandbox fs`), not a vendor base URL for the code under test: the
+// proxy never routes it and never hands it to a command, whatever env hint
+// it carries.
+const FilesystemService = "filesystem"
+
 // Unroutable explains why one of a sandbox's services got no interception
 // entry, so `use` can say so rather than quietly cover fewer dependencies than
 // the sandbox runs.
@@ -325,6 +332,17 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 
 	var skipped []Unroutable
 	for _, svc := range snapshot.Services {
+		if svc.Name == FilesystemService {
+			// Not a dependency of the command: nothing to intercept, nothing
+			// to hand over, and nothing to report as missing. A --route at
+			// it would send the command's traffic into the WebDAV root.
+			if _, routed := overrides[svc.Name]; routed {
+				return nil, nil, fmt.Errorf(
+					"--route names %s, the sandbox's WebDAV root, which is reached "+
+						"with `veris sandbox fs` and never routed", svc.Name)
+			}
+			continue
+		}
 		if !isHTTP(svc.URL) {
 			// A Postgres DSN is a wire protocol this proxy does not speak. It
 			// is reached directly — and the client code that reads it already
@@ -413,9 +431,9 @@ func ToConfig(snapshot *Snapshot, overrides map[string][]routes.Entry) (*config.
 // only if the command is handed the twin's URL under its env hint, and only
 // the sandbox's own ledger can count what arrived. It is the decision
 // ToConfig makes, exposed so the CLI can make the same one on a sandbox
-// described by the control plane.
+// described by the control plane. The filesystem member is never proxied.
 func NotProxied(svc Service, overrides map[string][]routes.Entry) bool {
-	if !isHTTP(svc.URL) {
+	if svc.Name == FilesystemService || !isHTTP(svc.URL) {
 		return true
 	}
 	entries, _ := routesFor(svc, overrides)

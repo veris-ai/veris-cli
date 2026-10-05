@@ -116,6 +116,34 @@ type CreateSandboxRequest struct {
 	SnapshotID    *string           `json:"snapshot_id,omitempty"`
 	ClientBaseURL *string           `json:"client_base_url,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
+	// Filesystem is the folders the sandbox's filesystem holds; empty sends
+	// nothing, and a control plane that predates agent filesystems ignores
+	// the field rather than refusing it. With SnapshotID, an explicit list
+	// replaces the snapshot's recorded folders; none takes them.
+	Filesystem []FilesystemFolder `json:"filesystem,omitempty"`
+}
+
+// FilesystemFolder is one folder of a sandbox's filesystem as the create
+// request names it (models.py's filesystem item). Exactly one of Git, GCS
+// and Upload is set, or none for an empty folder. Name defaults server-side
+// to the source's basename; Auth names an environment secret the engine
+// fetches the source with.
+type FilesystemFolder struct {
+	Name   string `json:"name,omitempty"`
+	Git    string `json:"git,omitempty"`
+	GCS    string `json:"gcs,omitempty"`
+	Upload string `json:"upload,omitempty"`
+	Ref    string `json:"ref,omitempty"`
+	Root   bool   `json:"root,omitempty"`
+	Auth   string `json:"auth,omitempty"`
+}
+
+// UploadResponse is POST /v1/environments/{id}/uploads' answer: the id a
+// FilesystemFolder's Upload names, and what was stored.
+type UploadResponse struct {
+	ID     string `json:"id"`
+	Bytes  int64  `json:"bytes"`
+	SHA256 string `json:"sha256"`
 }
 
 // SandboxUpdate is PATCH …/sandboxes/{id}'s body. The server reads which

@@ -25,6 +25,8 @@ func TestTheHandoffReachesTheWorkloadBehindTheUsersOwnVariables(t *testing.T) {
 		{Name: "postgres", URL: "postgresql://u:p@h:5432/db", EnvHint: "DATABASE_URL"},
 		{Name: "yente", URL: "http://gw/s/sbx_1/yente", ControlURL: "http://gw/s/sbx_1/yente", EnvHint: "YENTE_API_BASE"},
 		{Name: "nameless", URL: "http://gw/s/sbx_1/nameless"},
+		// The filesystem's hint names a path inside the pod, not a host value.
+		{Name: "filesystem", URL: "http://gw/s/sbx_1/filesystem/", ControlURL: "http://gw/c/sbx_1/filesystem", EnvHint: "WORKSPACE_DIR"},
 	}
 	handed := handoffs(services, nil, []string{"DATABASE_URL=postgresql://mine", "DEBUG"})
 	want := []config.PassEnvVar{{Name: "YENTE_API_BASE", Value: "http://gw/s/sbx_1/yente", Service: "yente"}}

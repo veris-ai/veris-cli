@@ -236,6 +236,9 @@ type upOptions struct {
 	callbackURL string
 	timeout     string
 	watch       bool
+	// fs is every --fs value as typed; parsed by upFolders, which also
+	// decides between it and the config's filesystem: list.
+	fs []string
 
 	// The session up hands over to once the sandbox is routable.
 	proxy  bool
@@ -250,7 +253,7 @@ func upCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "up",
 		Summary: "Start a sandbox of the environment and wait for it",
-		Usage:   "veris up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--callback-url URL] [--timeout 300s] [--proxy [--image IMG] [--listen ADDR] [--expose PORT] [--strict]] [--watch] [--json]",
+		Usage:   "veris up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--fs " + fsSpecGrammar + "]... [--callback-url URL] [--timeout 300s] [--proxy [--image IMG] [--listen ADDR] [--expose PORT] [--strict]] [--watch] [--json]",
 		Help: "--proxy opens a shell already routed at the new sandbox and returns when you leave it. There\n" +
 			"is nothing to source and no base URL to change: your code keeps its production hostnames and\n" +
 			"the sandbox answers them. It runs `veris run` for the session, so both tiers are the same\n" +
@@ -264,7 +267,17 @@ func upCommand() *cli.Command {
 			"the env-var hints the code under test needs. Settings come from the flag, then the environment\n" +
 			"config, then the defaults: boot bundle, and no TTL of its own -- a sandbox nobody gave one\n" +
 			"lives as long as the control plane's own default. --watch shows the wait as a live panel of\n" +
-			"the sandbox and its twins on a terminal, redrawn every 2 s until every twin is routable.",
+			"the sandbox and its twins on a terminal, redrawn every 2 s until every twin is routable.\n" +
+			"--fs gives the sandbox a filesystem: one folder per flag, " + fsSpecGrammar + ", where SOURCE is a\n" +
+			"git URL (https or ssh; @REF picks the branch or tag) or a local directory, which is tarred and\n" +
+			"uploaded before the sandbox is created (.git included; .veris/twin.local.yaml and .veris/*.lock\n" +
+			"left out). NAME= names the folder (default: the source's basename) and :root marks the one the\n" +
+			"agent's working directory is. The flags replace the environment config's filesystem: list, as\n" +
+			"every other flag replaces its setting. A private source's secret is named by auth: in the config,\n" +
+			"and a gs:// prefix always needs one, so it is written there ({gcs: gs://bucket/prefix, auth: NAME})\n" +
+			"rather than given to --fs. The folders appear as the sandbox's `filesystem` service, a WebDAV root\n" +
+			"that veris sandbox fs connects to, diffs, pulls, pushes and mounts. With --boot snapshot the\n" +
+			"snapshot's own folders boot, the config's list is not sent, and only --fs replaces them.",
 		Flags: func(fs *flag.FlagSet) {
 			fs.BoolVar(&o.watch, "watch", false, "show the wait as a live panel (terminal only)")
 			fs.StringVar(&o.env, "env", "", "environment name or id (same as NAME)")
@@ -272,6 +285,11 @@ func upCommand() *cli.Command {
 			fs.StringVar(&o.boot, "boot", "", "what the sandbox boots: bundle, baseline or snapshot (config, then bundle)")
 			fs.StringVar(&o.snapshot, "snapshot", "", "snapshot id or name, for --boot snapshot")
 			fs.StringVar(&o.callbackURL, "callback-url", "", "where the twins deliver callbacks (config)")
+			// Not comma-split: a git URL or a gs:// prefix may hold a comma.
+			fs.Func("fs", fsFlagHelp, func(v string) error {
+				o.fs = append(o.fs, v)
+				return nil
+			})
 			fs.StringVar(&o.timeout, "timeout", defaultUpTimeout, "budget for ready and routable, e.g. 300s or 5m")
 			fs.BoolVar(&o.proxy, "proxy", false, "open a shell routed at the new sandbox, and hold it until you leave")
 			fs.StringVar(&o.image, "image", "", "with --proxy: run the session inside this container `image`, with the redirect in the kernel, which covers every runtime")
@@ -407,6 +425,10 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 		s.ui.Fail("--snapshot only applies with --boot snapshot (got --boot %s)", boot)
 		return s, nil, printed(1)
 	}
+	folders, err := upFolders(s, o, conf, boot)
+	if err != nil {
+		return s, nil, err
+	}
 	env, err := c.GetEnvironment(bg, envID)
 	if err != nil {
 		return s, nil, s.fail("read", "environment "+envID, err)
@@ -445,6 +467,15 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 	if callback != "" {
 		req.ClientBaseURL = &callback
 	}
+	// Local directories go up before the sandbox exists, so a folder that
+	// cannot be sent leaves no sandbox and no pointer behind.
+	if len(folders) > 0 {
+		uploads, err := uploadFolders(bg, s, c, envID, folders)
+		if err != nil {
+			return s, nil, err
+		}
+		req.Filesystem = folderRequest(folders, uploads)
+	}
 
 	serverName := env.Name
 	if serverName == "" {
@@ -462,8 +493,19 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 	if catErr != nil {
 		s.ui.Warn("could not list services, so the twins are unannotated: %v", catErr)
 	}
-	s.ui.Info("Starting '%s' (%s: %s) · boot %s · %s",
+	starting := fmt.Sprintf("Starting '%s' (%s: %s) · boot %s · %s",
 		envName, serverName, withAdded(env.Services, catalog), bootLabel, life)
+	switch n := len(folders); {
+	case n == 1:
+		starting += " · fs 1 folder"
+	case n > 1:
+		starting += fmt.Sprintf(" · fs %d folders", n)
+	case boot == bootSnapshot:
+		// No list goes with snapshot_id, so the snapshot's own folders boot,
+		// whatever the config's filesystem: list says.
+		starting += " · fs from snapshot"
+	}
+	s.ui.Info("%s", starting)
 	// The pointer is about to be replaced: a sandbox it still names keeps
 	// running until its TTL and is reachable afterwards only by id, so the
 	// orphan is announced with the command that deletes it.
@@ -501,6 +543,13 @@ func upSandbox(ctx *cli.Context, name string, o upOptions, remember bool) (*sess
 		if err := waitRoutable(bg, s, sb, deadline, timeout); err != nil {
 			return s, sb, err
 		}
+	}
+	// An older control plane ignores a field it does not know rather than
+	// refusing it: the sandbox comes up with every twin and no folders, and
+	// the only trace is the member that is not there. Said once, as a
+	// warning: the sandbox exists and is otherwise what was asked for.
+	if len(req.Filesystem) > 0 && findService(sb.Services, filesystemService) == nil {
+		s.ui.Warn("The control plane ignored the filesystem request (it predates agent filesystems); sandbox %s has no folders", sb.ID)
 	}
 	printHints(s.ui, sb.Services, env.Services, catalog)
 	if conf != nil && len(conf.Data) > 0 {
@@ -552,6 +601,104 @@ func upSettings(o upOptions, conf *cfg.EnvConfig) (ttl int, boot, snapshot, call
 		}
 	}
 	return ttl, boot, snapshot, callback
+}
+
+// upFolders is the sandbox's folder list: every --fs value when any was
+// given, else -- unless the sandbox boots a snapshot -- the environment
+// config's filesystem: list, resolved against the project directory. The
+// two never merge, as no other up setting does. A snapshot recorded its
+// own folders, modifications and all, and a list sent beside snapshot_id
+// replaces them; so with --boot snapshot the config's list stays home and
+// only --fs, which says so on the command line, replaces the snapshot's.
+// A flag that will not parse is a usage error; a config entry that will
+// not is the file's fault and is printed as such.
+func upFolders(s *session, o upOptions, conf *cfg.EnvConfig, boot string) ([]folderSpec, error) {
+	if len(o.fs) > 0 {
+		return foldersFromFlags(o.fs, s.cwd)
+	}
+	if boot == bootSnapshot || conf == nil || len(conf.Filesystem) == 0 {
+		return nil, nil
+	}
+	folders, err := foldersFromConfig(s.res.Project.Dir(), conf.Filesystem)
+	if err != nil {
+		s.ui.Fail("%s: %v", relPath(s.cwd, s.res.Project.Path), err)
+		return nil, printed(1)
+	}
+	return folders, nil
+}
+
+// uploadFolders tars and uploads every local directory among folders and
+// returns the upload id each was given, by folder name. A control plane
+// without the uploads route answers FastAPI's 404; that is said plainly,
+// with the sources that need no upload, and nothing is created.
+func uploadFolders(ctx context.Context, s *session, c *api.Client, envID string, folders []folderSpec) (map[string]string, error) {
+	uploads := map[string]string{}
+	for _, f := range folders {
+		if f.Kind != folderPath {
+			continue
+		}
+		tmp, sum, err := stageFolder(f.Dir)
+		if err != nil {
+			return nil, s.fail("pack", "folder "+f.Name+" ("+f.Source+")", err)
+		}
+		for _, skipped := range sum.Skipped {
+			s.ui.Warn("%s: %s is neither a file, a directory nor a symlink; left out", f.Name, skipped)
+		}
+		id, err := sendFolder(ctx, s, c, envID, f, tmp)
+		_ = os.Remove(tmp.Name())
+		if err != nil {
+			return nil, err
+		}
+		uploads[f.Name] = id
+		s.ui.Success("Uploaded %s: %d %s, %s (%s)", f.Name, sum.Files, plural(sum.Files, "file", "files"), byteSize(sum.Bytes), id)
+	}
+	return uploads, nil
+}
+
+// stageFolder packs dir into a temporary gzip tar, which the upload then
+// streams with its size known. The caller removes the file.
+func stageFolder(dir string) (*os.File, tarSummary, error) {
+	tmp, err := os.CreateTemp("", "veris-fs-*.tar.gz")
+	if err != nil {
+		return nil, tarSummary{}, err
+	}
+	sum, err := tarDir(dir, tmp)
+	if err == nil {
+		_, err = tmp.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, sum, err
+	}
+	return tmp, sum, nil
+}
+
+// sendFolder streams one staged tar as an upload under a spinner, closing
+// the file. A 413 names the server's limit; a 404 with FastAPI's own
+// detail is a plane without the route.
+func sendFolder(ctx context.Context, s *session, c *api.Client, envID string, f folderSpec, tmp *os.File) (string, error) {
+	defer tmp.Close()
+	info, err := tmp.Stat()
+	if err != nil {
+		return "", s.fail("pack", "folder "+f.Name, err)
+	}
+	sp := s.ui.Spinner(fmt.Sprintf("Uploading %s (%s)", f.Name, byteSize(info.Size())))
+	up, err := c.UploadFolder(ctx, envID, f.Name, tmp, info.Size())
+	sp.Stop()
+	if err == nil {
+		return up.ID, nil
+	}
+	var ae *api.Error
+	switch {
+	case errors.As(err, &ae) && ae.Status == http.StatusNotFound && (ae.Detail == "Not Found" || ae.Detail == "404 page not found"):
+		s.ui.Fail("This control plane has no uploads route, so the local folder %s (%s) cannot be sent; name a git source instead (or a gs:// prefix in the config), or upgrade the control plane", f.Name, f.Source)
+		return "", printed(1)
+	case errors.As(err, &ae) && ae.Status == http.StatusRequestEntityTooLarge:
+		s.ui.Fail("Folder %s is %s packed, more than the control plane accepts in one upload: %s", f.Name, byteSize(info.Size()), ae.Error())
+		return "", printed(1)
+	}
+	return "", s.fail("upload", "folder "+f.Name, err)
 }
 
 func upBootKnown(b string) bool {
@@ -973,10 +1120,17 @@ func countsLine(counts map[string]int) string {
 
 // printHints prints what the code under test needs: one ENV_HINT=url line
 // per service. A URL that is not http is a data-plane DSN the app dials
-// itself, and says so beneath.
+// itself, and says so beneath. The filesystem member is not for the code
+// under test at all -- its URL is a WebDAV root for people and tools, and
+// any hint it carries names a path inside the pod -- so it prints as what
+// it is, with the verbs that reach it.
 func printHints(u *ui.UI, services []api.ServiceInfo, requested []string, catalog []api.CatalogService) {
 	width := nameWidth(services)
 	for _, svc := range services {
+		if svc.Name == filesystemService {
+			u.Info("  %-*s   WebDAV %s   (veris sandbox fs connect | diff | pull | push | mount)", width, svc.Name, svc.URL)
+			continue
+		}
 		v := svc.URL
 		if svc.EnvHint != "" {
 			v = svc.EnvHint + "=" + svc.URL

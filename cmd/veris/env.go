@@ -80,6 +80,9 @@ type createFlags struct {
 	command  optString
 	def      bool
 	force    bool
+	// fs is every --fs value as typed. Not a listFlag: a git URL or a
+	// gs:// prefix may hold a comma, so there is no splitting on one.
+	fs []string
 
 	// The proxy: block, as run's flags spell it.
 	image           string
@@ -97,6 +100,10 @@ func (f *createFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.snapshot, "snapshot", "", "the snapshot `id` or name a sandbox boots, with --boot snapshot")
 	fs.Var(&f.data, "data", "data `file` to add after boot (repeatable or comma-separated; none unless given)")
 	fs.Var(&f.command, "command", "the test command run through the proxy, as one shell `string` ('' for none)")
+	fs.Func("fs", fsFlagHelp, func(v string) error {
+		f.fs = append(f.fs, v)
+		return nil
+	})
 	fs.BoolVar(&f.def, "default", false, "make it the project's default environment")
 	fs.BoolVar(&f.force, "force", false, "replace an environment of the same name in .veris/twin.yaml")
 	fs.StringVar(&f.image, "image", "", "proxy.image: run the test command in this container `image`, the proxy beside it")
@@ -111,7 +118,7 @@ func envCreateCommand() *cli.Command {
 	return &cli.Command{
 		Name:    "create",
 		Summary: "Define a named environment",
-		Usage:   "veris env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force] [--json]",
+		Usage:   "veris env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot ID|NAME] [--data FILE] [--fs " + fsSpecGrammar + "]... [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force] [--json]",
 		Help: `The name and service list go to the server (POST /v1/environments), or
 --from adopts an existing server environment by id. The named config in
 .veris/twin.yaml, created when the folder has none, keeps everything else.
@@ -119,11 +126,27 @@ func envCreateCommand() *cli.Command {
 Two questions are asked on a TTY: the name and the services (a searchable
 picker). Off a TTY both must be flags: the name, and --services or --from.
 
---boot, --snapshot, --data and --command are recorded only when given, and
-nothing is written for the ones left out -- a sandbox then boots the bundle,
-seeds nothing, and veris run takes its command after --. Likewise no --ttl
-records no ttl_minutes, so the control plane's own default applies. The
-first environment of a project is its default.
+--boot, --snapshot, --data, --fs and --command are recorded only when given,
+and nothing is written for the ones left out -- a sandbox then boots the
+bundle, seeds nothing, has no filesystem, and veris run takes its command
+after --. Likewise no --ttl records no ttl_minutes, so the control plane's
+own default applies. The first environment of a project is its default.
+
+--fs records the folders every sandbox of the environment gets, one per
+flag as up --fs spells them (` + fsSpecGrammar + `, SOURCE a git URL or a
+local directory); a local directory is recorded relative to the project
+directory, so the file travels with the repository, and is uploaded by
+each up. A gs:// prefix needs auth: and is written in the file by hand:
+
+  environments:
+    NAME:
+      filesystem:
+        - {git: git@github.com:acme/app.git, ref: main, root: true, auth: GH_DEPLOY_KEY}
+        - {path: fixtures/data}             # --fs fixtures/data: uploaded by up
+        - {gcs: gs://bucket/prefix, auth: GCS_READER}
+
+auth: names an environment secret the engine fetches a private source
+with; it is written by hand, since the CLI holds no secrets.
 
 The proxy flags land in the config's proxy: block, which fills in whatever a
 veris run command line leaves out:
@@ -157,18 +180,19 @@ func validBoot(b string) bool {
 
 // envCreated is env create's --json body.
 type envCreated struct {
-	Name        string          `json:"name"`
-	ID          string          `json:"id"`
-	Services    []string        `json:"services"`
-	TTLMinutes  int             `json:"ttl_minutes"`
-	Boot        string          `json:"boot"`
-	Snapshot    string          `json:"snapshot,omitempty"`
-	Data        []string        `json:"data"`
-	Command     []string        `json:"command"`
-	Proxy       cfg.ProxyConfig `json:"proxy"`
-	Default     bool            `json:"default"`
-	Adopted     bool            `json:"adopted"`
-	ProjectFile string          `json:"project_file"`
+	Name        string             `json:"name"`
+	ID          string             `json:"id"`
+	Services    []string           `json:"services"`
+	TTLMinutes  int                `json:"ttl_minutes"`
+	Boot        string             `json:"boot"`
+	Snapshot    string             `json:"snapshot,omitempty"`
+	Data        []string           `json:"data"`
+	Filesystem  []cfg.FolderConfig `json:"filesystem"`
+	Command     []string           `json:"command"`
+	Proxy       cfg.ProxyConfig    `json:"proxy"`
+	Default     bool               `json:"default"`
+	Adopted     bool               `json:"adopted"`
+	ProjectFile string             `json:"project_file"`
 }
 
 // proxyConfig is the proxy: block the create flags spell, nil-free so the
@@ -232,6 +256,14 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 		return &cli.UsageError{Msg: "--services cannot change an adopted environment; the server has no update route. Omit --services, or omit --from"}
 	}
 	if err := f.checkProxyFlags(); err != nil {
+		return err
+	}
+	// Parsed against the working directory, as up would parse them typed
+	// there, before anything is minted: a directory that does not exist is
+	// a usage error, not a config that fails its first up.
+	cwd, _ := os.Getwd()
+	folderSpecs, err := foldersFromFlags(f.fs, cwd)
+	if err != nil {
 		return err
 	}
 	var command []string
@@ -367,6 +399,7 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	if command == nil {
 		command = []string{}
 	}
+	filesystem := folderConfigs(folderSpecs, proj.Dir())
 
 	// The question is put on a TTY with the answer leaning towards yes for
 	// the first environment: a project whose file lists environments but
@@ -401,6 +434,7 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 		Boot:       boot,
 		Snapshot:   snapshot,
 		Data:       data,
+		Filesystem: filesystem,
 		Proxy: cfg.ProxyConfig{
 			RequireService: f.requireService.vals, RequireCallback: f.requireCallback.vals,
 			Expose: f.expose, Image: f.image, Strict: f.strict,
@@ -433,7 +467,7 @@ func runEnvCreate(ctx *cli.Context, args []string, f *createFlags) error {
 	if s.ctx.Globals.JSON {
 		return printJSON(ctx.Stdout, envCreated{
 			Name: name, ID: env.ID, Services: env.Services, TTLMinutes: ttl, Boot: boot,
-			Snapshot: snapshot, Data: data, Command: command, Proxy: f.proxyConfig(),
+			Snapshot: snapshot, Data: data, Filesystem: filesystem, Command: command, Proxy: f.proxyConfig(),
 			Default: def, Adopted: adopted, ProjectFile: proj.Path,
 		})
 	}
@@ -720,6 +754,71 @@ func ttlLabel(minutes int) string {
 		return "ttl —"
 	}
 	return fmt.Sprintf("ttl %d", minutes)
+}
+
+// folderConfigs is the --fs values as the project file records them: a
+// local directory relative to the project directory when it is under it,
+// so the committed file is portable, and absolute when it is not.
+func folderConfigs(specs []folderSpec, projectDir string) []cfg.FolderConfig {
+	out := make([]cfg.FolderConfig, 0, len(specs))
+	for _, f := range specs {
+		c := cfg.FolderConfig{Name: f.Name, Ref: f.Ref, Root: f.Root}
+		switch f.Kind {
+		case folderGit:
+			c.Git = f.Source
+		case folderGCS:
+			c.GCS = f.Source
+		case folderPath:
+			c.Path = f.Dir
+			if rel, err := filepath.Rel(projectDir, f.Dir); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+				c.Path = filepath.ToSlash(rel)
+			}
+		}
+		// The name is written only when it is not what the source gives,
+		// so the file reads as if written by hand.
+		if spec, err := foldersFromConfig(projectDir, []cfg.FolderConfig{{Git: c.Git, GCS: c.GCS, Path: c.Path}}); err == nil && len(spec) == 1 && spec[0].Name == f.Name {
+			c.Name = ""
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// fsLabel renders the filesystem: list on one line, "" when empty:
+// "app (git@github.com:acme/app.git@main, root) · fixtures/data (path) ·
+// gs://bucket/prefix".
+func fsLabel(folders []cfg.FolderConfig) string {
+	parts := make([]string, 0, len(folders))
+	for _, f := range folders {
+		var what, source string
+		switch {
+		case f.Git != "":
+			what, source = "git", f.Git
+		case f.GCS != "":
+			what, source = "gcs", f.GCS
+		case f.Path != "":
+			what, source = "path", f.Path
+		default:
+			what = "empty"
+		}
+		label := f.Name
+		if label == "" {
+			label = source
+			source = ""
+		}
+		detail := what
+		if source != "" {
+			detail = source
+		}
+		if f.Ref != "" {
+			detail += "@" + f.Ref
+		}
+		if f.Root {
+			detail += ", root"
+		}
+		parts = append(parts, label+" ("+detail+")")
+	}
+	return strings.Join(parts, " · ")
 }
 
 func dataLabel(files []string) string {
@@ -1099,6 +1198,7 @@ func runEnvGet(ctx *cli.Context, args []string) error {
 			[]string{"TTL", ttl, from(conf.TTLMinutes > 0)},
 			[]string{"Boot", boot, from(conf.Boot != "")},
 			[]string{"Data", dashIfEmpty(strings.Join(conf.Data, ", ")), from(len(conf.Data) > 0)},
+			[]string{"Filesystem", dashIfEmpty(fsLabel(conf.Filesystem)), from(len(conf.Filesystem) > 0)},
 			[]string{"Callback", dashIfEmpty(conf.CallbackURL), from(conf.CallbackURL != "")},
 			[]string{"Proxy", dashIfEmpty(proxyLabel(conf.Proxy)), from(proxyLabel(conf.Proxy) != "")},
 			[]string{"Command", dashIfEmpty(strings.Join(conf.Run.Command, " ")), from(len(conf.Run.Command) > 0)},

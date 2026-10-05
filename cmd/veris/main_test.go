@@ -350,7 +350,7 @@ func TestTheMilestoneTwoGroupsAnswerAsAScriptSeesThem(t *testing.T) {
 			argv: []string{"--help"},
 			code: 0,
 			stdoutHas: []string{
-				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
+				"  veris sandbox   get|list|delete|reset|services|data|fs|trace|clock|exports [--id ID]\n",
 				"veris snapshot create|list|get|delete",
 				"veris baseline get|promote|set|clear|list",
 				"  veris run       [--fresh]",
@@ -494,9 +494,9 @@ func TestTheMilestoneThreeLeavesAnswerAsAScriptSeesThem(t *testing.T) {
 			argv: []string{"--help"},
 			code: 0,
 			stdoutHas: []string{
-				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--proxy [--image IMG]] [--watch]\n",
+				"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--fs SRC]... [--proxy [--image IMG]] [--watch]\n",
 				"  veris status    [--watch] [--json]\n",
-				"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n",
+				"  veris sandbox   get|list|delete|reset|services|data|fs|trace|clock|exports [--id ID]\n",
 				"[--expose PORT] [--require-service <n>] [--require-callback <path>]",
 				"veris doctor [--env NAME] [--json]",
 				"up --watch and status --watch keep a live panel",

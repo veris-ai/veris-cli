@@ -673,6 +673,23 @@ func TestSandboxServicesGet(t *testing.T) {
 		sbInOrder(t, stderr, "sandbox services get of stripe, the sandbox's only twin\n")
 	})
 
+	// The filesystem member is a service but not a twin to these verbs, so
+	// a sandbox with one twin and folders still has one twin to choose.
+	t.Run("the filesystem member is not a twin to choose", func(t *testing.T) {
+		only := newSandboxPlane(t)
+		twins := newDataTwins(t)
+		services := append(twins.services()[:1:1], api.ServiceInfo{
+			Name: "filesystem", Status: "ready", URL: "http://gw/s/" + sbID + "/filesystem/",
+			ControlURL: "http://gw/c/" + sbID + "/filesystem",
+		})
+		dataBench(t, only, services)
+		code, _, stderr := runSandboxCLI(t, "sandbox", "services", "get")
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, stderr)
+		}
+		sbInOrder(t, stderr, "sandbox services get of stripe, the sandbox's only twin\n")
+	})
+
 	t.Run("a terminal is asked which twin", func(t *testing.T) {
 		code, _, stderr := runSandboxCLITTY(t, "2\n", "sandbox", "services", "get")
 		if code != 0 {

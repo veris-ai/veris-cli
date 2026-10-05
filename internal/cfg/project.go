@@ -28,6 +28,23 @@ type RunConfig struct {
 	Command []string `yaml:"command,omitempty" json:"command"`
 }
 
+// FolderConfig is one folder of the sandbox's filesystem as the project
+// describes it: the source `up` gives the sandbox, under `filesystem:`.
+// Exactly one of Git, GCS and Path names the source; none is an empty
+// folder. Path is a local directory, relative to the project directory,
+// that up tars and uploads before the sandbox is created. Root marks the
+// folder the agent's working directory is; Auth names an environment
+// secret the engine fetches a private source with.
+type FolderConfig struct {
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	Git  string `yaml:"git,omitempty" json:"git,omitempty"`
+	GCS  string `yaml:"gcs,omitempty" json:"gcs,omitempty"`
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+	Ref  string `yaml:"ref,omitempty" json:"ref,omitempty"`
+	Root bool   `yaml:"root,omitempty" json:"root,omitempty"`
+	Auth string `yaml:"auth,omitempty" json:"auth,omitempty"`
+}
+
 // EnvConfig is one named environment as the project describes it.
 type EnvConfig struct {
 	ID string `yaml:"id,omitempty" json:"id"`
@@ -38,12 +55,17 @@ type EnvConfig struct {
 	TTLMinutes int    `yaml:"ttl_minutes,omitempty" json:"ttl_minutes"`
 	// Boot is bundle, baseline or snapshot; Snapshot names which when it is
 	// snapshot.
-	Boot        string      `yaml:"boot,omitempty" json:"boot"`
-	Snapshot    string      `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
-	Data        []string    `yaml:"data,omitempty" json:"data"`
-	CallbackURL string      `yaml:"callback_url,omitempty" json:"callback_url"`
-	Proxy       ProxyConfig `yaml:"proxy,omitempty" json:"proxy"`
-	Run         RunConfig   `yaml:"run,omitempty" json:"run"`
+	Boot     string   `yaml:"boot,omitempty" json:"boot"`
+	Snapshot string   `yaml:"snapshot,omitempty" json:"snapshot,omitempty"`
+	Data     []string `yaml:"data,omitempty" json:"data"`
+	// Filesystem is the folders a sandbox of this environment gets; `up
+	// --fs` replaces the whole list for one start-up, as every other flag
+	// replaces its setting. An older CLI reading a file with this block
+	// ignores it.
+	Filesystem  []FolderConfig `yaml:"filesystem,omitempty" json:"filesystem"`
+	CallbackURL string         `yaml:"callback_url,omitempty" json:"callback_url"`
+	Proxy       ProxyConfig    `yaml:"proxy,omitempty" json:"proxy"`
+	Run         RunConfig      `yaml:"run,omitempty" json:"run"`
 }
 
 // Project is .veris/twin.yaml, the committed file.
