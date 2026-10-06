@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -255,13 +258,21 @@ type sandboxPlane struct {
 	answer func(poll int) *api.Sandbox
 	polls  int
 
-	created     *api.CreateSandboxRequest
-	deleted     []string
-	deleteState int // DELETE's status (0 → 204)
-	reset       func() (int, any)
-	resets      int
-	listAll     func() (int, any) // GET /v1/sandboxes; nil → 404
-	lists       map[string]func() (int, any)
+	created *api.CreateSandboxRequest
+	// uploads is every POST …/uploads body, uploadNames the ?name= each
+	// carried, and uploadsStatus the answer (0 → 201; 404 is a plane
+	// without the route). order is every create-path request in sequence,
+	// so a test can hold the uploads to preceding the create.
+	uploads       [][]byte
+	uploadNames   []string
+	uploadsStatus int
+	order         []string
+	deleted       []string
+	deleteState   int // DELETE's status (0 → 204)
+	reset         func() (int, any)
+	resets        int
+	listAll       func() (int, any) // GET /v1/sandboxes; nil → 404
+	lists         map[string]func() (int, any)
 
 	// ledger answers GET /v1/sandboxes/{id}/ledger and ledgerEvent answers
 	// /ledger/{seq}. Nil is FastAPI's answer for a route it has none for,
@@ -328,8 +339,29 @@ func newSandboxPlane(t *testing.T) *sandboxPlane {
 			return
 		}
 		p.created = &req
+		p.order = append(p.order, "create")
 		sbJSON(w, 201, api.Sandbox{ID: sbID, EnvironmentID: r.PathValue("id"), Status: api.StatusProvisioning,
 			CreatedAt: at(time.Now()), ExpiresAt: at(time.Now().Add(30 * time.Minute))})
+	})
+	mux.HandleFunc("POST /v1/environments/{id}/uploads", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if ct := r.Header.Get("Content-Type"); ct != "application/gzip" {
+			t.Errorf("upload Content-Type = %q, want application/gzip", ct)
+		}
+		if r.ContentLength != int64(len(body)) {
+			t.Errorf("upload Content-Length = %d, body %d", r.ContentLength, len(body))
+		}
+		if p.uploadsStatus == 404 {
+			sbJSON(w, 404, map[string]string{"detail": "Not Found"})
+			return
+		}
+		p.uploads = append(p.uploads, body)
+		p.uploadNames = append(p.uploadNames, r.URL.Query().Get("name"))
+		p.order = append(p.order, "upload")
+		sum := sha256.Sum256(body)
+		sbJSON(w, 201, api.UploadResponse{ID: fmt.Sprintf("up_%d", len(p.uploads)), Bytes: int64(len(body)), SHA256: hex.EncodeToString(sum[:])})
 	})
 	mux.HandleFunc("GET /v1/environments/{id}/sandboxes", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
@@ -437,6 +469,20 @@ func (p *sandboxPlane) createdReq() *api.CreateSandboxRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.created
+}
+
+// uploadsSeen is every upload body and the name each carried; requestOrder
+// the create-path requests in sequence.
+func (p *sandboxPlane) uploadsSeen() ([][]byte, []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([][]byte(nil), p.uploads...), append([]string(nil), p.uploadNames...)
+}
+
+func (p *sandboxPlane) requestOrder() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.order...)
 }
 
 func (p *sandboxPlane) deletedIDs() []string {

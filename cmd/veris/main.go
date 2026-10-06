@@ -92,13 +92,13 @@ func root() *cli.Command {
 			"  Define       veris env create|list|get|use|delete · veris services\n" +
 			"\n" +
 			"  This folder's sandbox — no id typed, from .veris/twin.local.yaml:\n" +
-			"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--proxy [--image IMG]] [--watch]\n" +
+			"  veris up        [NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--fs SRC]... [--proxy [--image IMG]] [--watch]\n" +
 			"  veris status    [--watch] [--json]\n" +
 			"  veris down      [--all]\n" +
 			"  veris run       [--fresh] [--env NAME] [--image <image>] [--cap-add <CAP>] [--expose PORT] [--require-service <n>] [--require-callback <path>] [--receipt PATH] -- <cmd>\n" +
 			"\n" +
 			"  Any sandbox, by id:\n" +
-			"  veris sandbox   get|list|delete|reset|services|data|trace|clock|exports [--id ID]\n" +
+			"  veris sandbox   get|list|delete|reset|services|data|fs|trace|clock|exports [--id ID]\n" +
 			"\n" +
 			"  Keep a world veris snapshot create|list|get|delete · veris baseline get|promote|set|clear|list\n" +
 			"  Proxy        veris serve [--sandbox <id>] [--transparent] [--print-routes] · veris check\n" +

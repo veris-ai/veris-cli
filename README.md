@@ -203,6 +203,10 @@ environments:
     boot: bundle                    # bundle | baseline | snapshot
     data:                           # rows of your own, added by up after boot
       - data/dev-customers.json
+    filesystem:                     # folders the sandbox holds (veris sandbox fs)
+      - {git: git@github.com:acme/app.git, ref: main, root: true, auth: GH_DEPLOY_KEY}
+      - {path: fixtures/data}       # a local directory, uploaded by up
+      - {gcs: gs://bucket/prefix, auth: GCS_READER}
     proxy:
       require_service: [stripe]
       expose: 3000
@@ -232,10 +236,11 @@ only the services asked for, so one that gains an issuer later gains it in
 environments defined before it.
 
 `env create` writes `id`, and then only what a flag gave it: `ttl_minutes`,
-`boot`, `snapshot`, `data`, `run.command`, and the `proxy:` block from `--image`,
-`--require-service`, `--require-callback`, `--expose` and `--strict` (`env
-create --help` shows the block each writes). No secrets and no sandbox ids go
-in this file. The TTL's default, minimum and maximum are the control plane's,
+`boot`, `snapshot`, `data`, `filesystem` (from `--fs`), `run.command`, and the
+`proxy:` block from `--image`, `--require-service`, `--require-callback`,
+`--expose` and `--strict` (`env create --help` shows the block each writes).
+No secrets and no sandbox ids go in this file: a folder's `auth:` names an
+environment secret by name, and the engine holds the value. The TTL's default, minimum and maximum are the control plane's,
 not the CLI's: an environment with no `ttl_minutes` takes whatever it hands
 out, and a number it will not accept is refused by it, with the bounds named
 in the refusal.
@@ -254,7 +259,7 @@ both stages, and an ambiguous name or prefix lists the candidates.
 
 | Command | Does |
 |---|---|
-| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. On a TTY it asks for the name and the services and nothing else. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block. Every setting left out is left out of the file, so `up` boots the bundle, seeds nothing, and takes the control plane's own TTL. |
+| `env create [NAME] [--services a,b] [--from ID] [--ttl N] [--boot …] [--snapshot ID] [--data FILE] [--fs [NAME=]SOURCE[@REF][:root]]... [--command 'cmd'] [--image TAG] [--require-service NAME[:N]] [--require-callback PATH[:N]] [--expose PORT] [--strict] [--default] [--force]` | Define a named environment. On a TTY it asks for the name and the services and nothing else. `--from` adopts an existing server environment instead of creating one. Unknown service names are refused with the catalog. The proxy flags write the `proxy:` block; `--fs` writes the `filesystem:` list, a local directory recorded relative to the project. Every setting left out is left out of the file, so `up` boots the bundle, seeds nothing, has no filesystem, and takes the control plane's own TTL. |
 | `env list` | Two blocks: configured (this project's, `★` default, `●` in use here) and available (every server environment the key can see, which config points at it, live sandboxes). |
 | `env get [NAME\|ID]` | The resolved settings, where each came from, and the server record. |
 | `env use [NAME\|ID] [--global]` | Choose for this folder, or the profile. A picker on a TTY when NAME is omitted. |
@@ -272,9 +277,10 @@ grouped around. The three folder verbs answer under the group too
 (`veris sandbox up`), spelled in full.
 
 `up [NAME | --env NAME] [--ttl N] [--boot bundle|baseline|snapshot] [--snapshot
-ID|NAME] [--callback-url URL] [--timeout 300s]` takes each setting from the
-flag, then the environment config, then the defaults (boot bundle, and no TTL
-of its own: a sandbox nobody gave one lives as long as the control plane says).
+ID|NAME] [--fs [NAME=]SOURCE[@REF][:root]]... [--callback-url URL] [--timeout
+300s]` takes each setting from the flag, then the environment config, then the
+defaults (boot bundle, no folders, and no TTL of its own: a sandbox nobody gave
+one lives as long as the control plane says).
 It writes the sandbox id to `.veris/twin.local.yaml` (0600, gitignored) as soon
 as the control plane answers, then waits in two stages: until the sandbox is
 `ready`, and then until every twin's `/veris/health` answers through the
@@ -332,6 +338,94 @@ a twin actually serves (`GET /veris/operations`): method and path template on
 a REST twin, operation type and field on a GraphQL twin, tool names on an MCP
 surface. `--json` prints the twin's document as it sent it; a twin that
 publishes no list says so and exits 0.
+
+### The sandbox's filesystem: `up --fs` and `sandbox fs`
+
+A sandbox can hold folders beside its twins: a repository an agent works in,
+fixtures, a bucket prefix. `up --fs SOURCE` gives it one per flag, where
+SOURCE is a git URL (`https://…`, `git@host:org/repo.git`, `ssh://…`; `@REF`
+picks a branch or tag) or a local directory, which `up` tars and uploads
+before the sandbox is created — `.git` included, this tool's own
+`.veris/twin.local.yaml` and `.veris/*.lock` left out; a directory named
+through a symlink is uploaded as the directory it points at. `NAME=`
+names the folder (default: the source's basename, `app` for
+`git@github.com:acme/app.git`) and `:root` marks the one the agent's working
+directory is; names are unique, at most one folder is root, and a name is
+letters, digits, `.`, `_` and `-` (the control plane's rule, checked before
+any upload). A git source is fetched over https or ssh only, so `http://`,
+`git://` and a credential inside the URL are refused up front; a private
+repository's secret is named by `auth:` instead. The flags
+replace the environment config's `filesystem:` list for that start-up, as
+every other `up` flag replaces its setting, and `env create --fs` writes the
+list so every `up` (and `run --fresh`) of the environment gets the same
+folders. A private source's secret is named by `auth:` in the config, which
+holds the secret's name, never its value; a `gs://bucket/prefix` always needs
+one, so it is written in the config (`{gcs: gs://bucket/prefix, auth:
+GCS_READER}`) rather than given to `--fs`, and a `gcs:` entry without
+`auth:` is refused before anything is uploaded. With `--boot snapshot` the
+snapshot's own folders boot — the config's `filesystem:` list is not sent,
+since a list beside `snapshot_id` would replace what the snapshot saved —
+unless `--fs` names others, which do replace them; `up` says `fs from
+snapshot` on its Starting line.
+
+The folders appear as the sandbox's `filesystem` service: a WebDAV root with
+one directory per folder, printed by `up` as `filesystem   WebDAV <url>`
+rather than as an env hint, since it is for people and tools, not for the
+code under test — `run`, `up --proxy` and `sandbox exports` never hand it
+over. `veris sandbox fs` is the WebDAV root and the member's control routes
+(`/veris/fs/*`, reached with your Veris key like every other twin verb) with a
+terminal in front:
+
+```sh
+eval "$(veris sandbox fs connect)"           # VERIS_FS_URL, VERIS_FS_USER, VERIS_FS_PASSWORD, 1h
+veris sandbox fs diff app                    # A/M/D/R per file against the pulled baseline
+veris sandbox fs diff app --format patch     # a unified diff (the engine caps it at 8 MiB)
+veris sandbox fs pull app --dest ./app       # the folder as the engine holds it, .git included
+veris sandbox fs push app --src ./app        # every file back, over WebDAV; .git stays behind
+veris sandbox fs mount app ~/mnt/app         # rclone nfsmount (macOS) / mount (Linux), until Ctrl-C
+veris sandbox fs attach ~/ws                 # the pod's layout: WORKSPACE_DIR, WORKSPACE_FOLDERS
+```
+
+`connect` mints Basic credentials (`--ttl`, default 1h, at most 24h) and
+prints them as exports on stdout and nothing else there; the password never
+goes to stderr, so a transcript does not carry it. `diff`, `pull` and `push`
+take a FOLDER, or none when the sandbox has one; a terminal is asked which,
+anywhere else is told the commands. A folder the engine is still pulling
+(the layout's `ready: false`) is waited for under a spinner by `diff`,
+`pull`, `push`, `mount` and `attach`, for up to five minutes, then refused
+by name; `connect` mints regardless and names the folders still filling.
+`pull` refuses a destination that has
+files in it unless `--force`, and refuses an archive entry that would land
+outside it. `push` writes over what is there and deletes nothing; a top-level
+`.git` stays behind because the engine keeps the folder's own repository and
+baseline, and a symlink is sent in rclone's `.rclonelink` form, which the
+engine turns back into a link. `mount` and `attach --mount` need rclone on
+PATH (`brew install rclone`, or rclone.org/install) and print the install
+hint when it is missing; they run `rclone nfsmount` on macOS, which needs no
+kernel extension, and `rclone mount` on Linux. Windows has no mount here;
+`pull` and `push` do the job. A mount's credential lives `--ttl` (default
+12h, at most 24h), after which it must be mounted again; `--daemon` leaves
+the mount up and returns, and `umount` (macOS) or `fusermount -u` (Linux)
+undoes it. Copying is the agent-side default in the pod too; mounting is
+opt-in.
+
+`attach [DIR]` (default `~/.veris/fs/<sandbox>`) lays every folder out as the
+pod lays `/workspace` out — the root folder is DIR itself, the others
+`DIR/<name>` — copying each, or mounting the ones named by `--mount`, then
+prints `export WORKSPACE_DIR=…` and `export WORKSPACE_FOLDERS=<json>` on
+stdout, so `eval "$(veris sandbox fs attach)"` gives an agent run here the
+variables it would read in the pod. Every destination is checked before
+anything is pulled, and the root folder cannot be `--mount`ed when other
+folders would land inside it (a mount there would hide them): mount it
+alone with `fs mount`, or let attach copy it.
+
+Against a control plane that predates agent filesystems: `up --fs` with a
+local directory is refused before anything is created, since the plane has
+no uploads route; with git or gs:// sources the plane ignores the field, the
+sandbox comes up without folders, and `up` warns and exits 0 because the
+sandbox is otherwise what was asked for. Every `sandbox fs` verb on a sandbox
+without a filesystem, or whose member does not serve the routes, says so and
+exits 1.
 
 ### What it saw: `sandbox trace`
 

@@ -306,6 +306,7 @@ func TestEnvCreateFlagDriven(t *testing.T) {
 	want := envCreated{Name: "ci", ID: id, Services: []string{"stripe"}, TTLMinutes: 20, Boot: "bundle",
 		Data: []string{"data/ci.json"}, Command: []string{"pytest", "-q", "tests/integration"}, Default: true,
 		Proxy:       cfg.ProxyConfig{RequireService: []string{}, RequireCallback: []string{}},
+		Filesystem:  []cfg.FolderConfig{},
 		ProjectFile: filepath.Join(b.project, ".veris", "twin.yaml")}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("json = %+v, want %+v", got, want)
@@ -1322,4 +1323,66 @@ func TestEnvCreateNamesTheIssuerAServiceBringsAlong(t *testing.T) {
 		}
 		wantLines(t, stderr, "(old: google-calendar)")
 	})
+}
+
+// --fs on env create records the folders every sandbox of the environment
+// gets: a local directory relative to the project directory, so the
+// committed file travels; the name only when it is not the source's own.
+// env get shows the list, and a dash for an environment without one.
+func TestEnvCreateRecordsFoldersAndEnvGetShowsThem(t *testing.T) {
+	b := newEnvBench(t)
+	if err := os.MkdirAll(filepath.Join(b.project, "fixtures", "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := b.run("env", "create", "ci", "--services", "stripe",
+		"--fs", "./fixtures/app:root", "--fs", "web=https://github.com/acme/site", "--fs", "git@github.com:acme/lib.git@v2", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	want := []cfg.FolderConfig{
+		{Path: "fixtures/app", Root: true},
+		{Name: "web", Git: "https://github.com/acme/site"},
+		{Git: "git@github.com:acme/lib.git", Ref: "v2"},
+	}
+	if conf := b.loadProject().Environments["ci"]; !reflect.DeepEqual(conf.Filesystem, want) {
+		t.Errorf("filesystem = %+v, want %+v", conf.Filesystem, want)
+	}
+	var got envCreated
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil || !reflect.DeepEqual(got.Filesystem, want) {
+		t.Errorf("--json filesystem = %+v (%v), want %+v", got.Filesystem, err, want)
+	}
+
+	_, stderr, code = b.run("env", "get", "ci")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	wantLines(t, squash(stderr), "Filesystem fixtures/app (path, root) · web (https://github.com/acme/site) · git@github.com:acme/lib.git (git@v2) .veris/twin.yaml")
+
+	// A directory that does not exist is refused before anything is minted.
+	_, stderr, code = b.run("env", "create", "dev", "--services", "stripe", "--fs", "./nowhere")
+	if code != 1 || !strings.Contains(stderr, "veris: --fs ./nowhere: no such directory") {
+		t.Errorf("exit %d:\n%s", code, stderr)
+	}
+	// So is a gs:// source: the file it would write needs auth:, which the
+	// flag cannot carry, and every up of it would be refused by the plane.
+	_, stderr, code = b.run("env", "create", "dev", "--services", "stripe", "--fs", "gs://bucket/site")
+	if code != 1 || !strings.Contains(stderr, "veris: --fs gs://bucket/site: a gs:// source needs auth: naming the secret the engine reads it with, which --fs cannot carry; put it in the config under filesystem: as {gcs: gs://bucket/site, auth: SECRET_NAME}") {
+		t.Errorf("exit %d:\n%s", code, stderr)
+	}
+	if len(b.plane.created) != 1 {
+		t.Errorf("%d environments created, want the one", len(b.plane.created))
+	}
+
+	_, stderr, code = b.run("env", "create", "dev", "--services", "stripe")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(b.project, ".veris", "twin.yaml")); strings.Count(string(raw), "filesystem:") != 1 {
+		t.Errorf("an environment without --fs must write no filesystem key:\n%s", raw)
+	}
+	_, stderr, code = b.run("env", "get", "dev")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, stderr)
+	}
+	wantLines(t, squash(stderr), "Filesystem — default")
 }

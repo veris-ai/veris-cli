@@ -147,24 +147,32 @@ func atMostOneTwinName(ctx *cli.Context, args []string) (string, error) {
 // It needs the sandbox, so it runs after openSandboxServices rather than
 // during argument parsing: "which twin" is a question only the sandbox can
 // answer, and an error that names the twins beats one that names the rule.
+// The filesystem member is not a twin to these verbs -- it has no rows,
+// trace or clock -- so it is never chosen or offered; `veris sandbox fs`
+// is how it is reached.
 func chooseTwin(s *session, sb *api.Sandbox, name, idFlag string) (*api.ServiceInfo, error) {
 	if name != "" {
 		return twinNamed(s, sb, name)
 	}
 	verb := strings.Join(s.ctx.Path[1:], " ")
-	switch len(sb.Services) {
+	twins := make([]*api.ServiceInfo, 0, len(sb.Services))
+	for i := range sb.Services {
+		if sb.Services[i].Name != filesystemService {
+			twins = append(twins, &sb.Services[i])
+		}
+	}
+	switch len(twins) {
 	case 0:
 		s.ui.Fail("Sandbox %s has no twins", sb.ID)
 		return nil, printed(1)
 	case 1:
-		only := sb.Services[0]
-		s.ui.Info("%s of %s, the sandbox's only twin", verb, only.Name)
-		return &sb.Services[0], nil
+		s.ui.Info("%s of %s, the sandbox's only twin", verb, twins[0].Name)
+		return twins[0], nil
 	}
 	if s.ui.TTY {
-		opts := make([]ui.Option, 0, len(sb.Services))
-		for _, svc := range sb.Services {
-			opts = append(opts, ui.Option{Value: svc.Name, Label: svc.Name, Detail: twinDetail(svc)})
+		opts := make([]ui.Option, 0, len(twins))
+		for _, svc := range twins {
+			opts = append(opts, ui.Option{Value: svc.Name, Label: svc.Name, Detail: twinDetail(*svc)})
 		}
 		opt, err := s.ui.Select("Which twin?", opts, "NAME")
 		if err != nil {
@@ -172,8 +180,8 @@ func chooseTwin(s *session, sb *api.Sandbox, name, idFlag string) (*api.ServiceI
 		}
 		return twinNamed(s, sb, opt.Value)
 	}
-	s.ui.Fail("%s needs the twin's name. Sandbox %s has %d:", verb, sb.ID, len(sb.Services))
-	for _, svc := range sb.Services {
+	s.ui.Fail("%s needs the twin's name. Sandbox %s has %d:", verb, sb.ID, len(twins))
+	for _, svc := range twins {
 		s.ui.Next(twinCommand(verb, svc.Name, idFlag))
 	}
 	return nil, printed(1)

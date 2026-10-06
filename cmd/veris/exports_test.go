@@ -189,6 +189,8 @@ func TestExportsRendering(t *testing.T) {
 		{Name: "stripe", EnvHint: "STRIPE_API_BASE", URL: "https://gw/s/x/stripe"},
 		{Name: "odd", EnvHint: "ODD_URL", URL: "http://it's here/#frag"},
 		{Name: "nohint", URL: "http://nowhere"},
+		// The filesystem member's hint is a pod path, never exported.
+		{Name: "filesystem", EnvHint: "WORKSPACE_DIR", URL: "https://gw/s/x/filesystem/"},
 	}
 	var out bytes.Buffer
 	if err := renderExports(&out, "env", services); err != nil {
@@ -208,5 +210,12 @@ func TestExportsRendering(t *testing.T) {
 	}
 	if got := shellQuote(`a'b`); got != `'a'\''b'` {
 		t.Errorf("shellQuote = %s", got)
+	}
+	out.Reset()
+	if err := renderExports(&out, "json", services); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "WORKSPACE_DIR") {
+		t.Errorf("json exported the filesystem:\n%s", out.String())
 	}
 }

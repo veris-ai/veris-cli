@@ -19,6 +19,10 @@ environments:
     boot: baseline
     snapshot: nightly
     data: [data/dev-customers.json]
+    filesystem:
+      - {name: app, git: 'git@github.com:acme/app.git', ref: main, root: true, auth: GH_DEPLOY_KEY}
+      - {path: fixtures/data}
+      - {gcs: 'gs://bucket/prefix'}
     callback_url: https://cb.example
     proxy: {require_service: [stripe], require_callback: [/hook], expose: 8080, image: app:test, strict: true}
     run: {command: [pytest, -q]}
@@ -34,6 +38,11 @@ func TestLoadProjectDecodesEveryField(t *testing.T) {
 	want := EnvConfig{
 		ID: "k3j2v0d8p1q7x9r2m5n8b4c6a", Profile: "work", TTLMinutes: 240,
 		Boot: "baseline", Snapshot: "nightly", Data: []string{"data/dev-customers.json"},
+		Filesystem: []FolderConfig{
+			{Name: "app", Git: "git@github.com:acme/app.git", Ref: "main", Root: true, Auth: "GH_DEPLOY_KEY"},
+			{Path: "fixtures/data"},
+			{GCS: "gs://bucket/prefix"},
+		},
 		CallbackURL: "https://cb.example",
 		Proxy: ProxyConfig{RequireService: []string{"stripe"}, RequireCallback: []string{"/hook"},
 			Expose: 8080, Image: "app:test", Strict: true},
@@ -183,8 +192,10 @@ func TestProjectSaveRoundTrip(t *testing.T) {
 		Version: 1, Project: "checkout-svc", Default: "dev",
 		Environments: map[string]EnvConfig{
 			"dev": {ID: "k3j2", TTLMinutes: 240, Boot: "baseline",
-				Proxy: ProxyConfig{RequireService: []string{"stripe"}},
-				Run:   RunConfig{Command: []string{"pytest", "-q"}}},
+				Filesystem: []FolderConfig{{Path: "app", Root: true}, {Git: "https://github.com/acme/lib", Ref: "v1"}},
+				Proxy:      ProxyConfig{RequireService: []string{"stripe"}},
+				Run:        RunConfig{Command: []string{"pytest", "-q"}}},
+			"ci": {ID: "9q1w"},
 		},
 		Path: filepath.Join(root, ".veris", "twin.yaml"),
 	}
@@ -199,12 +210,15 @@ func TestProjectSaveRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, key := range []string{"version: 1", "project: checkout-svc", "default: dev",
-		"ttl_minutes: 240", "require_service:", "command:"} {
+		"ttl_minutes: 240", "require_service:", "command:", "filesystem:", "path: app", "root: true", "ref: v1"} {
 		if !strings.Contains(string(raw), key) {
 			t.Errorf("saved file lacks %q:\n%s", key, raw)
 		}
 	}
-	for _, absent := range []string{"callback_url", "snapshot", "strict", "expose"} {
+	// An environment without folders writes no filesystem key, and a folder
+	// never writes the source kinds it does not have (one `gcs:` line would
+	// read as a second source).
+	for _, absent := range []string{"callback_url", "snapshot", "strict", "expose", "gcs", "auth", "name:"} {
 		if strings.Contains(string(raw), absent) {
 			t.Errorf("zero field %q written out:\n%s", absent, raw)
 		}

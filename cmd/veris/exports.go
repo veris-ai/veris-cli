@@ -79,7 +79,7 @@ func sandboxExports(ctx *cli.Context, idFlag, format string) error {
 		return s.fail("read", "services of sandbox "+id, err)
 	}
 	for _, svc := range services {
-		if svc.EnvHint == "" {
+		if svc.EnvHint == "" && svc.Name != filesystemService {
 			s.ui.Warn("%s has no env hint, so nothing is exported for it", svc.Name)
 		}
 	}
@@ -112,18 +112,21 @@ func exportFormat(ctx *cli.Context, format string) (string, error) {
 
 // renderExports writes the services that carry an env hint, in the order the
 // control plane lists them. json is one object, so its keys come out sorted.
+// The filesystem member is left out whatever it carries: its URL is a
+// WebDAV root, and `veris sandbox fs connect` is what exports it, with
+// credentials.
 func renderExports(w io.Writer, format string, services []api.ServiceInfo) error {
 	if format == "json" {
 		body := map[string]string{}
 		for _, svc := range services {
-			if svc.EnvHint != "" {
+			if svc.EnvHint != "" && svc.Name != filesystemService {
 				body[svc.EnvHint] = svc.URL
 			}
 		}
 		return printJSON(w, body)
 	}
 	for _, svc := range services {
-		if svc.EnvHint == "" {
+		if svc.EnvHint == "" || svc.Name == filesystemService {
 			continue
 		}
 		var line string

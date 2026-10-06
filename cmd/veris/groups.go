@@ -7,7 +7,7 @@ import (
 )
 
 // sandboxCommands is up, status, down and the sandbox group, with the
-// group's Milestone 2 verbs (services, data, trace, clock) attached here so
+// group's Milestone 2 verbs (services, data, files, fs, trace, clock) attached here so
 // each of them lives in its own file and the group's literal in sandbox.go
 // stays about the lifecycle verbs.
 func sandboxCommands() []*cli.Command {
@@ -18,6 +18,7 @@ func sandboxCommands() []*cli.Command {
 				sandboxServicesCommand(),
 				sandboxDataCommand(),
 				sandboxFilesCommand(),
+				sandboxFSCommand(),
 				sandboxTraceCommand(),
 				sandboxClockCommand(),
 			)

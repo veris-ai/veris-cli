@@ -523,3 +523,48 @@ func TestTheControlURLRidesIntoTheConfig(t *testing.T) {
 		t.Errorf("legacy Control() = %q, want the data URL", got)
 	}
 }
+
+// The filesystem member is a WebDAV root for `veris sandbox fs`, not a
+// dependency of the command: the host tier's config neither routes it, nor
+// hands it over under a hint it might carry, nor reports it as out of
+// reach -- the same rule run's handoffs and exports apply.
+func TestTheFilesystemMemberIsNeitherRoutedNorHandedOver(t *testing.T) {
+	for _, hint := range []string{"", "WORKSPACE_DIR"} {
+		snapshot := googleSandbox("http://sandbox.test")
+		snapshot.Services = append(snapshot.Services, Service{
+			Name: FilesystemService, URL: "https://gw/s/sbx_google/filesystem/",
+			ControlURL: "https://api/c/sbx_google/filesystem", Status: "ready", EnvHint: hint,
+		})
+		cfg, skipped, err := ToConfig(snapshot, nil)
+		if err != nil {
+			t.Fatalf("hint %q: ToConfig: %v", hint, err)
+		}
+		for _, svc := range cfg.Services {
+			if svc.Name == FilesystemService {
+				t.Errorf("hint %q: filesystem routed: %+v", hint, svc)
+			}
+		}
+		for _, pe := range cfg.PassEnv {
+			if pe.Service == FilesystemService || pe.Name == "WORKSPACE_DIR" {
+				t.Errorf("hint %q: filesystem handed over: %+v", hint, pe)
+			}
+		}
+		for _, s := range skipped {
+			if s.Service == FilesystemService {
+				t.Errorf("hint %q: filesystem reported as unroutable: %q", hint, s.Reason)
+			}
+		}
+		if !NotProxied(Service{Name: FilesystemService, URL: "https://gw/s/sbx_google/filesystem/",
+			Routes: []routes.Entry{{Host: "files.example"}}}, nil) {
+			t.Errorf("hint %q: the filesystem member is never proxied", hint)
+		}
+	}
+
+	// Routing it on purpose is refused, not honoured.
+	snapshot := googleSandbox("http://sandbox.test")
+	snapshot.Services = append(snapshot.Services, Service{Name: FilesystemService, URL: "https://gw/fs/"})
+	_, _, err := ToConfig(snapshot, map[string][]routes.Entry{FilesystemService: {{Host: "files.example"}}})
+	if err == nil || !strings.Contains(err.Error(), "veris sandbox fs") {
+		t.Errorf("--route filesystem=... err = %v, want a refusal naming veris sandbox fs", err)
+	}
+}

@@ -718,12 +718,14 @@ func notProxied(svc api.ServiceInfo, overrides map[string][]routes.Entry) bool {
 // yente or a postgres is reached without the code under test being told
 // anything but the variable it already reads. A variable the command line
 // set with -e is the user's explicit answer and is never overwritten; a twin
-// with no hint has no name to be handed under.
+// with no hint has no name to be handed under. The filesystem member is
+// never handed over: its URL is a WebDAV root for people and tools, and a
+// hint it carries names a path inside the pod, which no code here reads.
 func handoffs(services []api.ServiceInfo, overrides map[string][]routes.Entry, userEnv []string) []config.PassEnvVar {
 	set := userSetVars(userEnv)
 	var out []config.PassEnvVar
 	for _, svc := range services {
-		if svc.EnvHint == "" || svc.URL == "" || set[svc.EnvHint] || !notProxied(svc, overrides) {
+		if svc.Name == filesystemService || svc.EnvHint == "" || svc.URL == "" || set[svc.EnvHint] || !notProxied(svc, overrides) {
 			continue
 		}
 		out = append(out, config.PassEnvVar{Name: svc.EnvHint, Value: svc.URL, Service: svc.Name})
