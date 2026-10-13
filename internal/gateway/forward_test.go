@@ -292,6 +292,26 @@ func exchangeLenient(t *testing.T, addr, raw string) string {
 	return string(got)
 }
 
+func TestForwardDenyListener(t *testing.T) {
+	up := startUpstream(t, "200 OK", "")
+	addr, logs := startForwarder(t, up.url(), func(f *Forwarder) { f.Deny = true })
+	for _, request := range []string{
+		"CONNECT outlook.office365.com:443 HTTP/1.1\r\nHost: outlook.office365.com:443\r\n\r\n",
+		"GET http://outlook.office365.com/ HTTP/1.1\r\nHost: outlook.office365.com\r\n\r\n",
+		// Even the PAC path: a deny listener serves nothing.
+		"GET /proxy.pac HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+	} {
+		got := exchange(t, addr, request)
+		if want := "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; got != want {
+			t.Fatalf("%q answered %q, want %q", request, got, want)
+		}
+	}
+	if auths, _ := up.seen(); len(auths) != 0 {
+		t.Errorf("a denied request reached the upstream: %q", auths)
+	}
+	waitForLog(t, logs, []string{"tunnel denied", "target=outlook.office365.com:443", "method=CONNECT"})
+}
+
 func TestForwardUpstreamDown(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

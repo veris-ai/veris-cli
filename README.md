@@ -763,7 +763,8 @@ identical.
 ## gateway forward
 
 ```bash
-veris gateway forward --listen 127.0.0.1:3128 --upstream-file /path/to/upstream [--pac-file /path/to/proxy.pac]
+veris gateway forward --listen 127.0.0.1:3128 --upstream-file /path/to/upstream \
+  [--pac-file /path/to/proxy.pac] [--deny-listen 127.0.0.1:3129]
 ```
 
 The Veris egress gateway is an HTTP CONNECT proxy that refuses a tunnel
@@ -784,6 +785,10 @@ terminated and nothing inside a tunnel is read.
   `application/x-ns-proxy-autoconfig`, read afresh per request, so the system
   setting can point at `http://127.0.0.1:<port>/proxy.pac` (macOS reads
   `file://` PAC URLs unreliably).
+- `--deny-listen` serves a second loopback port that answers every request
+  `403` and opens nothing, for the PAC file to name for hosts that must not be
+  reached at all. A closed port will not do: macOS treats an unreachable proxy
+  as a failed one and connects directly.
 - A gateway that refuses a tunnel has its status (403, 407, 502…) relayed; one
   that cannot be reached within 10 s is answered `502`. Established tunnels
   have no idle timeout.

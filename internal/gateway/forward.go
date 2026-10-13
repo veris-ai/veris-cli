@@ -124,7 +124,12 @@ type Forwarder struct {
 	Upstream Upstream
 	// PACFile, when set, is served at GET /proxy.pac, read afresh per request.
 	PACFile string
-	Log     *slog.Logger
+	// Deny makes this a deny listener: every request is answered 403 and
+	// nothing is opened. A PAC file names it for hosts that must not be
+	// reached at all. It cannot name a closed port instead: macOS treats an
+	// unreachable proxy as a failed one and connects directly.
+	Deny bool
+	Log  *slog.Logger
 
 	HeadTimeout     time.Duration
 	DialTimeout     time.Duration
@@ -254,7 +259,7 @@ func (h *headLimit) Read(p []byte) (int, error) {
 }
 
 // handle serves one client connection: a CONNECT tunnel, the PAC file, or a
-// refusal. It owns c and closes it.
+// refusal (every request, on a deny listener). It owns c and closes it.
 func (f *Forwarder) handle(c net.Conn) {
 	defer c.Close()
 	log := f.logger()
@@ -278,6 +283,11 @@ func (f *Forwarder) handle(c net.Conn) {
 		return
 	}
 	lim.limited = false
+	if f.Deny {
+		writeStatus(c, http.StatusForbidden)
+		log.Info("tunnel denied", "target", req.Host, "method", req.Method)
+		return
+	}
 	if req.Method != http.MethodConnect {
 		f.serveNonConnect(c, req)
 		return
