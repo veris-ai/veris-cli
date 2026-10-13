@@ -760,6 +760,37 @@ dependency passes the canary check and produces an empty receipt. Without
 both, "interception silently did not happen" and "everything worked" look
 identical.
 
+## gateway forward
+
+```bash
+veris gateway forward --listen 127.0.0.1:3128 --upstream-file /path/to/upstream [--pac-file /path/to/proxy.pac]
+```
+
+The Veris egress gateway is an HTTP CONNECT proxy that refuses a tunnel
+without Basic `Proxy-Authorization` naming the sandbox. Operating-system proxy
+settings (a host and port, or a PAC file) have nowhere to put that credential,
+so the GUI apps on a Playground desktop cannot use the gateway directly.
+`gateway forward` listens on loopback, asks for no credential, and opens each
+CONNECT tunnel through the gateway with one. It is a pure relay: no TLS is
+terminated and nothing inside a tunnel is read.
+
+- `--upstream-file` holds the gateway's URL,
+  `http://<user>:<pass>@<host>:<port>`, and nothing else. It carries a
+  credential, so it should be mode 0600; neither it nor the credential is ever
+  logged, only the gateway's host:port.
+- `--listen` must be a loopback address; anything else is refused.
+- Only CONNECT is served. Any other request is answered `501`, except
+  `GET /proxy.pac` when `--pac-file` is given: that file is served as
+  `application/x-ns-proxy-autoconfig`, read afresh per request, so the system
+  setting can point at `http://127.0.0.1:<port>/proxy.pac` (macOS reads
+  `file://` PAC URLs unreliably).
+- A gateway that refuses a tunnel has its status (403, 407, 502…) relayed; one
+  that cannot be reached within 10 s is answered `502`. Established tunnels
+  have no idle timeout.
+
+It runs until SIGINT or SIGTERM and logs one line as each tunnel opens and one
+as it closes: target, gateway status, bytes each way and duration.
+
 ## doctor
 
 `veris doctor [--env NAME]` is the one screen that answers "why is my first
