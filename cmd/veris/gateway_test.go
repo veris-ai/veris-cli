@@ -28,6 +28,7 @@ func TestGatewayForwardRefusesBeforeListening(t *testing.T) {
 		{"all interfaces", gatewayForwardOptions{Listen: "0.0.0.0:0", UpstreamFile: upstream}, "not a loopback address"},
 		{"a LAN address", gatewayForwardOptions{Listen: "192.168.1.10:3128", UpstreamFile: upstream}, "not a loopback address"},
 		{"missing upstream file", gatewayForwardOptions{Listen: "127.0.0.1:0", UpstreamFile: filepath.Join(dir, "nope")}, "read the upstream file"},
+		{"deny on a LAN address", gatewayForwardOptions{Listen: "127.0.0.1:0", DenyListen: "192.168.1.10:3128", UpstreamFile: upstream}, "--deny-listen"},
 		{"missing PAC file", gatewayForwardOptions{Listen: "127.0.0.1:0", UpstreamFile: upstream, PACFile: filepath.Join(dir, "nope.pac")}, "--pac-file"},
 	}
 	for _, tc := range cases {
@@ -51,8 +52,8 @@ func TestGatewayForwardHelp(t *testing.T) {
 	}
 	for _, want := range []string{
 		"veris gateway forward - ",
-		"--listen 127.0.0.1:<port> --upstream-file <path> [--pac-file <path>]",
-		"  --listen ", "  --upstream-file ", "  --pac-file ", "/proxy.pac",
+		"--listen 127.0.0.1:<port> --upstream-file <path> [--pac-file <path>] [--deny-listen 127.0.0.1:<port>]",
+		"  --listen ", "  --upstream-file ", "  --pac-file ", "  --deny-listen ", "/proxy.pac",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help lacks %q:\n%s", want, stdout.String())

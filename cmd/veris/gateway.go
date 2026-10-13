@@ -36,6 +36,11 @@ Only CONNECT is served; any other request is answered 501, except GET
 request) so the system setting can point at
 http://127.0.0.1:<port>/proxy.pac.
 
+--deny-listen serves a second loopback port that answers every request 403
+and opens nothing, for a PAC file to name for hosts that must not be reached
+at all. A closed port will not do: macOS treats an unreachable proxy as a
+failed one and connects directly.
+
 --upstream-file holds the gateway's URL, http://<user>:<pass>@<host>:<port>,
 and nothing else; it carries a credential, so it should be mode 0600, and
 neither it nor the credential is ever logged -- only the gateway's host:port.
@@ -47,17 +52,19 @@ as it closes, with its target, the gateway's status, bytes and duration.`
 
 // gatewayForwardCommand is `veris gateway forward`.
 func gatewayForwardCommand() *cli.Command {
-	var listen, upstreamFile, pacFile, logLevel, logFormat string
+	var listen, denyListen, upstreamFile, pacFile, logLevel, logFormat string
 	return &cli.Command{
 		Name:    "forward",
 		Summary: "Serve CONNECT on loopback and tunnel through the gateway with its credential",
-		Usage:   "veris gateway forward --listen 127.0.0.1:<port> --upstream-file <path> [--pac-file <path>]",
-		Help:    gatewayForwardHelp,
+		Usage: "veris gateway forward --listen 127.0.0.1:<port> --upstream-file <path> " +
+			"[--pac-file <path>] [--deny-listen 127.0.0.1:<port>]",
+		Help: gatewayForwardHelp,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&listen, "listen", "", "loopback `address` to serve CONNECT on, e.g. 127.0.0.1:3128")
 			fs.StringVar(&upstreamFile, "upstream-file", "",
 				"`file` holding the gateway's proxy URL, credential included (mode 0600)")
 			fs.StringVar(&pacFile, "pac-file", "", "serve this `file` at GET /proxy.pac")
+			fs.StringVar(&denyListen, "deny-listen", "", "loopback `address` that answers every request 403")
 			fs.StringVar(&logLevel, "log-level", "info", "debug, info, warn or error")
 			fs.StringVar(&logFormat, "log-format", "text", "text or json")
 		},
@@ -66,7 +73,7 @@ func gatewayForwardCommand() *cli.Command {
 				return err
 			}
 			return gatewayForward(gatewayForwardOptions{
-				Listen: listen, UpstreamFile: upstreamFile, PACFile: pacFile,
+				Listen: listen, DenyListen: denyListen, UpstreamFile: upstreamFile, PACFile: pacFile,
 				LogLevel: logLevel, LogFormat: logFormat,
 			})
 		},
@@ -75,8 +82,8 @@ func gatewayForwardCommand() *cli.Command {
 
 // gatewayForwardOptions are forward's flags.
 type gatewayForwardOptions struct {
-	Listen, UpstreamFile, PACFile string
-	LogLevel, LogFormat           string
+	Listen, DenyListen, UpstreamFile, PACFile string
+	LogLevel, LogFormat                       string
 }
 
 // gatewayForward runs the relay until a signal, then shuts it down.
@@ -89,6 +96,11 @@ func gatewayForward(o gatewayForwardOptions) error {
 	}
 	if err := gateway.CheckLoopback(o.Listen); err != nil {
 		return err
+	}
+	if o.DenyListen != "" {
+		if err := gateway.CheckLoopback(o.DenyListen); err != nil {
+			return errors.New("--deny-listen: " + err.Error())
+		}
 	}
 	log := newLogger(o.LogLevel, o.LogFormat)
 	upstream, err := gateway.ReadUpstreamFile(o.UpstreamFile, log.Warn)
@@ -105,6 +117,21 @@ func gatewayForward(o gatewayForwardOptions) error {
 		return err
 	}
 	fwd := &gateway.Forwarder{Upstream: upstream, PACFile: o.PACFile, Log: log}
+	var deny *gateway.Forwarder
+	if o.DenyListen != "" {
+		denyLn, err := net.Listen("tcp", o.DenyListen)
+		if err != nil {
+			_ = ln.Close()
+			return errors.New("--deny-listen: " + err.Error())
+		}
+		deny = &gateway.Forwarder{Deny: true, Log: log}
+		go func() {
+			if err := deny.Serve(denyLn); err != nil {
+				log.Error("the deny listener stopped", "err", err)
+			}
+		}()
+		log.Info("gateway deny listening", "addr", denyLn.Addr().String())
+	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -115,6 +142,9 @@ func gatewayForward(o gatewayForwardOptions) error {
 		log.Info("shutting down")
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
+		if deny != nil {
+			_ = deny.Shutdown(ctx)
+		}
 		_ = fwd.Shutdown(ctx)
 	}()
 
